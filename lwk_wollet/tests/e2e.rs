@@ -2095,7 +2095,7 @@ fn test_manual_coin_selection() {
         .set_wallet_utxos(vec![asset_utxo.outpoint])
         .finish()
         .unwrap_err();
-    assert!(matches!(err, Error::ManualCoinSelectionOnlyLbtc));
+    assert!(matches!(err, Error::InsufficientFunds { .. }));
     let err = w
         .tx_builder()
         .add_recipient(&node_address, 200_000, asset)
@@ -2103,7 +2103,7 @@ fn test_manual_coin_selection() {
         .set_wallet_utxos(vec![utxos[0].outpoint])
         .finish()
         .unwrap_err();
-    assert!(matches!(err, Error::ManualCoinSelectionOnlyLbtc));
+    assert!(matches!(err, Error::InsufficientFunds { .. }));
 }
 
 #[ignore = "This test connects to liquid testnet"]
