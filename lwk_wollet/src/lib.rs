@@ -99,6 +99,8 @@ mod liquidex;
 mod model;
 pub mod pegin;
 mod persister;
+#[cfg(feature = "postgres")]
+pub mod postgres;
 mod pset_create;
 pub mod registry;
 mod store;
@@ -118,6 +120,8 @@ pub use crate::model::{
 };
 pub use crate::pegin::fed_peg_script;
 pub use crate::persister::{FsPersister, NoPersist, PersistError, Persister};
+#[cfg(feature = "postgres")]
+pub use crate::postgres::{PgPersister, PostgresUtxoStore, UtxoStore};
 pub use crate::registry::{asset_ids, issuance_ids, Contract, Entity};
 pub use crate::tx_builder::{TxBuilder, WolletTxBuilder};
 pub use crate::update::{DownloadTxResult, Update};
