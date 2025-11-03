@@ -229,7 +229,8 @@ impl<C: BlockchainBackend> TestWollet<C> {
             .unwrap()
             .fee_rate(fee_rate)
             .finish()
-            .unwrap();
+            .unwrap()
+            .0;
         pset = pset_rt(&pset);
 
         let details = self.wollet.get_details(&pset).unwrap();
@@ -286,7 +287,8 @@ impl<C: BlockchainBackend> TestWollet<C> {
             .drain_lbtc_to(address)
             .fee_rate(fee_rate)
             .finish()
-            .unwrap();
+            .unwrap()
+            .0;
 
         let details = self.wollet.get_details(&pset).unwrap();
         let fee = details.balance.fee as i64;
@@ -319,7 +321,8 @@ impl<C: BlockchainBackend> TestWollet<C> {
             .unwrap()
             .fee_rate(fee_rate)
             .finish()
-            .unwrap();
+            .unwrap()
+            .0;
 
         pset = pset_rt(&pset);
 
@@ -381,7 +384,8 @@ impl<C: BlockchainBackend> TestWollet<C> {
             .unwrap()
             .fee_rate(fee_rate)
             .finish()
-            .unwrap();
+            .unwrap()
+            .0;
 
         pset = pset_rt(&pset);
 
@@ -425,7 +429,8 @@ impl<C: BlockchainBackend> TestWollet<C> {
             .unwrap()
             .fee_rate(fee_rate)
             .finish()
-            .unwrap();
+            .unwrap()
+            .0;
         pset = pset_rt(&pset);
 
         let issuance_input = &pset.inputs()[0].clone();
@@ -499,7 +504,8 @@ impl<C: BlockchainBackend> TestWollet<C> {
             .unwrap()
             .fee_rate(fee_rate)
             .finish()
-            .unwrap();
+            .unwrap()
+            .0;
         pset = pset_rt(&pset);
 
         let details = self.wollet.get_details(&pset).unwrap();
@@ -561,7 +567,8 @@ impl<C: BlockchainBackend> TestWollet<C> {
             .unwrap()
             .fee_rate(fee_rate)
             .finish()
-            .unwrap();
+            .unwrap()
+            .0;
         pset = pset_rt(&pset);
 
         let details = self.wollet.get_details(&pset).unwrap();

@@ -149,7 +149,8 @@ fn multi_multisig(server: &TestElectrumServer, jade_signer: &AnySigner) {
         .add_lbtc_recipient(&w2_address, 10_000)
         .unwrap()
         .finish()
-        .unwrap();
+        .unwrap()
+        .0;
 
     w2.wollet.add_details(&mut pset).unwrap();
     for signer in signers_m1 {

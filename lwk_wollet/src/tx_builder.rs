@@ -4,7 +4,7 @@ use elements::{
     confidential::{AssetBlindingFactor, Nonce, Value, ValueBlindingFactor},
     issuance::ContractHash,
     pset::{raw::ProprietaryKey, Output, PartiallySignedTransaction, PsbtSighashType},
-    secp256k1_zkp::{self, ZERO_TWEAK},
+    secp256k1_zkp::{self, SecretKey, ZERO_TWEAK},
     Address, AssetId, BlindAssetProofs, EcdsaSighashType, OutPoint, Script, Transaction,
 };
 use rand::thread_rng;
@@ -16,6 +16,15 @@ use crate::{
     pset_create::{validate_address, IssuanceRequest},
     Contract, ElementsNetwork, Error, LiquidexProposal, UnvalidatedRecipient, Wollet, EC,
 };
+
+pub type PsetBlindingFactors = HashMap<
+    usize,
+    (
+        elements26::confidential::AssetBlindingFactor,
+        elements26::confidential::ValueBlindingFactor,
+        SecretKey,
+    ),
+>;
 
 pub fn extract_issuances(tx: &Transaction) -> Vec<IssuanceDetails> {
     let mut r = vec![];
@@ -385,7 +394,7 @@ impl TxBuilder {
     fn finish_liquidex_make(
         self,
         wollet: &Wollet,
-    ) -> Result<(PartiallySignedTransaction, Vec<String>), Error> {
+    ) -> Result<(PartiallySignedTransaction, Vec<String>, PsetBlindingFactors), Error> {
         // Create PSET
         let mut pset = PartiallySignedTransaction::new_v2();
         let mut inp_txout_sec = HashMap::new();
@@ -521,14 +530,14 @@ impl TxBuilder {
         wollet.add_details(&mut pset)?;
 
         // TODO: blinding nonces
-        Ok((pset, vec![]))
+        Ok((pset, vec![], HashMap::new()))
     }
 
     /// Finish building a transaction that takes LiquiDEX proposals
     fn finish_liquidex_take(
         self,
         wollet: &Wollet,
-    ) -> Result<(PartiallySignedTransaction, Vec<String>), Error> {
+    ) -> Result<(PartiallySignedTransaction, Vec<String>, PsetBlindingFactors), Error> {
         let [proposal] = self.liquidex_proposals.as_slice() else {
             return Err(Error::LiquidexError(LiquidexError::TakerInvalidParams));
         };
@@ -736,27 +745,30 @@ impl TxBuilder {
         wollet.add_details(&mut pset)?;
 
         // TODO: blinding nonces
-        Ok((pset, vec![]))
+        Ok((pset, vec![], HashMap::new()))
     }
 
     /// Finish building the transaction for AMP0
     #[cfg(feature = "amp0")]
     pub fn finish_for_amp0(self, wollet: &Wollet) -> Result<crate::amp0::Amp0Pset, Error> {
-        let (pset, blinding_nonces) = self.finish_inner(wollet, true)?;
+        let (pset, blinding_nonces, _blinders) = self.finish_inner(wollet, true)?;
         crate::amp0::Amp0Pset::new(pset, blinding_nonces)
     }
 
     /// Finish building the transaction
-    pub fn finish(self, wollet: &Wollet) -> Result<PartiallySignedTransaction, Error> {
-        let (pset, _blinding_nonces) = self.finish_inner(wollet, false)?;
-        Ok(pset)
+    pub fn finish(
+        self,
+        wollet: &Wollet,
+    ) -> Result<(PartiallySignedTransaction, PsetBlindingFactors), Error> {
+        let (pset, _blinding_nonces, blinders) = self.finish_inner(wollet, false)?;
+        Ok((pset, blinders))
     }
 
     fn finish_inner(
         self,
         wollet: &Wollet,
         for_amp0: bool,
-    ) -> Result<(PartiallySignedTransaction, Vec<String>), Error> {
+    ) -> Result<(PartiallySignedTransaction, Vec<String>, PsetBlindingFactors), Error> {
         if self.is_liquidex_make {
             return self.finish_liquidex_make(wollet);
         } else if !self.liquidex_proposals.is_empty() {
@@ -1118,26 +1130,26 @@ impl TxBuilder {
         };
 
         let mut m = HashMap::new();
-        for (ct_location, (_abf, _vbf, eph_sk)) in blind_secrets.iter() {
+        for (ct_location, (abf, vbf, eph_sk)) in blind_secrets.iter() {
             // these are outputs not inputs...
             if let elements26::CtLocation {
                 input_index,
                 ty: elements26::CtLocationType::Input,
             } = ct_location
             {
-                m.insert(input_index, eph_sk);
+                m.insert(*input_index, (*abf, *vbf, *eph_sk));
             }
         }
 
         let mut blinding_nonces = vec![];
         for idx in 0..pset.n_outputs() {
-            let bn = if let Some(eph_sk) = m.get(&idx) {
+            let bn = if let Some(blinders) = m.get(&idx) {
                 let blinding_pubkey = pset.outputs()[idx]
                     .blinding_key
                     .ok_or_else(|| Error::Generic("Missing blinding key".into()))?;
                 let (_nonce, shared_secret) = elements::confidential::Nonce::with_ephemeral_sk(
                     &EC,
-                    **eph_sk,
+                    blinders.2,
                     &blinding_pubkey.inner,
                 );
                 shared_secret.display_secret().to_string()
@@ -1150,7 +1162,7 @@ impl TxBuilder {
         // Add details to the pset from our descriptor, like bip32derivation and keyorigin
         wollet.add_details(&mut pset)?;
 
-        Ok((pset, blinding_nonces))
+        Ok((pset, blinding_nonces, m))
     }
 }
 
@@ -1171,7 +1183,7 @@ impl<'a> WolletTxBuilder<'a> {
     }
 
     /// Consume this builder and create a transaction
-    pub fn finish(self) -> Result<PartiallySignedTransaction, Error> {
+    pub fn finish(self) -> Result<(PartiallySignedTransaction, PsetBlindingFactors), Error> {
         self.inner.finish(self.wollet)
     }
 

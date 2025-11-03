@@ -489,7 +489,8 @@ fn multiple_descriptors() {
         .issue_asset(satoshi_a, None, satoshi_t, Some(address_t), None)
         .unwrap()
         .finish()
-        .unwrap();
+        .unwrap()
+        .0;
 
     wallet_t.wollet.add_details(&mut pset).unwrap();
     let (asset, token) = &pset.inputs()[0].issuance_ids();
@@ -519,7 +520,8 @@ fn multiple_descriptors() {
         .reissue_asset(*asset, satoshi_ar, Some(address_a), None)
         .unwrap()
         .finish()
-        .unwrap();
+        .unwrap()
+        .0;
 
     wallet_a.wollet.add_details(&mut pset).unwrap();
     let details_a = wallet_a.wollet.get_details(&pset).unwrap();
@@ -553,7 +555,8 @@ fn multiple_descriptors() {
         .add_recipient(&address_nt, satoshi_t, *token)
         .unwrap()
         .finish()
-        .unwrap();
+        .unwrap()
+        .0;
     wallet_t.sign(&signer_t1, &mut pset);
     wallet_t.sign(&signer_t2, &mut pset);
     wallet_t.send(&mut pset);
@@ -586,7 +589,8 @@ fn multiple_descriptors() {
         .reissue_asset(*asset, satoshi_ar, Some(address_a), Some(issuance_tx))
         .unwrap()
         .finish()
-        .unwrap();
+        .unwrap()
+        .0;
     wallet_nt.sign(&signer_nt, &mut pset);
     wallet_nt.send(&mut pset);
     wallet_a.sync();
@@ -722,7 +726,8 @@ fn create_pset_error() {
         .add_recipient(&address, satoshi_t, token)
         .unwrap()
         .finish()
-        .unwrap();
+        .unwrap()
+        .0;
 
     wallet.sign(&signer, &mut pset);
     wallet.send(&mut pset);
@@ -804,7 +809,8 @@ fn multisig_flow() {
         .add_lbtc_recipient(&node_addr, satoshi)
         .unwrap()
         .finish()
-        .unwrap();
+        .unwrap()
+        .0;
 
     // Send the PSET to each signer
     let mut pset1 = pset.clone();
@@ -850,7 +856,8 @@ fn jade_sign_wollet_pset() {
         .add_lbtc_recipient(&my_addr, 1000)
         .unwrap()
         .finish()
-        .unwrap();
+        .unwrap()
+        .0;
 
     let docker = Cli::default();
     let jade_init = jade_setup(&docker, mnemonic);
@@ -899,7 +906,8 @@ fn jade_single_sig() {
         .add_lbtc_recipient(&node_addr, satoshi)
         .unwrap()
         .finish()
-        .unwrap();
+        .unwrap()
+        .0;
 
     wallet.sign(&signer, &mut pset);
     wallet.send(&mut pset);
@@ -1180,7 +1188,8 @@ async fn test_esplora_waterfalls_utxo_only() {
         .add_lbtc_recipient(address, 100_000)
         .unwrap()
         .finish()
-        .unwrap();
+        .unwrap()
+        .0;
     signer.sign(&mut pset).unwrap();
     let pset_details = wollet.get_details(&pset).unwrap();
 
@@ -1479,7 +1488,8 @@ fn ct_discount() {
         .add_lbtc_recipient(&node_address, 1_000)
         .unwrap()
         .finish()
-        .unwrap();
+        .unwrap()
+        .0;
 
     wallet.sign(&signer, &mut pset);
     let details = wallet.wollet.get_details(&pset).unwrap();
@@ -1494,7 +1504,8 @@ fn ct_discount() {
         .add_lbtc_recipient(&node_address, 1_000)
         .unwrap()
         .finish()
-        .unwrap();
+        .unwrap()
+        .0;
 
     wallet.sign(&signer, &mut pset);
     let details = wallet.wollet.get_details(&pset).unwrap();
@@ -1522,7 +1533,8 @@ fn ct_discount() {
         .add_lbtc_recipient(&node_address, 1_000)
         .unwrap()
         .finish()
-        .unwrap();
+        .unwrap()
+        .0;
 
     wallet.sign(&signer, &mut pset);
     let details = wallet.wollet.get_details(&pset).unwrap();
@@ -1703,7 +1715,8 @@ fn test_prune() {
         .add_lbtc_recipient(&address, 10_000)
         .unwrap()
         .finish()
-        .unwrap();
+        .unwrap()
+        .0;
     let _details = wallet.wollet.get_details(&pset).unwrap();
 
     wallet.sign(&signer, &mut pset);
@@ -1746,7 +1759,8 @@ fn test_external_utxo() {
         .add_external_utxos(vec![external_utxo])
         .unwrap()
         .finish()
-        .unwrap();
+        .unwrap()
+        .0;
 
     // Add the details for the extenal wallet to sign
     w2.wollet.add_details(&mut pset).unwrap();
@@ -1784,7 +1798,8 @@ fn test_external_utxo() {
         .add_external_utxos(vec![external_utxo])
         .unwrap()
         .finish()
-        .unwrap();
+        .unwrap()
+        .0;
 
     w2.wollet.add_details(&mut pset).unwrap();
     for signer in signers {
@@ -1808,7 +1823,8 @@ fn test_external_utxo() {
         .add_external_utxos(vec![external_utxo])
         .unwrap()
         .finish()
-        .unwrap();
+        .unwrap()
+        .0;
 
     w2.wollet.add_details(&mut pset).unwrap();
     for signer in signers {
@@ -1831,7 +1847,8 @@ fn test_external_utxo() {
         .add_external_utxos(vec![external_utxo])
         .unwrap()
         .finish()
-        .unwrap();
+        .unwrap()
+        .0;
 
     w2.wollet.add_details(&mut pset).unwrap();
     for signer in signers {
@@ -1854,7 +1871,8 @@ fn test_external_utxo() {
         .add_external_utxos(vec![external_utxo])
         .unwrap()
         .finish()
-        .unwrap();
+        .unwrap()
+        .0;
 
     w2.wollet.add_details(&mut pset).unwrap();
     for signer in signers {
@@ -1899,7 +1917,8 @@ fn test_unblinded_utxo() {
         .add_external_utxos(vec![external_utxo])
         .unwrap()
         .finish()
-        .unwrap();
+        .unwrap()
+        .0;
 
     for signer in signers {
         w.sign(signer, &mut pset);
@@ -1929,7 +1948,8 @@ fn test_unblinded_utxo() {
         .drain_lbtc_wallet()
         .drain_lbtc_to(node_address)
         .finish()
-        .unwrap();
+        .unwrap()
+        .0;
 
     // 1 blinded input, 1 unblinded input
     assert_eq!(pset.inputs().len(), 2);
@@ -1957,7 +1977,8 @@ fn test_unblinded_utxo() {
         .drain_lbtc_wallet()
         .drain_lbtc_to(node_address)
         .finish()
-        .unwrap();
+        .unwrap()
+        .0;
 
     for signer in signers {
         w.sign(signer, &mut pset);
@@ -1999,7 +2020,8 @@ fn test_spend_blinded_utxo_with_custom_blinding_key() {
         .add_external_utxos(vec![external_utxo])
         .unwrap()
         .finish()
-        .unwrap();
+        .unwrap()
+        .0;
 
     signer.sign(&mut pset).unwrap();
     let _ = w.send(&mut pset);
@@ -2128,7 +2150,8 @@ fn test_waterfalls_esplora() {
         .drain_lbtc_wallet()
         .drain_lbtc_to(address.clone())
         .finish()
-        .unwrap();
+        .unwrap()
+        .0;
 
     let sigs = signer.sign(&mut pset).unwrap();
     assert!(sigs > 0);
@@ -2405,7 +2428,8 @@ fn test_manual_coin_selection() {
         .unwrap()
         .set_wallet_utxos(vec![utxos[0].outpoint])
         .finish()
-        .unwrap();
+        .unwrap()
+        .0;
     assert_eq!(pset.inputs().len(), 1);
     assert_eq!(pset.outputs().len(), 3); // recipient + change + fee
     signer.sign(&mut pset).unwrap();
@@ -2419,7 +2443,8 @@ fn test_manual_coin_selection() {
         .unwrap()
         .set_wallet_utxos(vec![utxos[0].outpoint, utxos[1].outpoint])
         .finish()
-        .unwrap();
+        .unwrap()
+        .0;
     assert_eq!(pset.inputs().len(), 2);
     assert_eq!(pset.outputs().len(), 3); // recipient + change + fee
     signer.sign(&mut pset).unwrap();
@@ -2471,7 +2496,8 @@ fn test_manual_coin_selection() {
         .add_recipient(&node_address, 1, asset)
         .unwrap()
         .finish()
-        .unwrap();
+        .unwrap()
+        .0;
     assert_eq!(pset.inputs().len(), 2);
     assert_eq!(pset.outputs().len(), 4); // asset recipient, asset change, lbtc change, fees
     signer.sign(&mut pset).unwrap();
@@ -2492,7 +2518,8 @@ fn test_manual_coin_selection() {
         .add_recipient(&node_address, 1, token)
         .unwrap()
         .finish()
-        .unwrap();
+        .unwrap()
+        .0;
     assert_eq!(pset.inputs().len(), 3);
     assert_eq!(pset.outputs().len(), 5); // asset recipient, asset change, token recipient, lbtc change, fees
     signer.sign(&mut pset).unwrap();
@@ -2510,7 +2537,8 @@ fn test_manual_coin_selection() {
             token_utxo.outpoint,
         ])
         .finish()
-        .unwrap();
+        .unwrap()
+        .0;
     assert_eq!(pset.inputs().len(), 3);
     assert_eq!(pset.outputs().len(), 4); // asset change, token change, lbtc change, fees
     signer.sign(&mut pset).unwrap();
@@ -2577,7 +2605,8 @@ fn test_update_transaction() {
         .add_lbtc_recipient(&node_addr, 1_000)
         .unwrap()
         .finish()
-        .unwrap();
+        .unwrap()
+        .0;
 
     let sigs = signer.sign(&mut pset).unwrap();
     assert!(sigs > 0);
@@ -2624,7 +2653,8 @@ fn test_update_transaction() {
         .add_lbtc_recipient(&node_addr, 1_000)
         .unwrap()
         .finish()
-        .unwrap();
+        .unwrap()
+        .0;
     let sigs = signer.sign(&mut pset).unwrap();
     assert!(sigs > 0);
     let tx = w.wollet.finalize(&mut pset).unwrap();
@@ -2673,7 +2703,8 @@ fn liquidex<C: BlockchainBackend>(
         .liquidex_make(utxo_send, &addr, sats_recv, asset_recv)
         .unwrap()
         .finish()
-        .unwrap();
+        .unwrap()
+        .0;
 
     let details = wallet_maker.wollet.get_details(&pset).unwrap();
     assert_eq!(details.balance.fee, 0);
@@ -2712,7 +2743,8 @@ fn liquidex<C: BlockchainBackend>(
         .liquidex_take(vec![proposal])
         .unwrap()
         .finish()
-        .unwrap();
+        .unwrap()
+        .0;
 
     let details = wallet_taker.wollet.get_details(&pset).unwrap();
     let fee = details.balance.fee as i64;
@@ -2846,7 +2878,8 @@ fn test_no_wildcard_with_path_after() {
         .add_lbtc_recipient(&addr, 10_000)
         .unwrap()
         .finish()
-        .unwrap();
+        .unwrap()
+        .0;
 
     wallet.sign(&signer, &mut pset);
     let _ = wallet.send(&mut pset);
@@ -2924,7 +2957,8 @@ fn test_no_wildcard() {
         .add_lbtc_recipient(&wallet.address(), 10_000)
         .unwrap()
         .finish()
-        .unwrap();
+        .unwrap()
+        .0;
     pset = pset_rt(&pset);
 
     let details = wallet.wollet.get_details(&pset).unwrap();
@@ -2995,7 +3029,8 @@ fn test_sh_multi() {
         .add_lbtc_recipient(&wallet.address(), 10_000)
         .unwrap()
         .finish()
-        .unwrap();
+        .unwrap()
+        .0;
     pset = pset_rt(&pset);
 
     let details = wallet.wollet.get_details(&pset).unwrap();
@@ -3051,7 +3086,8 @@ fn test_singlekey() {
         .add_lbtc_recipient(&node_addr, satoshi)
         .unwrap()
         .finish()
-        .unwrap();
+        .unwrap()
+        .0;
 
     sign_with_seckey(sk_a, &mut pset).unwrap();
     sign_with_seckey(sk_b, &mut pset).unwrap();
@@ -3083,7 +3119,8 @@ fn test_issuance_amount_limits() {
         .issue_asset(amount_21m, None, 1, None, None)
         .unwrap()
         .finish()
-        .unwrap();
+        .unwrap()
+        .0;
     wallet.sign(&AnySigner::Software(signer.clone()), &mut pset);
     let (asset, _) = pset.inputs()[0].issuance_ids();
     wallet.send(&mut pset);
@@ -3117,7 +3154,8 @@ fn test_issuance_amount_limits() {
         .reissue_asset(asset, amount, None, None)
         .unwrap()
         .finish()
-        .unwrap();
+        .unwrap()
+        .0;
     wallet.sign(&AnySigner::Software(signer.clone()), &mut pset);
     wallet.send(&mut pset);
 
@@ -3201,7 +3239,8 @@ fn test_non_std_legacy_multisig() {
         .drain_lbtc_wallet()
         .drain_lbtc_to(recv_addr)
         .finish()
-        .unwrap();
+        .unwrap()
+        .0;
 
     sign_with_seckey(sk_a, &mut pset).unwrap();
     sign_with_seckey(sk_b, &mut pset).unwrap();
@@ -3266,7 +3305,8 @@ fn test_sync_high_index() {
         .add_lbtc_recipient(addr50.address(), 50)
         .unwrap()
         .finish()
-        .unwrap();
+        .unwrap()
+        .0;
 
     let sigs = signer.sign(&mut pset).unwrap();
     assert!(sigs > 0);
@@ -3350,7 +3390,8 @@ fn test_chain_tx() {
         .add_lbtc_recipient(&node_addr, 1_000)
         .unwrap()
         .finish()
-        .unwrap();
+        .unwrap()
+        .0;
 
     let previous_utxos = wallet.wollet.extract_wallet_utxos(&pset0).unwrap();
     assert_eq!(previous_utxos.len(), 1);
@@ -3367,7 +3408,8 @@ fn test_chain_tx() {
         .unwrap()
         .set_wallet_utxos(vec![])
         .finish()
-        .unwrap();
+        .unwrap()
+        .0;
 
     // Sign all txs
     for pset in [&mut pset0, &mut pset1] {
@@ -3410,7 +3452,8 @@ fn test_explicit_send() {
         .add_explicit_recipient(&addr_explicit, 1_000, lbtc)
         .unwrap()
         .finish()
-        .unwrap();
+        .unwrap()
+        .0;
 
     let details = wallet.wollet.get_details(&pset).unwrap();
     let recipient = &details.balance.recipients[0];
@@ -3437,7 +3480,8 @@ fn test_explicit_send() {
         .add_explicit_recipient(&addr_explicit, 1_000, lbtc)
         .unwrap()
         .finish()
-        .unwrap();
+        .unwrap()
+        .0;
 
     // TODO: allow to get details
     let err = wallet.wollet.get_details(&pset).unwrap_err();
@@ -3477,7 +3521,8 @@ fn test_finalize_diff_sighashes() {
         .add_lbtc_recipient(&addr, 1_000)
         .unwrap()
         .finish()
-        .unwrap();
+        .unwrap()
+        .0;
 
     // Note: a PSET/PSBT input have a unique sighash type, even in the case it requires multiple
     // signatures, which might be done with different sighashes.
@@ -3522,7 +3567,7 @@ fn test_skip_signing_utxo() {
     w.fund_btc(&server);
 
     // Send all funds
-    let pset = w.tx_builder().drain_lbtc_wallet().finish().unwrap();
+    let pset = w.tx_builder().drain_lbtc_wallet().finish().unwrap().0;
 
     assert_eq!(pset.inputs().len(), 2);
 
@@ -3627,7 +3672,8 @@ fn test_fee_service() {
         .drain_lbtc_wallet()
         .drain_lbtc_to(addr_fs)
         .finish()
-        .unwrap();
+        .unwrap()
+        .0;
 
     // User shares PSET with Fee Service
 
@@ -3780,7 +3826,8 @@ fn basics() -> Result<(), Box<dyn std::error::Error>> {
     let mut pset = wollet
         .tx_builder()
         .add_recipient(&address, sats, lbtc)?
-        .finish()?;
+        .finish()?
+        .0;
     // ANCHOR_END: tx
 
     // ANCHOR: pset-details
@@ -4010,7 +4057,8 @@ fn snippet_multisig() -> Result<(), Box<dyn std::error::Error>> {
     let mut pset = wollet_c
         .tx_builder()
         .add_recipient(&address, sats, lbtc)?
-        .finish()?;
+        .finish()?
+        .0;
 
     // Carol signs the transaction
     let sigs_added = signer_c.sign(&mut pset)?;
