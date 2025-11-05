@@ -1124,9 +1124,35 @@ impl TxBuilder {
                 .expect("from elements25");
             (blind_secrets, pset25)
         } else {
-            let blind_secrets = std::collections::BTreeMap::new();
-            pset.blind_last(&mut rng, &EC, &inp_txout_sec)?;
-            (blind_secrets, pset)
+            use elements26::pset::PartiallySignedTransaction as Pset26;
+            use elements26::confidential::{
+                AssetBlindingFactor as Abf26, ValueBlindingFactor as Vbf26,
+            };
+            use std::str::FromStr;
+            let mut pset26 = Pset26::from_str(&pset.to_string()).expect("from elements25");
+            let inp_txout_sec: HashMap<usize, elements26::TxOutSecrets> = inp_txout_sec
+                .iter()
+                .map(|(i, s)| {
+                    let asset = elements26::AssetId::from_slice(s.asset.into_inner().as_ref())
+                        .expect("from elements25");
+                    let abf = Abf26::from_slice(s.asset_bf.into_inner().as_ref())
+                        .expect("from elements25");
+                    let vbf = Vbf26::from_slice(s.value_bf.into_inner().as_ref())
+                        .expect("from elements25");
+                    let value = s.value;
+                    let s = elements26::TxOutSecrets::new(asset, abf, value, vbf);
+                    (*i, s)
+                })
+                .collect();
+
+            let blind_secrets = pset26
+                .blind_last(&mut rng, &EC, &inp_txout_sec)
+                .map_err(|e| Error::Generic(format!("elements26 blind error: {}", e)))?;
+
+            let pset25 = elements::pset::PartiallySignedTransaction::from_str(&pset26.to_string())
+                .expect("from elements25");
+
+            (blind_secrets, pset25)
         };
 
         let mut m = HashMap::new();
