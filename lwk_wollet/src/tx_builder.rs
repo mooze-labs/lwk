@@ -1131,14 +1131,7 @@ impl TxBuilder {
 
         let mut m = HashMap::new();
         for (ct_location, (abf, vbf, eph_sk)) in blind_secrets.iter() {
-            // these are outputs not inputs...
-            if let elements26::CtLocation {
-                input_index,
-                ty: elements26::CtLocationType::Input,
-            } = ct_location
-            {
-                m.insert(*input_index, (*abf, *vbf, *eph_sk));
-            }
+            m.insert(ct_location.input_index, (*abf, *vbf, *eph_sk));
         }
 
         let mut blinding_nonces = vec![];
