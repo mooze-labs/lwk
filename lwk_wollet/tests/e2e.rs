@@ -4011,7 +4011,8 @@ fn test_issue_asset() -> Result<(), Box<dyn std::error::Error>> {
             None, // None -> a wallet from the address is used
             Some(contract.clone()),
         )?
-        .finish()?;
+        .finish()?
+        .0;
 
     // Sign the transaction and finalize it
     let signatures_added = signer.sign(&mut pset).expect("signing failed");
@@ -4042,7 +4043,7 @@ fn test_issue_asset() -> Result<(), Box<dyn std::error::Error>> {
     let builder = wollet.tx_builder();
     let mut pset = builder
         .reissue_asset(asset_id, reissue_asset, asset_receiver, issuance_tx)?
-        .finish()?;
+        .finish()?.0;
     let signatures_added = signer.sign(&mut pset).unwrap();
     assert!(signatures_added == 2); // ANCHOR: ignore
     let _ = wollet.finalize(&mut pset).unwrap();
@@ -4059,7 +4060,7 @@ fn test_issue_asset() -> Result<(), Box<dyn std::error::Error>> {
     // ANCHOR: burn_asset
     let burn_asset = 50;
     let builder = wollet.tx_builder();
-    let mut pset = builder.add_burn(burn_asset, asset_id)?.finish()?;
+    let mut pset = builder.add_burn(burn_asset, asset_id)?.finish()?.0;
     let signatures_added = signer.sign(&mut pset)?;
     assert!(signatures_added == 2); // ANCHOR: ignore
     let _ = wollet.finalize(&mut pset)?;
