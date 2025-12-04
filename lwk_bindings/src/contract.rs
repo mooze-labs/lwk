@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use elements::hashes::hex::FromHex;
 
-use crate::LwkError;
+use crate::{types::AssetId, LwkError, TxIn};
 
 /// Wrapper over [`lwk_wollet::Contract`]
 #[derive(uniffi::Object)]
@@ -26,6 +26,12 @@ impl From<Contract> for lwk_wollet::Contract {
 impl From<&Contract> for lwk_wollet::Contract {
     fn from(contract: &Contract) -> Self {
         contract.inner.clone()
+    }
+}
+
+impl AsRef<lwk_wollet::Contract> for Contract {
+    fn as_ref(&self) -> &lwk_wollet::Contract {
+        &self.inner
     }
 }
 
@@ -60,4 +66,18 @@ impl Contract {
         inner.validate()?; // TODO validate should be the constructor
         Ok(Arc::new(Self { inner }))
     }
+}
+
+/// Derive asset id from contract and transaction input
+#[uniffi::export]
+pub fn derive_asset_id(txin: &TxIn, contract: &Contract) -> Result<AssetId, LwkError> {
+    let (asset_id, _token_id) = lwk_wollet::asset_ids(txin.as_ref(), contract.as_ref())?;
+    Ok(asset_id.into())
+}
+
+/// Derive token id from contract and transaction input
+#[uniffi::export]
+pub fn derive_token_id(txin: &TxIn, contract: &Contract) -> Result<AssetId, LwkError> {
+    let (_asset_id, token_id) = lwk_wollet::asset_ids(txin.as_ref(), contract.as_ref())?;
+    Ok(token_id.into())
 }

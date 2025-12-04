@@ -5,7 +5,7 @@ node = LwkTestEnv()
 
 network = Network.regtest_default()
 policy_asset = network.policy_asset()
-client = ElectrumClient(node.electrum_url(), tls=False, validate_domain=False)
+client = ElectrumClient.from_url(node.electrum_url())
 
 # Wallet 1
 s1 = Signer(Mnemonic.from_random(12), network)
@@ -32,13 +32,15 @@ utxo_w2 = ExternalUtxo(
     w2.is_segwit()
 )
 
+# ANCHOR: drain_lbtc_wallet
 node_addr = node.get_new_address()
-# Create speding tx sending all to the node
+# Create speding tx sending all to the node # ANCHOR: ignore
 builder = network.tx_builder()
-builder.add_external_utxos([utxo_w2])
+builder.add_external_utxos([utxo_w2]) # ANCHOR: ignore
 builder.drain_lbtc_wallet()
 builder.drain_lbtc_to(node_addr)
 pset = builder.finish(w1)
+# ANCHOR_END: drain_lbtc_wallet
 
 pset = s1.sign(pset)
 

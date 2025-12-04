@@ -4,8 +4,9 @@ mod utils;
 mod tests {
 
     use crate::utils::{self, BOLTZ_REGTEST, DEFAULT_REGTEST_NODE, TIMEOUT, WAIT_TIME};
-    use std::{env, str::FromStr, sync::Arc};
+    use std::{env, str::FromStr, sync::Arc, time::Duration};
 
+    use bip39::Mnemonic;
     use boltz_client::{
         boltz::{BoltzApiClientV2, BoltzWsConfig, CreateSubmarineRequest},
         fees::Fee,
@@ -16,7 +17,7 @@ mod tests {
     };
     use lwk_boltz::{
         clients::{AnyClient, ElectrumClient},
-        LightningPayment, LightningSession, PreparePayData,
+        BoltzSession, LightningPayment, PreparePayDataSerializable,
     };
     use lwk_wollet::{elements, secp256k1::rand::thread_rng, ElementsNetwork};
 
@@ -27,7 +28,7 @@ mod tests {
 
         let network = ElementsNetwork::Liquid;
 
-        let session = LightningSession::new(
+        let session = BoltzSession::builder(
             network,
             AnyClient::Electrum(Arc::new(
                 ElectrumClient::new(
@@ -38,9 +39,9 @@ mod tests {
                 )
                 .unwrap(),
             )),
-            Some(TIMEOUT),
-            None,
         )
+        .create_swap_timeout(TIMEOUT)
+        .build()
         .await
         .unwrap();
 
@@ -52,7 +53,7 @@ mod tests {
             "MAINNET_REFUND_ADDRESS environment variable must be set for mainnet submarine test",
         );
 
-        log::info!("Preparing payment for invoice: {}", bolt11_invoice);
+        log::info!("Preparing payment for invoice: {bolt11_invoice}");
 
         let refund_address = elements::Address::from_str(&refund_address).unwrap();
         let lightning_payment = LightningPayment::from_str(&bolt11_invoice).unwrap();
@@ -74,7 +75,7 @@ mod tests {
         // Note: In a real test, you would need to send funds to prepare_pay_response.address
         // with amount prepare_pay_response.amount before calling complete_pay()
         let result = prepare_pay_response.complete_pay().await;
-        log::info!("Complete Pay Result: {:?}", result);
+        log::info!("Complete Pay Result: {result:?}");
     }
 
     #[tokio::test]
@@ -99,12 +100,12 @@ mod tests {
             .unwrap(),
         );
 
-        let session = LightningSession::new(
+        let session = BoltzSession::builder(
             ElementsNetwork::default_regtest(),
             AnyClient::Electrum(client.clone()),
-            Some(TIMEOUT),
-            None,
         )
+        .create_swap_timeout(TIMEOUT)
+        .build()
         .await
         .unwrap();
         let bolt11_invoice = utils::generate_invoice_lnd(50_000).await.unwrap();
@@ -124,6 +125,47 @@ mod tests {
         .await
         .unwrap();
         prepare_pay_response.complete_pay().await.unwrap();
+
+        // complete a payment via advance()
+        let bolt11_invoice = utils::generate_invoice_lnd(500_000).await.unwrap();
+        let lightning_payment = LightningPayment::from_str(&bolt11_invoice).unwrap();
+        let mut prepare_pay_response = session
+            .prepare_pay(&lightning_payment, &refund_address, None)
+            .await
+            .unwrap();
+        utils::send_to_address(
+            Chain::Liquid(LiquidChain::LiquidRegtest),
+            &prepare_pay_response.data.create_swap_response.address,
+            prepare_pay_response
+                .data
+                .create_swap_response
+                .expected_amount,
+        )
+        .await
+        .unwrap();
+        loop {
+            match prepare_pay_response.advance().await {
+                Ok(std::ops::ControlFlow::Continue(_)) => {}
+                Ok(std::ops::ControlFlow::Break(result)) => {
+                    log::info!("Payment completed with result: {result}");
+                    assert!(result, "Payment should succeed");
+                    break;
+                }
+                Err(e) => {
+                    panic!("Unexpected error: {e}");
+                }
+            }
+        }
+        // repeatly calling advance on a terminated swap don't timeout
+        for _ in 0..10 {
+            match prepare_pay_response.advance().await {
+                Err(lwk_boltz::Error::NoBoltzUpdate) => { // expected
+                }
+                _ => {
+                    panic!("unexpected status");
+                }
+            }
+        }
 
         // Test underpay which triggers a refund to the refund address
         let bolt11_invoice = utils::generate_invoice_lnd(50_000).await.unwrap();
@@ -145,6 +187,54 @@ mod tests {
         .unwrap();
         prepare_pay_response.complete_pay().await.unwrap();
 
+        // test polling
+        let session_polling = BoltzSession::builder(
+            ElementsNetwork::default_regtest(),
+            AnyClient::Electrum(client.clone()),
+        )
+        .polling(true)
+        .build()
+        .await
+        .unwrap();
+
+        let bolt11_invoice = utils::generate_invoice_lnd(50_000).await.unwrap();
+        let lightning_payment = LightningPayment::from_str(&bolt11_invoice).unwrap();
+        let mut prepare_pay_response = session_polling
+            .prepare_pay(&lightning_payment, &refund_address, None)
+            .await
+            .unwrap();
+        utils::send_to_address(
+            Chain::Liquid(LiquidChain::LiquidRegtest),
+            &prepare_pay_response.data.create_swap_response.address,
+            prepare_pay_response
+                .data
+                .create_swap_response
+                .expected_amount,
+        )
+        .await
+        .unwrap();
+
+        // Poll for updates until payment is complete
+        loop {
+            match prepare_pay_response.advance().await {
+                Ok(std::ops::ControlFlow::Continue(update)) => {
+                    log::info!("Polling: Received update. status:{}", update.status);
+                }
+                Ok(std::ops::ControlFlow::Break(result)) => {
+                    log::info!("Polling: Payment completed with result: {result}");
+                    assert!(result, "Payment should succeed");
+                    break;
+                }
+                Err(lwk_boltz::Error::NoBoltzUpdate) => {
+                    log::info!("Polling: No update available, sleeping and retrying...");
+                    sleep(Duration::from_secs(1)).await;
+                }
+                Err(e) => {
+                    panic!("Polling: Unexpected error: {e}");
+                }
+            }
+        }
+
         // Stop the mining task
         mining_handle.abort();
     }
@@ -156,6 +246,10 @@ mod tests {
 
         // Start concurrent block mining task
         let mining_handle = utils::start_block_mining();
+        let mnemonic = Mnemonic::from_str(
+            "damp cart merit asset obvious idea chef traffic absent armed road link",
+        )
+        .unwrap();
 
         let refund_address = utils::generate_address(Chain::Liquid(LiquidChain::LiquidRegtest))
             .await
@@ -171,12 +265,13 @@ mod tests {
             .unwrap(),
         );
 
-        let session = LightningSession::new(
+        let session = BoltzSession::builder(
             ElementsNetwork::default_regtest(),
             AnyClient::Electrum(client.clone()),
-            Some(TIMEOUT),
-            None,
         )
+        .create_swap_timeout(TIMEOUT)
+        .mnemonic(mnemonic.clone())
+        .build()
         .await
         .unwrap();
 
@@ -191,20 +286,25 @@ mod tests {
         let serialized_data = prepare_pay_response.serialize().unwrap();
         drop(prepare_pay_response);
         drop(session);
-        let session = LightningSession::new(
+        let session = BoltzSession::builder(
             ElementsNetwork::default_regtest(),
             AnyClient::Electrum(client.clone()),
-            Some(TIMEOUT),
-            None,
         )
+        .create_swap_timeout(TIMEOUT)
+        .mnemonic(mnemonic)
+        .build()
         .await
         .unwrap();
-        let data = PreparePayData::deserialize(&serialized_data).unwrap();
+        let data = PreparePayDataSerializable::deserialize(&serialized_data).unwrap();
+        assert_eq!(
+            data.mnemonic_identifier.to_string(),
+            "e92cd0870c080a91a063345362b7e76d4ad3a4b4"
+        );
         let prepare_pay_response = session.restore_prepare_pay(data).await.unwrap();
         utils::send_to_address(
             Chain::Liquid(LiquidChain::LiquidRegtest),
-            &prepare_pay_response.address(),
-            prepare_pay_response.amount(),
+            &prepare_pay_response.uri_address().unwrap().to_string(),
+            prepare_pay_response.uri_amount(),
         )
         .await
         .unwrap();

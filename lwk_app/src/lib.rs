@@ -21,7 +21,7 @@ use std::thread::{sleep, JoinHandle};
 use std::time::Duration;
 
 use lwk_common::{
-    address_to_text_qr, address_to_uri_qr, keyorigin_xpub_from_str, multisig_desc, singlesig_desc,
+    address_to_qr, address_to_text_qr, keyorigin_xpub_from_str, multisig_desc, singlesig_desc,
     InvalidBipVariant, InvalidBlindingKeyVariant, InvalidMultisigVariant, InvalidSinglesigVariant,
     Signer,
 };
@@ -57,6 +57,7 @@ pub use config::Config;
 pub use error::Error;
 pub use lwk_tiny_jrpc::RpcError;
 
+mod blockchain_client;
 mod client;
 mod config;
 pub mod consts;
@@ -78,7 +79,7 @@ pub struct App {
 
 impl App {
     pub fn new(config: Config) -> Result<App, Error> {
-        log::info!("Creating new app with config: {:?}", config);
+        log::info!("Creating new app with config: {config:?}");
 
         Ok(App {
             rpc: None,
@@ -182,8 +183,8 @@ impl App {
                 (wollets_names, config)
             };
 
-            match config.electrum_client() {
-                Ok(mut electrum_client) => {
+            match config.blockchain_client() {
+                Ok(mut blockchain_client) => {
                     for name in wollets_names {
                         let state = match state_scanning
                             .lock()
@@ -195,7 +196,7 @@ impl App {
                             Err(_) => continue,
                         };
 
-                        match electrum_client.full_scan(&state) {
+                        match blockchain_client.full_scan(&state) {
                             Ok(Some(update)) => {
                                 let mut s = state_scanning.lock().expect("state lock poison");
                                 let _ = match s.wollets.get_mut(&name) {
@@ -443,7 +444,7 @@ fn inner_method_handler(request: Request, state: Arc<Mutex<State>>) -> Result<Re
                 .with_uri_qr
                 .map(|e| {
                     let pixel_per_module = (e != 0).then_some(e);
-                    address_to_uri_qr(addr.address(), pixel_per_module)
+                    address_to_qr(addr.address(), pixel_per_module)
                 })
                 .transpose()?;
 
@@ -712,7 +713,7 @@ fn inner_method_handler(request: Request, state: Arc<Mutex<State>>) -> Result<Re
 
             let derived_mnemonic = sw_signer
                 .derive_bip85_mnemonic(r.index, r.word_count)
-                .map_err(|e| Error::Generic(format!("BIP85 derivation failed: {}", e)))?;
+                .map_err(|e| Error::Generic(format!("BIP85 derivation failed: {e}")))?;
 
             Response::result(
                 request.id,
@@ -729,10 +730,10 @@ fn inner_method_handler(request: Request, state: Arc<Mutex<State>>) -> Result<Re
             let mut pset =
                 PartiallySignedTransaction::from_str(&r.pset).map_err(|e| e.to_string())?;
             let tx = wollet.finalize(&mut pset)?;
-            let electrum_client = s.config.electrum_client()?;
+            let blockchain_client = s.config.blockchain_client()?;
 
             if !r.dry_run {
-                electrum_client.broadcast(&tx)?;
+                blockchain_client.broadcast(&tx)?;
             }
 
             Response::result(
@@ -929,8 +930,8 @@ fn inner_method_handler(request: Request, state: Arc<Mutex<State>>) -> Result<Re
             let txid = Txid::from_str(&r.txid)?;
             let tx = if let Some(tx) = wollet.transaction(&txid)? {
                 tx.tx.clone()
-            } else if r.from_explorer {
-                let client = s.config.esplora_blocking_client()?;
+            } else if r.fetch {
+                let client = s.config.blockchain_client()?;
                 let mut txs = client.get_transactions(&[txid])?;
                 txs.pop().ok_or(Error::WalletTxNotFound(r.txid, r.name))?
             } else {
@@ -997,7 +998,7 @@ fn inner_method_handler(request: Request, state: Arc<Mutex<State>>) -> Result<Re
             let txid = proposal.needed_tx()?;
             let client = {
                 let s = state.lock()?;
-                s.config.esplora_blocking_client()?
+                s.config.blockchain_client()?
             };
             let tx = client.get_transactions(&[txid])?.pop().expect("tx");
             let proposal = proposal.validate(tx)?;
@@ -1164,8 +1165,8 @@ fn inner_method_handler(request: Request, state: Arc<Mutex<State>>) -> Result<Re
             s.persist_all()?;
             Response::result(request.id, serde_json::to_value(response::Empty {})?)
         }
-        Method::AssetFromExplorer => {
-            let r: request::AssetFromExplorer = serde_json::from_value(params)?;
+        Method::AssetFromRegistry => {
+            let r: request::AssetFromRegistry = serde_json::from_value(params)?;
             let mut s = state.lock()?;
             let asset_id = AssetId::from_str(&r.asset_id)?;
             if s.get_asset(&asset_id).is_ok() {
@@ -1173,7 +1174,7 @@ fn inner_method_handler(request: Request, state: Arc<Mutex<State>>) -> Result<Re
             }
             let registry = lwk_wollet::registry::blocking::Registry::new(&s.config.registry_url)?;
             let (contract, issuance_tx) =
-                registry.fetch_with_tx(asset_id, &s.config.esplora_client())?;
+                registry.fetch_with_tx(asset_id, &s.config.blockchain_client()?)?;
             s.insert_asset(asset_id, issuance_tx, contract)?;
             // convert the request to an AssetInsert to skip network calls
             let asset_insert_request = s.get_asset(&asset_id)?.request().expect("asset");
@@ -1187,7 +1188,7 @@ fn inner_method_handler(request: Request, state: Arc<Mutex<State>>) -> Result<Re
                 let s = state.lock()?;
                 (s.config.jade_network(), Some(s.config.timeout))
             };
-            log::debug!("jade network: {}", network);
+            log::debug!("jade network: {network}");
 
             let jade = match r.emulator {
                 Some(emulator) => Jade::from_socket(emulator, network)?,

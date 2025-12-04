@@ -22,7 +22,7 @@ wollet = Wollet(network, desc, datadir=None)
 addr = wollet.address(None)
 
 # ANCHOR_END: address
-client = ElectrumClient(node.electrum_url(), tls=False, validate_domain=False)
+client = ElectrumClient.from_url(node.electrum_url())
 
 sats = 100000
 txid = node.send_to_address(addr.address(), sats, asset=None)
@@ -33,10 +33,29 @@ txs = wollet.transactions()
 balance = wollet.balance()
 # ANCHOR_END: txs
 
+# TODO: moves example code related to clients.md to a separate file `clients.py`.
+# ANCHOR: electrum_client
+# Create electrum client with custom URL
+client = ElectrumClient("blockstream.info:995", tls=True, validate_domain=True)
+
+# Or use the default electrum client for the network
+default_client = Network.mainnet().default_electrum_client()
+# ANCHOR_END: electrum_client
+
+# ANCHOR: esplora_client
+url = "https://blockstream.info/liquid/api"
+client = EsploraClient(url, Network.mainnet())
+# ANCHOR_END: esplora_client
+
+# ANCHOR: waterfalls_client
+url = "https://waterfalls.liquidwebwallet.org/liquid/api"
+client = EsploraClient.new_waterfalls(url, Network.mainnet())
+# ANCHOR_END: waterfalls_client
+
 # ANCHOR: client
 url = "https://blockstream.info/liquidtestnet/api"
 client = EsploraClient(url, network)
-client = ElectrumClient(node.electrum_url(), tls=False, validate_domain=False)  # ANCHOR: ignore
+client = ElectrumClient.from_url(node.electrum_url())  # ANCHOR: ignore
 
 update = client.full_scan(wollet)
 wollet.apply_update(update)

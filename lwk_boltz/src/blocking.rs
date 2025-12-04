@@ -1,22 +1,23 @@
-use std::{ops::ControlFlow, sync::Arc, time::Duration};
+use std::{ops::ControlFlow, sync::Arc};
 
-use bip39::Mnemonic;
 use boltz_client::{
     boltz::{
-        GetReversePairsResponse, GetSubmarinePairsResponse, RevSwapStates, SubSwapStates,
-        SwapRestoreResponse, Webhook,
+        ChainSwapStates, GetReversePairsResponse, GetSubmarinePairsResponse, RevSwapStates,
+        SubSwapStates, SwapRestoreResponse, Webhook,
     },
+    network::Chain,
     Bolt11Invoice,
 };
-use lwk_wollet::{elements, ElementsNetwork};
+use elements::bitcoin;
+use lwk_wollet::elements;
 
 use crate::{
-    clients::AnyClient, Error, InvoiceData, LightningPayment, PreparePayData, RescueFile,
-    SwapStatus,
+    prepare_pay_data::PreparePayDataSerializable, ChainSwapDataSerializable, Error, InvoiceData,
+    InvoiceDataSerializable, LightningPayment, PreparePayData, RescueFile, SwapStatus,
 };
 
-pub struct LightningSession {
-    inner: super::LightningSession,
+pub struct BoltzSession {
+    inner: super::BoltzSession,
     runtime: Arc<tokio::runtime::Runtime>,
 }
 
@@ -30,19 +31,18 @@ pub struct InvoiceResponse {
     runtime: Arc<tokio::runtime::Runtime>,
 }
 
-impl LightningSession {
-    pub fn new(
-        network: ElementsNetwork,
-        client: AnyClient,
-        timeout: Option<Duration>,
-        mnemonic: Option<Mnemonic>,
-    ) -> Result<Self, Error> {
-        let runtime = Arc::new(tokio::runtime::Runtime::new()?);
-        let _guard = runtime.enter();
-        let inner = runtime.block_on(super::LightningSession::new(
-            network, client, timeout, mnemonic,
-        ))?;
-        Ok(Self { inner, runtime })
+pub struct LockupResponse {
+    inner: super::LockupResponse,
+    runtime: Arc<tokio::runtime::Runtime>,
+}
+
+impl BoltzSession {
+    /// Internal method to construct a blocking session from an async session and runtime
+    pub(crate) fn new_from_async(
+        inner: super::BoltzSession,
+        runtime: Arc<tokio::runtime::Runtime>,
+    ) -> Self {
+        Self { inner, runtime }
     }
 
     pub fn prepare_pay(
@@ -62,7 +62,10 @@ impl LightningSession {
         })
     }
 
-    pub fn restore_prepare_pay(&self, data: PreparePayData) -> Result<PreparePayResponse, Error> {
+    pub fn restore_prepare_pay(
+        &self,
+        data: PreparePayDataSerializable,
+    ) -> Result<PreparePayResponse, Error> {
         let inner = self
             .runtime
             .block_on(self.inner.restore_prepare_pay(data))?;
@@ -91,9 +94,55 @@ impl LightningSession {
         })
     }
 
-    pub fn restore_invoice(&self, data: InvoiceData) -> Result<InvoiceResponse, Error> {
+    pub fn restore_invoice(&self, data: InvoiceDataSerializable) -> Result<InvoiceResponse, Error> {
         let inner = self.runtime.block_on(self.inner.restore_invoice(data))?;
         Ok(InvoiceResponse {
+            inner,
+            runtime: self.runtime.clone(),
+        })
+    }
+
+    pub fn btc_to_lbtc(
+        &self,
+        amount: u64,
+        refund_address: &bitcoin::Address,
+        claim_address: &elements::Address,
+        webhook: Option<Webhook<ChainSwapStates>>,
+    ) -> Result<LockupResponse, Error> {
+        let inner = self.runtime.block_on(self.inner.btc_to_lbtc(
+            amount,
+            refund_address,
+            claim_address,
+            webhook,
+        ))?;
+        Ok(LockupResponse {
+            inner,
+            runtime: self.runtime.clone(),
+        })
+    }
+
+    pub fn lbtc_to_btc(
+        &self,
+        amount: u64,
+        refund_address: &elements::Address,
+        claim_address: &bitcoin::Address,
+        webhook: Option<Webhook<ChainSwapStates>>,
+    ) -> Result<LockupResponse, Error> {
+        let inner = self.runtime.block_on(self.inner.lbtc_to_btc(
+            amount,
+            refund_address,
+            claim_address,
+            webhook,
+        ))?;
+        Ok(LockupResponse {
+            inner,
+            runtime: self.runtime.clone(),
+        })
+    }
+
+    pub fn restore_lockup(&self, data: ChainSwapDataSerializable) -> Result<LockupResponse, Error> {
+        let inner = self.runtime.block_on(self.inner.restore_lockup(data))?;
+        Ok(LockupResponse {
             inner,
             runtime: self.runtime.clone(),
         })
@@ -130,6 +179,14 @@ impl LightningSession {
         Ok(inner)
     }
 
+    pub fn next_index_to_use(&self) -> u32 {
+        self.inner.next_index_to_use()
+    }
+
+    pub fn set_next_index_to_use(&self, next_index_to_use: u32) {
+        self.inner.set_next_index_to_use(next_index_to_use);
+    }
+
     pub fn fetch_swaps_info(
         &self,
     ) -> Result<(GetReversePairsResponse, GetSubmarinePairsResponse), Error> {
@@ -149,15 +206,20 @@ impl PreparePayResponse {
     }
 
     pub fn uri(&self) -> String {
-        self.inner.data.create_swap_response.bip21.clone()
+        self.inner.uri()
     }
 
-    pub fn uri_address(&self) -> String {
-        self.inner.data.create_swap_response.address.clone()
+    pub fn uri_address(&self) -> Result<elements::Address, Error> {
+        self.inner.uri_address()
     }
 
     pub fn uri_amount(&self) -> u64 {
-        self.inner.data.create_swap_response.expected_amount
+        self.inner.uri_amount()
+    }
+
+    /// See [`crate::PreparePayResponse::fee()`]
+    pub fn fee(&self) -> Option<u64> {
+        self.inner.fee()
     }
 
     pub fn serialize(&self) -> Result<String, Error> {
@@ -184,6 +246,11 @@ impl InvoiceResponse {
         self.inner.bolt11_invoice()
     }
 
+    /// See [`crate::InvoiceResponse::fee()`]
+    pub fn fee(&self) -> Option<u64> {
+        self.inner.fee()
+    }
+
     pub fn advance(&mut self) -> Result<ControlFlow<bool, SwapStatus>, Error> {
         let inner = self.runtime.block_on(self.inner.advance())?;
         Ok(inner)
@@ -191,5 +258,41 @@ impl InvoiceResponse {
 
     pub fn serialize(&self) -> Result<String, Error> {
         self.inner.serialize()
+    }
+}
+
+impl LockupResponse {
+    pub fn swap_id(&self) -> String {
+        self.inner.swap_id()
+    }
+
+    pub fn lockup_address(&self) -> &str {
+        self.inner.lockup_address()
+    }
+
+    pub fn expected_amount(&self) -> u64 {
+        self.inner.expected_amount()
+    }
+
+    pub fn chain_from(&self) -> Chain {
+        self.inner.chain_from()
+    }
+
+    pub fn chain_to(&self) -> Chain {
+        self.inner.chain_to()
+    }
+
+    pub fn advance(&mut self) -> Result<ControlFlow<bool, SwapStatus>, Error> {
+        let inner = self.runtime.block_on(self.inner.advance())?;
+        Ok(inner)
+    }
+
+    pub fn serialize(&self) -> Result<String, Error> {
+        self.inner.serialize()
+    }
+
+    pub fn complete(self) -> Result<bool, Error> {
+        let inner = self.runtime.block_on(self.inner.complete())?;
+        Ok(inner)
     }
 }

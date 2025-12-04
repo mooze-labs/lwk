@@ -14,24 +14,19 @@ def save_swap_data(swap_id, data):
         f.write(data)
     print(f"Swap data saved to {swap_file}")
 
-def delete_swap_data(swap_id):
-    """Delete swap data file"""
-    swap_file = f"{swaps_dir}/{swap_id}.json"
-    try:
-        os.remove(swap_file)
-        print(f"Swap data deleted: {swap_file}")
-    except FileNotFoundError:
-        print(f"Swap data file not found: {swap_file}")
-    except Exception as e:
-        print(f"Error deleting swap data: {e}")
 
-def rename_swap_data(swap_id):
-    """Move swap data file to failed directory"""
+def rename_swap_data(swap_id, status):
+    """Move swap data file to completed or failed directory
+    
+    Args:
+        swap_id: The swap identifier
+        status: Either "completed" or "failed"
+    """
     src_file = f"{swaps_dir}/{swap_id}.json"
-    dst_file = f"{swaps_dir}/failed/{swap_id}.json"
+    dst_file = f"{swaps_dir}/{status}/{swap_id}.json"
     try:
         shutil.move(src_file, dst_file)
-        print(f"Swap data moved to failed: {dst_file}")
+        print(f"Swap data moved to {status}: {dst_file}")
     except FileNotFoundError:
         print(f"Swap data file not found: {src_file}")
     except Exception as e:
@@ -73,50 +68,93 @@ def update_balance(wollet, esplora_client, desc):
 def invoice_thread(invoice_response, claim_address):
     """Thread function to handle invoice completion"""
     print("Waiting for invoice payment...")
+    swap_id = invoice_response.swap_id()
+
     while True:
         try:
             state = invoice_response.advance()
-            swap_id = invoice_response.swap_id()
+            print(f"Invoice state for swap {swap_id}: {state}")
             if state == PaymentState.CONTINUE:
                 data = invoice_response.serialize()
                 save_swap_data(swap_id, data)
             elif state == PaymentState.SUCCESS:
                 print("Invoice payment completed successfully!")
-                delete_swap_data(swap_id)
+                rename_swap_data(swap_id, "completed")
                 break
             elif state == PaymentState.FAILED:
                 print("Invoice payment failed!")
-                rename_swap_data(swap_id)
+                rename_swap_data(swap_id, "failed")
                 break
-               
+        except LwkError.NoBoltzUpdate as e:
+            print("No update available, continuing polling...")
+            time.sleep(1)
+            continue
         except Exception as e:
-            print(f"Error in invoice thread: {e}")
+            print(f"Error in invoice thread - type: {type(e).__name__}, details: {e}")
+            import traceback
+            traceback.print_exc()
             break
 
 def pay_invoice_thread(prepare_pay_response):
     """Thread function to handle payment completion"""
     print("Waiting for payment completion...")
+    swap_id = prepare_pay_response.swap_id()
     while True:
         try:
             state = prepare_pay_response.advance()
-            swap_id = prepare_pay_response.swap_id()
+            print(f"Payment state for swap {swap_id}: {state}")
             if state == PaymentState.CONTINUE:
                 data = prepare_pay_response.serialize()
                 save_swap_data(swap_id, data)
             elif state == PaymentState.SUCCESS:
                 print("Payment completed successfully!")
-                delete_swap_data(swap_id)
+                rename_swap_data(swap_id, "completed")
                 break
             elif state == PaymentState.FAILED:
                 print("Payment failed!")
-                rename_swap_data(swap_id)
+                rename_swap_data(swap_id, "failed")
                 break
-            
+        except LwkError.NoBoltzUpdate as e:
+            print("No update available, continuing polling...")
+            time.sleep(1)
+            continue
         except Exception as e:
-            print(f"Error in payment thread: {e}")
+            print(f"Error in payment thread - type: {type(e).__name__}, details: {e}")
+            import traceback
+            traceback.print_exc()
             break
 
-def show_invoice(lightning_session, wollet):
+def lockup_thread(lockup_response):
+    """Thread function to handle chain swap completion"""
+    print("Waiting for chain swap completion...")
+    swap_id = lockup_response.swap_id()
+
+    while True:
+        try:
+            state = lockup_response.advance()
+            print(f"Chain swap state for swap {swap_id}: {state}")
+            if state == PaymentState.CONTINUE:
+                data = lockup_response.serialize()
+                save_swap_data(swap_id, data)
+            elif state == PaymentState.SUCCESS:
+                print("Chain swap completed successfully!")
+                rename_swap_data(swap_id, "completed")
+                break
+            elif state == PaymentState.FAILED:
+                print("Chain swap failed!")
+                rename_swap_data(swap_id, "failed")
+                break
+        except LwkError.NoBoltzUpdate as e:
+            print("No update available, continuing polling...")
+            time.sleep(1)
+            continue
+        except Exception as e:
+            print(f"Error in chain swap thread - type: {type(e).__name__}, details: {e}")
+            import traceback
+            traceback.print_exc()
+            break
+
+def show_invoice(boltz_session, wollet):
     """Create and show an invoice"""
     # Ask for the invoice amount
     while True:
@@ -136,8 +174,11 @@ def show_invoice(lightning_session, wollet):
 
     # Create invoice
     webhook_url = os.getenv('WEBHOOK')
-    webhook = WebHook(webhook_url) if webhook_url else None
-    invoice_response = lightning_session.invoice(amount, "Lightning payment", claim_address, webhook) 
+    webhook = WebHook(webhook_url, status=[]) if webhook_url else None
+    invoice_response = boltz_session.invoice(amount, "Lightning payment", claim_address, webhook) 
+
+    fee = invoice_response.fee()
+    print(f"Fee: {fee}")
 
     # Get and print the bolt11 invoice
     bolt11_invoice_obj = invoice_response.bolt11_invoice()
@@ -156,7 +197,7 @@ def show_invoice(lightning_session, wollet):
     thread.start()
     print("Started thread to monitor invoice payment.")
 
-def pay_invoice(lightning_session, wollet, esplora_client, signer, skip_completion_thread=False):
+def pay_invoice(boltz_session, wollet, esplora_client, signer, skip_completion_thread=False):
     """Pay a bolt11 invoice"""
     # Read bolt11 invoice from user
     bolt11_str = input("Enter bolt11 invoice: ").strip()
@@ -171,15 +212,17 @@ def pay_invoice(lightning_session, wollet, esplora_client, signer, skip_completi
 
         # Prepare payment
         webhook_url = os.getenv('WEBHOOK')
-        webhook = WebHook(webhook_url) if webhook_url else None
-        prepare_pay_response = lightning_session.prepare_pay(lightning_payment, refund_address, webhook) 
+        webhook = WebHook(webhook_url, status=[]) if webhook_url else None
+        prepare_pay_response = boltz_session.prepare_pay(lightning_payment, refund_address, webhook) 
+
+        fee = prepare_pay_response.fee()
+        print(f"Fee: {fee}")
 
         data=prepare_pay_response.serialize()
         swap_id=prepare_pay_response.swap_id()
 
         # Save swap data to file
         save_swap_data(swap_id, data)
-
 
         # Get the URI for payment
         uri = prepare_pay_response.uri()
@@ -247,7 +290,7 @@ def pay_invoice(lightning_session, wollet, esplora_client, signer, skip_completi
     except Exception as e:
         print(f"Error preparing payment: {e}")
 
-def restorable_reverse_swaps(lightning_session, wollet):
+def restorable_reverse_swaps(boltz_session, wollet):
     """Fetch reverse swaps for the wallet"""
     try:
         # Get the claim address for this wallet
@@ -255,8 +298,8 @@ def restorable_reverse_swaps(lightning_session, wollet):
         print(f"Fetching reverse swaps for claim address: {claim_address}")
 
         # Fetch reverse swaps from Boltz
-        swap_list = lightning_session.swap_restore()
-        swap_data_list = lightning_session.restorable_reverse_swaps(swap_list, claim_address)
+        swap_list = boltz_session.swap_restore()
+        swap_data_list = boltz_session.restorable_reverse_swaps(swap_list, claim_address)
 
         if not swap_data_list:
             print("No reverse swaps found")
@@ -274,7 +317,7 @@ def restorable_reverse_swaps(lightning_session, wollet):
     except Exception as e:
         print(f"Error fetching reverse swaps: {e}")
 
-def restorable_submarine_swaps(lightning_session, wollet):
+def restorable_submarine_swaps(boltz_session, wollet):
     """Fetch submarine swaps for the wallet"""
     try:
         # Get the refund address for this wallet
@@ -282,8 +325,8 @@ def restorable_submarine_swaps(lightning_session, wollet):
         print(f"Fetching submarine swaps for refund address: {refund_address}")
 
         # Fetch submarine swaps from Boltz
-        swap_list = lightning_session.swap_restore()
-        swap_data_list = lightning_session.restorable_submarine_swaps(swap_list, refund_address)
+        swap_list = boltz_session.swap_restore()
+        swap_data_list = boltz_session.restorable_submarine_swaps(swap_list, refund_address)
 
         if not swap_data_list:
             print("No submarine swaps found")
@@ -301,11 +344,11 @@ def restorable_submarine_swaps(lightning_session, wollet):
     except Exception as e:
         print(f"Error fetching submarine swaps: {e}")
 
-def list_all_swaps(lightning_session):
+def list_all_swaps(boltz_session):
     """List all swaps for the lightning session"""
     try:
         # Fetch all swaps from Boltz
-        swap_list = lightning_session.swap_restore()
+        swap_list = boltz_session.swap_restore()
 
         # Convert to JSON string and parse
         swaps_json = str(swap_list)
@@ -327,11 +370,11 @@ def list_all_swaps(lightning_session):
     except Exception as e:
         print(f"Error listing all swaps: {e}")
 
-def show_swaps_info(lightning_session):
+def show_swaps_info(boltz_session):
     """Show swaps info from Boltz API"""
     try:
         # Fetch swaps info from Boltz
-        swaps_info_json = lightning_session.fetch_swaps_info()
+        swaps_info_json = boltz_session.fetch_swaps_info()
 
         # Parse and pretty print the JSON
         swaps_info = json.loads(swaps_info_json)
@@ -339,12 +382,145 @@ def show_swaps_info(lightning_session):
     except Exception as e:
         print(f"Error fetching swaps info: {e}")
 
+def lbtc_to_btc_swap(boltz_session, wollet, esplora_client, signer):
+    """Create a swap to convert LBTC to BTC"""
+    # Ask for the swap amount
+    while True:
+        try:
+            amount_str = input("Enter amount in satoshis to swap from LBTC to BTC: ").strip()
+            amount = int(amount_str)
+            if amount <= 0:
+                print("Amount must be positive. Please try again.")
+                continue
+            break
+        except ValueError:
+            print("Invalid amount. Please enter a valid number.")
+
+    # Ask for the Bitcoin claim address
+    claim_address = input("Enter Bitcoin address to receive BTC: ").strip()
+
+    # Get a Liquid refund address from the wallet
+    refund_address = wollet.address(None).address()
+    print(f"Refund address (Liquid): {refund_address}")
+
+    try:
+        # Create the swap
+        webhook_url = os.getenv('WEBHOOK')
+        webhook = WebHook(webhook_url, status=[]) if webhook_url else None
+        lockup_response = boltz_session.lbtc_to_btc(amount, refund_address, claim_address, webhook)
+
+        # Get swap details
+        swap_id = lockup_response.swap_id()
+        lockup_address = lockup_response.lockup_address()
+        expected_amount = lockup_response.expected_amount()
+        from_chain = lockup_response.chain_from()
+        to_chain = lockup_response.chain_to()
+
+        print(f"Swap ID: {swap_id}")
+        print(f"Lockup address: {lockup_address}")
+        print(f"Expected amount: {expected_amount}")
+        print(f"From chain: {from_chain}")
+        print(f"To chain: {to_chain}")
+
+        # Save swap data
+        data = lockup_response.serialize()
+        save_swap_data(swap_id, data)
+
+        # Build and send transaction to the lockup address
+        print(f"Sending {expected_amount} sats to {lockup_address}...")
+        builder = network.tx_builder()
+        lbtc_asset = network.policy_asset()
+        lockup_addr = Address(lockup_address)
+        builder.add_recipient(lockup_addr, expected_amount, lbtc_asset)
+
+        # Create the PSET
+        pset = builder.finish(wollet)
+
+        # Sign the PSET
+        signed_pset = signer.sign(pset)
+
+        # Finalize and extract transaction
+        finalized_pset = wollet.finalize(signed_pset)
+        tx = finalized_pset.extract_tx()
+
+        # Broadcast the transaction
+        txid = esplora_client.broadcast(tx)
+        print(f"Transaction broadcasted! TXID: {txid}")
+
+        # Start thread to monitor swap completion
+        thread = threading.Thread(target=lockup_thread, args=(lockup_response,))
+        thread.daemon = True
+        thread.start()
+        print("Started thread to monitor chain swap completion.")
+
+    except Exception as e:
+        print(f"Error creating LBTC to BTC swap: {e}")
+
+def btc_to_lbtc_swap(boltz_session, wollet):
+    """Create a swap to convert BTC to LBTC"""
+    # Ask for the swap amount
+    while True:
+        try:
+            amount_str = input("Enter amount in satoshis to swap from BTC to LBTC: ").strip()
+            amount = int(amount_str)
+            if amount <= 0:
+                print("Amount must be positive. Please try again.")
+                continue
+            break
+        except ValueError:
+            print("Invalid amount. Please enter a valid number.")
+
+    # Get a Liquid claim address from the wallet
+    claim_address = wollet.address(None).address()
+    print(f"Claim address (Liquid): {claim_address}")
+
+    # Ask for the Bitcoin refund address
+    refund_address = input("Enter Bitcoin address for refunds: ").strip()
+
+    try:
+        # Create the swap
+        webhook_url = os.getenv('WEBHOOK')
+        webhook = WebHook(webhook_url, status=[]) if webhook_url else None
+        lockup_response = boltz_session.btc_to_lbtc(amount, refund_address, claim_address, webhook)
+
+        # Get swap details
+        swap_id = lockup_response.swap_id()
+        lockup_address = lockup_response.lockup_address()
+        expected_amount = lockup_response.expected_amount()
+        from_chain = lockup_response.chain_from()
+        to_chain = lockup_response.chain_to()
+
+        print(f"\nSwap ID: {swap_id}")
+        print(f"From chain: {from_chain}")
+        print(f"To chain: {to_chain}")
+        print(f"\n***** PLEASE SEND {expected_amount} sats from your Bitcoin wallet to: {lockup_address} *****\n")
+
+        # Save swap data
+        data = lockup_response.serialize()
+        save_swap_data(swap_id, data)
+
+        # Start thread to monitor swap completion
+        thread = threading.Thread(target=lockup_thread, args=(lockup_response,))
+        thread.daemon = True
+        thread.start()
+        print("Started thread to monitor chain swap completion.")
+
+    except Exception as e:
+        print(f"Error creating BTC to LBTC swap: {e}")
+
 def main():
     # Get mnemonic from environment variable
     mnemonic_str = os.getenv('MNEMONIC')
     if not mnemonic_str:
         print("Error: MNEMONIC environment variable not set")
         return
+
+    polling = os.getenv('POLLING')
+    if polling:
+        polling = True
+    else:
+        polling = False
+    print(f"Polling: {polling}")
 
     mnemonic = Mnemonic(mnemonic_str)
     global network
@@ -357,6 +533,7 @@ def main():
     os.makedirs("swaps", exist_ok=True)
     os.makedirs(swaps_dir, exist_ok=True)
     os.makedirs(f"{swaps_dir}/failed", exist_ok=True)
+    os.makedirs(f"{swaps_dir}/completed", exist_ok=True)
 
     b = EsploraClientBuilder(
         base_url="https://waterfalls.liquidwebwallet.org/liquid/api",
@@ -378,7 +555,22 @@ def main():
     mnemonic_lightning = signer.derive_bip85_mnemonic(0, 12) # for security reasons using a different mnemonic for the lightning session
     lightning_client = AnyClient.from_esplora(esplora_client)
     logger = MyLogger()
-    lightning_session = LightningSession(network=network, client=lightning_client, timeout=30, logging=logger, mnemonic=mnemonic_lightning)
+
+    # Use blockstream electrum instance for bitcoin, without specifying this, bull bitcoin electrum instances will be used
+    bitcoin_electrum_url = "ssl://bitcoin-mainnet.blockstream.info:50002"
+
+    builder = BoltzSessionBuilder(
+        network=network,
+        client=lightning_client,
+        timeout=30,
+        mnemonic=mnemonic_lightning,
+        logging=logger,
+        polling=polling,
+        referral_id="LWK python example",
+        bitcoin_electrum_client_url=bitcoin_electrum_url,
+        random_preimages=True,
+    )
+    boltz_session = BoltzSession.from_builder(builder)
 
     # Initial balance update
     update_balance(wollet, esplora_client, desc)
@@ -401,7 +593,7 @@ def main():
             if swap_type == 'submarine':
                 print(f"Restoring submarine swap {swap_id}...")
                 try:
-                    prepare_pay_response = lightning_session.restore_prepare_pay(data)
+                    prepare_pay_response = boltz_session.restore_prepare_pay(data)
                     # Start thread to monitor payment
                     thread = threading.Thread(target=pay_invoice_thread, args=(prepare_pay_response,))
                     thread.daemon = True
@@ -409,14 +601,14 @@ def main():
                     print(f"Started monitoring thread for submarine swap {swap_id}")
                 except LwkError.SwapExpired as e:
                     print(f"Submarine swap {swap_id} has expired, moving to failed directory")
-                    rename_swap_data(swap_id)
+                    rename_swap_data(swap_id, "failed")
                 except Exception as e:
                     print(f"Error restoring submarine swap {swap_id}: {e}")
 
             elif swap_type == 'reverse':
                 print(f"Restoring reverse swap {swap_id}...")
                 try:
-                    invoice_response = lightning_session.restore_invoice(data)
+                    invoice_response = boltz_session.restore_invoice(data)
                     # Start thread to monitor invoice
                     thread = threading.Thread(target=invoice_thread, args=(invoice_response, wollet.address(None).address()))
                     thread.daemon = True
@@ -424,10 +616,23 @@ def main():
                     print(f"Started monitoring thread for reverse swap {swap_id}")
                 except LwkError.SwapExpired as e:
                     print(f"Reverse swap {swap_id} has expired, moving to failed directory")
-                    rename_swap_data(swap_id)
+                    rename_swap_data(swap_id, "failed")
                 except Exception as e:
                     print(f"Error restoring reverse swap {swap_id}: {e}")
-
+            elif swap_type == 'chain':
+                print(f"Restoring chain swap {swap_id}...")
+                try:
+                    lockup_response = boltz_session.restore_lockup(data)
+                    # Start thread to monitor invoice
+                    thread = threading.Thread(target=lockup_thread, args=(lockup_response,))
+                    thread.daemon = True
+                    thread.start()
+                    print(f"Started monitoring thread for chain swap {swap_id}")
+                except LwkError.SwapExpired as e:
+                    print(f"Chain swap {swap_id} has expired, moving to failed directory")
+                    rename_swap_data(swap_id, "failed")
+                except Exception as e:
+                    print(f"Error restoring chain swap {swap_id}: {e}")
             else:
                 print(f"Unknown swap type '{swap_type}' in file {swap_file}")
 
@@ -446,6 +651,8 @@ def main():
         print("7) Fetch restorable submarine swaps")
         print("8) List all swaps")
         print("9) Show swaps info")
+        print("10) Swap LBTC to BTC (chain swap)")
+        print("11) Swap BTC to LBTC (chain swap) (requires external btc wallet)")
         print("q) Quit")
 
         choice = input("Choose option: ").strip().lower()
@@ -455,17 +662,17 @@ def main():
             update_balance(wollet, esplora_client, desc)
         elif choice == '2':
             print("\n=== Creating Invoice ===")
-            show_invoice(lightning_session, wollet)
+            show_invoice(boltz_session, wollet)
         elif choice == '3':
             print("\n=== Paying Invoice ===")
-            pay_invoice(lightning_session, wollet, esplora_client, signer)
+            pay_invoice(boltz_session, wollet, esplora_client, signer)
         elif choice == '4':
             print("\n=== Paying Invoice (but don't start completion thread) ===")
-            pay_invoice(lightning_session, wollet, esplora_client, signer, skip_completion_thread=True)
+            pay_invoice(boltz_session, wollet, esplora_client, signer, skip_completion_thread=True)
         elif choice == '5':
             print("\n=== Generating Rescue File ===")
             try:
-                rescue_data = lightning_session.rescue_file()
+                rescue_data = boltz_session.rescue_file()
                 # Compute hash of the rescue data
                 rescue_hash = hashlib.sha256(rescue_data.encode('utf-8')).hexdigest()[:16]
                 filename = f"rescue_file_{rescue_hash}.json"
@@ -478,16 +685,22 @@ def main():
                 print(f"Error generating rescue file: {e}")
         elif choice == '6':
             print("\n=== Fetching Reverse Swaps ===")
-            restorable_reverse_swaps(lightning_session, wollet)
+            restorable_reverse_swaps(boltz_session, wollet)
         elif choice == '7':
             print("\n=== Fetching Submarine Swaps ===")
-            restorable_submarine_swaps(lightning_session, wollet)
+            restorable_submarine_swaps(boltz_session, wollet)
         elif choice == '8':
             print("\n=== Listing All Swaps ===")
-            list_all_swaps(lightning_session)
+            list_all_swaps(boltz_session)
         elif choice == '9':
             print("\n=== Showing Swaps Info ===")
-            show_swaps_info(lightning_session)
+            show_swaps_info(boltz_session)
+        elif choice == '10':
+            print("\n=== Swapping LBTC to BTC ===")
+            lbtc_to_btc_swap(boltz_session, wollet, esplora_client, signer)
+        elif choice == '11':
+            print("\n=== Swapping BTC to LBTC ===")
+            btc_to_lbtc_swap(boltz_session, wollet)
         elif choice == 'q':
             print("Goodbye!")
             break

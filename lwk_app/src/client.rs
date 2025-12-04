@@ -300,13 +300,9 @@ impl Client {
         &self,
         name: String,
         txid: String,
-        from_explorer: bool,
+        fetch: bool,
     ) -> Result<response::WalletTx, Error> {
-        let req = request::WalletTx {
-            name,
-            txid,
-            from_explorer,
-        };
+        let req = request::WalletTx { name, txid, fetch };
         self.make_request(Method::WalletTx, Some(req))
     }
 
@@ -467,9 +463,9 @@ impl Client {
         self.make_request(Method::AssetRemove, Some(req))
     }
 
-    pub fn asset_from_explorer(&self, asset_id: String) -> Result<response::Empty, Error> {
-        let req = request::AssetFromExplorer { asset_id };
-        self.make_request(Method::AssetFromExplorer, Some(req))
+    pub fn asset_from_registry(&self, asset_id: String) -> Result<response::Empty, Error> {
+        let req = request::AssetFromRegistry { asset_id };
+        self.make_request(Method::AssetFromRegistry, Some(req))
     }
 
     pub fn asset_publish(&self, asset_id: String) -> Result<response::AssetPublish, Error> {

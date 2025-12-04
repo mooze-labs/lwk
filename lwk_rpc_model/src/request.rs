@@ -395,8 +395,8 @@ pub struct WalletTx {
     /// Transaction ID
     pub txid: String,
 
-    /// Use the explorer if necessary
-    pub from_explorer: bool,
+    /// Attempt to fetch the transaction if not available locally
+    pub fetch: bool,
 }
 
 /// Request to have details of an asset
@@ -426,9 +426,9 @@ pub struct AssetRemove {
     pub asset_id: String,
 }
 
-/// Request to insert an asset retrieving information from the explorer
+/// Request to insert an asset retrieving information from the asset registry
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
-pub struct AssetFromExplorer {
+pub struct AssetFromRegistry {
     /// The asset identifier
     pub asset_id: String,
 }

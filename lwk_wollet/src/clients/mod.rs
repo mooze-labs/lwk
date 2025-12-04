@@ -1,7 +1,7 @@
 //! Clients to fetch data from the Blockchain.
 
 use crate::{
-    store::{Height, Timestamp},
+    cache::{Height, Timestamp},
     BlindingPublicKey, Chain, DownloadTxResult, ElementsNetwork, Error, WolletDescriptor, EC,
 };
 use elements::{
@@ -21,6 +21,8 @@ use std::{
 pub mod blocking;
 
 pub mod asyncr;
+
+pub(crate) mod electrum_url;
 
 /// A builder for the [`crate::clients::asyncr::EsploraClient`] or [`crate::clients::blocking::EsploraClient`]
 #[derive(Debug, Clone)]

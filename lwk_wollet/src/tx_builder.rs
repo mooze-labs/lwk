@@ -4,8 +4,9 @@ use elements::{
     confidential::{AssetBlindingFactor, Nonce, Value, ValueBlindingFactor},
     issuance::ContractHash,
     pset::{raw::ProprietaryKey, Output, PartiallySignedTransaction, PsbtSighashType},
-    secp256k1_zkp::{self, SecretKey, ZERO_TWEAK},
-    Address, AssetId, BlindAssetProofs, EcdsaSighashType, OutPoint, Script, Transaction,
+    secp256k1_zkp::{self, RangeProof, SurjectionProof, SecretKey, ZERO_TWEAK},
+    Address, AssetId, BlindAssetProofs, BlindValueProofs, EcdsaSighashType, OutPoint, Script,
+    Transaction, TxOut, TxOutSecrets,
 };
 use rand::thread_rng;
 
@@ -13,7 +14,7 @@ use crate::{
     hashes::Hash,
     liquidex::{self, LiquidexError, Validated},
     model::{ExternalUtxo, IssuanceDetails, Recipient},
-    pset_create::{validate_address, IssuanceRequest},
+    pset_create::{validate_address, IssuanceRequest, SECP256K1_SURJECTIONPROOF_MAX_N_INPUTS},
     Contract, ElementsNetwork, Error, LiquidexProposal, UnvalidatedRecipient, Wollet, EC,
 };
 
@@ -66,25 +67,88 @@ fn add_external_input(
     inp_txout_sec: &mut HashMap<usize, elements::TxOutSecrets>,
     inp_weight: &mut usize,
     utxo: &ExternalUtxo,
-) {
-    let mut input = elements::pset::Input::from_prevout(utxo.outpoint);
-    let mut txout = utxo.txout.clone();
-    // This field is used by stateless blinders or signers to
-    // learn the blinding factors and unblinded values of this input.
-    // We need this since the output witness, which includes the
-    // rangeproof, is not serialized.
+    add_input_rangeproofs: bool,
+) -> Result<usize, Error> {
+    add_input_inner(
+        pset,
+        inp_txout_sec,
+        inp_weight,
+        utxo.outpoint,
+        utxo.txout.clone(),
+        utxo.tx.clone(),
+        utxo.unblinded,
+        utxo.max_weight_to_satisfy,
+        true, // external inputs can be explicit
+        add_input_rangeproofs,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn add_input_inner(
+    pset: &mut PartiallySignedTransaction,
+    inp_txout_sec: &mut HashMap<usize, TxOutSecrets>,
+    inp_weight: &mut usize,
+    outpoint: OutPoint,
+    mut txout: TxOut,
+    tx: Option<Transaction>,
+    unblinded: TxOutSecrets,
+    max_weight_to_satisfy: usize,
+    allow_explicit_input: bool,
+    add_input_rangeproofs: bool,
+) -> Result<usize, Error> {
+    if pset.inputs().len() >= SECP256K1_SURJECTIONPROOF_MAX_N_INPUTS {
+        return Err(Error::TooManyInputs(pset.inputs().len()));
+    }
+
+    let mut input = elements::pset::Input::from_prevout(outpoint);
+
+    input.asset = Some(unblinded.asset);
+    input.amount = Some(unblinded.value);
+    if let (Some(value_comm), Some(asset_gen)) =
+        (txout.value.commitment(), txout.asset.commitment())
+    {
+        // Add the blind proofs
+        // These are used to prove that the asset and amount field commit to
+        // the asset and value/amount commitment of the output that is being
+        // spent.
+        let mut rng = rand::thread_rng();
+        input.blind_asset_proof = Some(Box::new(SurjectionProof::blind_asset_proof(
+            &mut rng,
+            &EC,
+            unblinded.asset,
+            unblinded.asset_bf,
+        )?));
+        input.blind_value_proof = Some(Box::new(RangeProof::blind_value_proof(
+            &mut rng,
+            &EC,
+            unblinded.value,
+            value_comm,
+            asset_gen,
+            unblinded.value_bf,
+        )?));
+    } else if !allow_explicit_input {
+        return Err(Error::NotConfidentialInput);
+    }
+
     // Note that we explicitly remove the txout rangeproof to avoid
     // relying on its presence.
-    input.in_utxo_rangeproof = txout.witness.rangeproof.take();
-    input.witness_utxo = Some(txout);
-    if let Some(tx) = &utxo.tx {
+    let rangeproof = txout.witness.rangeproof.take();
+    if add_input_rangeproofs {
+        // This field is used by _some_ stateless blinders or signers to
+        // learn the blinding factors and unblinded values of this input.
+        // We need this since the output witness, which includes the
+        // rangeproof, is not serialized.
+        input.in_utxo_rangeproof = rangeproof;
+    }
+    input.witness_utxo = Some(txout.clone());
+
+    if let Some(mut tx) = tx {
         // For pre-segwit add non_witness_utxo
-        let mut tx = tx.clone();
         // Remove the rangeproof to match the witness utxo,
         // to pass the checks done by elements-miniscript
         let _ = tx
             .output
-            .get_mut(utxo.outpoint.vout as usize)
+            .get_mut(outpoint.vout as usize)
             .expect("got txout above")
             .witness
             .rangeproof
@@ -94,8 +158,9 @@ fn add_external_input(
 
     pset.add_input(input);
     let idx = pset.inputs().len() - 1;
-    inp_txout_sec.insert(idx, utxo.unblinded);
-    *inp_weight += utxo.max_weight_to_satisfy;
+    inp_txout_sec.insert(idx, unblinded);
+    *inp_weight += max_weight_to_satisfy;
+    Ok(idx)
 }
 
 /// A transaction builder
@@ -121,6 +186,8 @@ pub struct TxBuilder {
 
     selected_utxos: Option<Vec<OutPoint>>,
 
+    add_input_rangeproofs: bool,
+
     // LiquiDEX fields
     is_liquidex_make: bool,
     liquidex_proposals: Vec<LiquidexProposal<Validated>>,
@@ -139,6 +206,7 @@ impl TxBuilder {
             drain_to: None,
             external_utxos: vec![],
             selected_utxos: None,
+            add_input_rangeproofs: true,
             is_liquidex_make: false,
             liquidex_proposals: vec![],
         }
@@ -243,6 +311,34 @@ impl TxBuilder {
     /// Do not use ELIP200 discounted fees for Confidential Transactions
     pub fn disable_ct_discount(mut self) -> Self {
         self.ct_discount = false;
+        self
+    }
+
+    /// Construct the PSET adding the input rangeproofs
+    ///
+    /// Default: `true`.
+    ///
+    /// To verify the asset and amount/value of an input, you can use either
+    /// the blind proofs or the rangeproof.
+    ///
+    /// LWK now always adds the blind proofs, so the rangeproofs are technically
+    /// redudant. However old versions of LWK did not add the blind proofs and
+    /// only added only the input rangeproofs.
+    /// Consistently, the old LWK verification code ignored the blind proofs
+    /// and only looked at the input rangeproofs.
+    ///
+    /// So for backward compatibility purposes, now LWK verification code looks
+    /// for both blind proofs and rangeproofs, and when constructing a PSET LWK
+    /// adds both blind proofs and rangeproofs.
+    ///
+    /// This is not ideal since rangeproofs are large and redundant, but you can
+    /// skip adding the input rangeproofs passing `false` to this function.
+    ///
+    /// By passing `true` you can preserve the addition of input rangeproofs.
+    ///
+    /// After a grace period, we plan to switch the default to `false`.
+    pub fn add_input_rangeproofs(mut self, add_rangeproofs: bool) -> Self {
+        self.add_input_rangeproofs = add_rangeproofs;
         self
     }
 
@@ -417,7 +513,13 @@ impl TxBuilder {
         let utxo = utxos
             .get(&outpoint)
             .ok_or(Error::MissingWalletUtxo(outpoint))?;
-        wollet.add_input(&mut pset, &mut inp_txout_sec, &mut inp_weight, utxo)?;
+        wollet.add_input(
+            &mut pset,
+            &mut inp_txout_sec,
+            &mut inp_weight,
+            utxo,
+            self.add_input_rangeproofs,
+        )?;
 
         let input = &mut pset.inputs_mut()[0];
         // Set asset blinding factor
@@ -613,7 +715,13 @@ impl TxBuilder {
                 .values()
                 .filter(|u| u.unblinded.asset == maker_output_asset)
             {
-                wollet.add_input(&mut pset, &mut inp_txout_sec, &mut inp_weight, utxo)?;
+                wollet.add_input(
+                    &mut pset,
+                    &mut inp_txout_sec,
+                    &mut inp_weight,
+                    utxo,
+                    self.add_input_rangeproofs,
+                )?;
                 let surj_input = elements::SurjectionInput::from_txout_secrets(utxo.unblinded);
                 input_domain.push(surj_input.surjection_target(&EC).expect("from secrets"));
                 satoshi_in += utxo.unblinded.value;
@@ -656,7 +764,13 @@ impl TxBuilder {
             .values()
             .filter(|u| u.unblinded.asset == wollet.policy_asset())
         {
-            wollet.add_input(&mut pset, &mut inp_txout_sec, &mut inp_weight, utxo)?;
+            wollet.add_input(
+                &mut pset,
+                &mut inp_txout_sec,
+                &mut inp_weight,
+                utxo,
+                self.add_input_rangeproofs,
+            )?;
             let surj_input = elements::SurjectionInput::from_txout_secrets(utxo.unblinded);
             input_domain.push(surj_input.surjection_target(&EC).expect("from secrets"));
             satoshi_in += utxo.unblinded.value;
@@ -835,7 +949,13 @@ impl TxBuilder {
                 if utxo.unblinded.asset != asset {
                     continue;
                 }
-                add_external_input(&mut pset, &mut inp_txout_sec, &mut inp_weight, utxo);
+                add_external_input(
+                    &mut pset,
+                    &mut inp_txout_sec,
+                    &mut inp_weight,
+                    utxo,
+                    self.add_input_rangeproofs,
+                )?;
                 satoshi_in += utxo.unblinded.value;
             }
 
@@ -845,14 +965,26 @@ impl TxBuilder {
                     if utxo.unblinded.asset != asset {
                         continue;
                     }
-                    wollet.add_input(&mut pset, &mut inp_txout_sec, &mut inp_weight, utxo)?;
+                    wollet.add_input(
+                        &mut pset,
+                        &mut inp_txout_sec,
+                        &mut inp_weight,
+                        utxo,
+                        self.add_input_rangeproofs,
+                    )?;
                     satoshi_in += utxo.unblinded.value;
                 }
             } else {
                 // Add more asset utxos until we cover the amount to send
                 if satoshi_in < satoshi_out {
                     for utxo in utxos.values().filter(|u| u.unblinded.asset == asset) {
-                        wollet.add_input(&mut pset, &mut inp_txout_sec, &mut inp_weight, utxo)?;
+                        wollet.add_input(
+                            &mut pset,
+                            &mut inp_txout_sec,
+                            &mut inp_weight,
+                            utxo,
+                            self.add_input_rangeproofs,
+                        )?;
                         satoshi_in += utxo.unblinded.value;
                         if satoshi_in >= satoshi_out {
                             break;
@@ -893,7 +1025,13 @@ impl TxBuilder {
             if utxo.unblinded.asset != policy_asset {
                 continue;
             }
-            add_external_input(&mut pset, &mut inp_txout_sec, &mut inp_weight, utxo);
+            add_external_input(
+                &mut pset,
+                &mut inp_txout_sec,
+                &mut inp_weight,
+                utxo,
+                self.add_input_rangeproofs,
+            )?;
             satoshi_in += utxo.unblinded.value;
         }
 
@@ -902,13 +1040,25 @@ impl TxBuilder {
                 if utxo.unblinded.asset != policy_asset {
                     continue;
                 }
-                wollet.add_input(&mut pset, &mut inp_txout_sec, &mut inp_weight, utxo)?;
+                wollet.add_input(
+                    &mut pset,
+                    &mut inp_txout_sec,
+                    &mut inp_weight,
+                    utxo,
+                    self.add_input_rangeproofs,
+                )?;
                 satoshi_in += utxo.unblinded.value;
             }
         } else {
             // FIXME: For implementation simplicity now we always add all L-BTC inputs
             for utxo in utxos.values().filter(|u| u.unblinded.asset == policy_asset) {
-                wollet.add_input(&mut pset, &mut inp_txout_sec, &mut inp_weight, utxo)?;
+                wollet.add_input(
+                    &mut pset,
+                    &mut inp_txout_sec,
+                    &mut inp_weight,
+                    utxo,
+                    self.add_input_rangeproofs,
+                )?;
                 satoshi_in += utxo.unblinded.value;
             }
         }
@@ -986,6 +1136,7 @@ impl TxBuilder {
                                 &mut inp_txout_sec,
                                 &mut inp_weight,
                                 utxo_token,
+                                self.add_input_rangeproofs,
                             )?;
 
                             // and an outpout receiving the token
@@ -1110,7 +1261,7 @@ impl TxBuilder {
                 .collect();
             let blind_secrets = pset26
                 .blind_last(&mut rng, &EC, &inp_txout_sec)
-                .map_err(|e| Error::Generic(format!("elements26 blind error: {}", e)))?;
+                .map_err(|e| Error::Generic(format!("elements26 blind error: {e}")))?;
             // erase all non witness utxo surjection and range proofs
             // this appears to be necessary for pre-segwit inputs
             for input in pset26.inputs_mut() {
@@ -1307,6 +1458,14 @@ impl<'a> WolletTxBuilder<'a> {
         Self {
             wollet: self.wollet,
             inner: self.inner.disable_ct_discount(),
+        }
+    }
+
+    /// Wrapper of [`TxBuilder::add_input_rangeproofs()`]
+    pub fn add_input_rangeproofs(self, add_rangeproofs: bool) -> Self {
+        Self {
+            wollet: self.wollet,
+            inner: self.inner.add_input_rangeproofs(add_rangeproofs),
         }
     }
 

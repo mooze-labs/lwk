@@ -2,11 +2,18 @@ use std::sync::Arc;
 
 use crate::{types::AssetId, Address, Txid};
 
-/// Represent a test environment with an elements node and an electrum server.
-/// useful for testing only, wrapper over [`lwk_test_util::TestElectrumServer`]
+/// Test environment
+///
+/// Regtest with:
+/// * Elements node
+/// * Electrum server
+/// * Esplora server
+/// * Waterfalls server
+///
+/// Wrapper over [`lwk_test_util::TestEnv`]
 #[derive(uniffi::Object)]
 pub struct LwkTestEnv {
-    inner: lwk_test_util::TestElectrumServer,
+    inner: lwk_test_util::TestEnv,
 }
 
 #[uniffi::export]
@@ -15,9 +22,12 @@ impl LwkTestEnv {
     #[allow(clippy::new_without_default)]
     #[uniffi::constructor]
     pub fn new() -> LwkTestEnv {
-        LwkTestEnv {
-            inner: lwk_test_util::setup_with_esplora(),
-        }
+        let inner = lwk_test_util::TestEnvBuilder::from_env()
+            .with_electrum()
+            .with_esplora()
+            .with_waterfalls()
+            .build();
+        LwkTestEnv { inner }
     }
 
     /// Generate `blocks` blocks from the node
@@ -49,6 +59,16 @@ impl LwkTestEnv {
 
     /// Get the Electrum URL of the test environment
     pub fn electrum_url(&self) -> String {
-        self.inner.electrs.electrum_url.clone()
+        self.inner.electrum_url()
+    }
+
+    /// Get the Esplora URL of the test environment
+    pub fn esplora_url(&self) -> String {
+        self.inner.esplora_url()
+    }
+
+    /// Get the Waterfalls URL of the test environment
+    pub fn waterfalls_url(&self) -> String {
+        self.inner.waterfalls_url()
     }
 }

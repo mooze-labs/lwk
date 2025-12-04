@@ -11,9 +11,9 @@ pub const BATCH_SIZE: u32 = 20;
 pub type Height = u32;
 pub type Timestamp = u32;
 
-/// `RawCache` is a cache of wallet data, like wallet transactions.
+/// `Cache` is a cache of wallet data, like wallet transactions.
 /// It is fully reconstructable from the CT Descriptor and the blockchain.
-pub struct RawCache {
+pub struct Cache {
     /// contains all my tx and all prevouts
     pub all_txs: HashMap<Txid, Transaction>,
 
@@ -42,7 +42,7 @@ pub struct RawCache {
     pub last_unused_internal: AtomicU32,
 }
 
-impl Default for RawCache {
+impl Default for Cache {
     fn default() -> Self {
         Self {
             all_txs: HashMap::default(),
@@ -58,7 +58,7 @@ impl Default for RawCache {
     }
 }
 
-impl std::hash::Hash for RawCache {
+impl std::hash::Hash for Cache {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         let mut vec: Vec<_> = self.all_txs.keys().collect();
         vec.sort();
@@ -97,18 +97,13 @@ impl std::hash::Hash for RawCache {
     }
 }
 
-#[derive(Default, Hash)]
-pub struct Store {
-    pub cache: RawCache,
-}
-
 #[derive(Default, Debug)]
 pub struct ScriptBatch {
     pub cached: bool,
     pub value: Vec<(Script, (Chain, ChildNumber, BlindingPublicKey))>,
 }
 
-impl Store {
+impl Cache {
     pub fn get_script_batch(
         &self,
         batch: u32,
@@ -141,7 +136,7 @@ impl Store {
         child: ChildNumber,
         descriptor: &ConfidentialDescriptor<DescriptorPublicKey>,
     ) -> Result<(Script, BlindingPublicKey, bool), Error> {
-        let opt_script = self.cache.scripts.get(&(ext_int, child));
+        let opt_script = self.scripts.get(&(ext_int, child));
         let (script, blinding_pubkey, cached) = match opt_script {
             Some((script, blinding_pubkey)) => (script.clone(), *blinding_pubkey, true),
             None => {
@@ -155,7 +150,6 @@ impl Store {
 
     pub fn spent(&self) -> Result<HashSet<OutPoint>, Error> {
         Ok(self
-            .cache
             .all_txs
             .values()
             .flat_map(|tx| tx.input.iter())
@@ -166,7 +160,7 @@ impl Store {
 
 #[cfg(test)]
 mod tests {
-    use crate::{store::Store, WolletDescriptor};
+    use crate::{cache::Cache, WolletDescriptor};
     use elements::{Address, AddressParams, Txid};
     use elements_miniscript::ConfidentialDescriptor;
     use std::{
@@ -186,17 +180,14 @@ mod tests {
         let master_blinding_key =
             "9c8e4f05c7711a98c838be228bcb84924d4570ca53f35fa1c793e58841d47023";
         let checksum = "8w7cjcha";
-        let desc_str = format!(
-            "ct(slip77({}),elwpkh({}/*))#{}",
-            master_blinding_key, xpub, checksum
-        );
+        let desc_str = format!("ct(slip77({master_blinding_key}),elwpkh({xpub}/*))#{checksum}");
         let desc = ConfidentialDescriptor::<_>::from_str(&desc_str).unwrap();
         let desc: WolletDescriptor = desc.try_into().unwrap();
         let addr1 = desc.address(0, &AddressParams::LIQUID_TESTNET).unwrap();
 
-        let store = Store::default();
+        let cache = Cache::default();
 
-        let x = store
+        let x = cache
             .get_script_batch(0, &desc.as_single_descriptors().unwrap()[0])
             .unwrap();
         assert_eq!(format!("{:?}", x.value[0]), "(Script(OP_0 OP_PUSHBYTES_20 d11ef9e68385138627b09d52d6fe12662d049224), (External, Normal { index: 0 }, PublicKey(0525054b498a69342d90750ed5e8f91cb6fb4da48735fd7011fdbcfc0e8edee1f0a30ed1e5c1d730e281b73f70f02dec2cbe20d0ac864d3d3d6942a02d66c6e3)))");
@@ -211,18 +202,17 @@ mod tests {
     }
 
     #[test]
-    fn test_store_hash() {
-        let mut store = Store::default();
+    fn test_cache_hash() {
+        let mut cache = Cache::default();
         let mut hasher = DefaultHasher::new();
-        store.hash(&mut hasher);
+        cache.hash(&mut hasher);
         assert_eq!(11565483422739161174, hasher.finish());
 
-        store
-            .cache
+        cache
             .heights
             .insert(<Txid as elements::hashes::Hash>::all_zeros(), None);
         let mut hasher = DefaultHasher::new();
-        store.hash(&mut hasher);
+        cache.hash(&mut hasher);
         assert_eq!(12004253425667158821, hasher.finish());
 
         // TODO test other fields change the hash

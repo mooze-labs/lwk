@@ -18,6 +18,18 @@ impl From<bip39::Mnemonic> for Mnemonic {
     }
 }
 
+impl From<Mnemonic> for bip39::Mnemonic {
+    fn from(mnemonic: Mnemonic) -> Self {
+        mnemonic.inner
+    }
+}
+
+impl From<&Mnemonic> for bip39::Mnemonic {
+    fn from(mnemonic: &Mnemonic) -> Self {
+        mnemonic.inner.clone()
+    }
+}
+
 impl Display for Mnemonic {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.inner)
@@ -39,7 +51,7 @@ impl Mnemonic {
     /// Note this is secret information, do not log it.
     #[wasm_bindgen(js_name = toString)]
     pub fn to_string_js(&self) -> String {
-        format!("{}", self)
+        format!("{self}")
     }
 
     /// Creates a Mnemonic from entropy, at least 16 bytes are needed.

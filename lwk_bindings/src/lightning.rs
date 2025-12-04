@@ -1,6 +1,7 @@
 use std::{
     collections::HashMap,
     ops::ControlFlow,
+    str::FromStr,
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -9,8 +10,12 @@ use crate::{
     Address, Bolt11Invoice, ElectrumClient, EsploraClient, LightningPayment, LwkError, Mnemonic,
     Network,
 };
+use elements::bitcoin;
 use log::{Level, Metadata, Record};
-use lwk_boltz::{InvoiceData, PreparePayData, RevSwapStates, SubSwapStates};
+use lwk_boltz::{
+    ChainSwapDataSerializable, ChainSwapStates, InvoiceDataSerializable,
+    PreparePayDataSerializable, RevSwapStates, SubSwapStates,
+};
 use std::fmt;
 
 /// Log level for logging messages
@@ -77,12 +82,39 @@ impl log::Log for LoggingBridge {
     fn flush(&self) {}
 }
 
+/// A builder for the `BoltzSession`
+#[derive(uniffi::Record)]
+pub struct BoltzSessionBuilder {
+    network: Arc<Network>,
+    client: Arc<AnyClient>,
+    #[uniffi(default = None)]
+    timeout: Option<u64>,
+    #[uniffi(default = None)]
+    mnemonic: Option<Arc<Mnemonic>>,
+    #[uniffi(default = None)]
+    logging: Option<Arc<dyn Logging>>,
+    #[uniffi(default = false)]
+    polling: bool,
+    #[uniffi(default = None)]
+    timeout_advance: Option<u64>,
+    #[uniffi(default = None)]
+    next_index_to_use: Option<u32>,
+    #[uniffi(default = None)]
+    referral_id: Option<String>,
+    #[uniffi(default = None)]
+    bitcoin_electrum_client_url: Option<String>,
+    #[uniffi(default = false)]
+    random_preimages: bool,
+}
+
 /// A session to pay and receive lightning payments.
 ///
 /// Lightning payments are done via LBTC swaps using Boltz.
+///
+/// See `BoltzSessionBuilder` for various options to configure the session.
 #[derive(uniffi::Object)]
-pub struct LightningSession {
-    inner: lwk_boltz::blocking::LightningSession,
+pub struct BoltzSession {
+    inner: lwk_boltz::blocking::BoltzSession,
     #[allow(dead_code)]
     logging: Option<Arc<dyn Logging>>,
 }
@@ -96,6 +128,7 @@ pub struct PreparePayResponse {
 #[derive(uniffi::Object)]
 pub struct WebHook {
     url: String,
+    status: Vec<String>,
 }
 
 #[derive(uniffi::Object)]
@@ -110,10 +143,15 @@ pub struct SwapList {
     inner: Vec<lwk_boltz::SwapRestoreResponse>,
 }
 
+#[derive(uniffi::Object)]
+pub struct LockupResponse {
+    inner: Mutex<Option<lwk_boltz::blocking::LockupResponse>>,
+}
+
 impl fmt::Display for SwapList {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let json = serde_json::to_string(&self.inner).map_err(|_| fmt::Error)?;
-        write!(f, "{}", json)
+        write!(f, "{json}")
     }
 }
 
@@ -144,22 +182,38 @@ impl AnyClient {
 }
 
 #[uniffi::export]
-impl LightningSession {
-    /// Create the lightning session
+impl BoltzSession {
+    /// Create the lightning session with default settings
     ///
-    /// If a `logging` implementation is provided, it will be set as the global logger
-    /// to receive log messages from the lightning operations. Note that the global
-    /// logger can only be set once - if a logger is already set, the new one will be ignored.
+    /// This uses default timeout and generates a random mnemonic.
+    /// For custom configuration, use [`BoltzSession::from_builder()`] instead.
     #[uniffi::constructor]
-    pub fn new(
-        network: &Network,
-        client: &AnyClient,
-        timeout: Option<u64>,
-        logging: Option<Arc<dyn Logging>>,
-        mnemonic: Option<Arc<Mnemonic>>,
-    ) -> Result<Self, LwkError> {
+    pub fn new(network: &Network, client: &AnyClient) -> Result<Self, LwkError> {
+        let client_arc = match client {
+            AnyClient::Electrum(c) => Arc::new(AnyClient::Electrum(c.clone())),
+            AnyClient::Esplora(c) => Arc::new(AnyClient::Esplora(c.clone())),
+        };
+        let builder = BoltzSessionBuilder {
+            network: Arc::new(*network),
+            client: client_arc,
+            timeout: None,
+            mnemonic: None,
+            logging: None,
+            polling: false,
+            timeout_advance: None,
+            next_index_to_use: None,
+            referral_id: None,
+            bitcoin_electrum_client_url: None,
+            random_preimages: false,
+        };
+        Self::from_builder(builder)
+    }
+
+    /// Create the lightning session from a builder
+    #[uniffi::constructor]
+    pub fn from_builder(builder: BoltzSessionBuilder) -> Result<Self, LwkError> {
         // Validate the logger by attempting a test call
-        if let Some(ref logger_impl) = logging {
+        if let Some(ref logger_impl) = builder.logging {
             // Test the logger with a dummy message to catch issues early
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 logger_impl.log(LogLevel::Debug, "Logger validation test".to_string());
@@ -169,7 +223,7 @@ impl LightningSession {
         }
 
         // Set up the custom logger if provided
-        if let Some(ref logger_impl) = logging {
+        if let Some(ref logger_impl) = builder.logging {
             let bridge = LoggingBridge {
                 inner: logger_impl.clone(),
             };
@@ -178,11 +232,11 @@ impl LightningSession {
             let _ = log::set_boxed_logger(Box::new(bridge))
                 .map(|()| log::set_max_level(log::LevelFilter::Trace));
         }
-        log::info!("Creating lightning session");
+        log::info!("Creating lightning session from builder");
 
-        let network_value = network.into();
+        let network_value = builder.network.as_ref().into();
 
-        let client = match client {
+        let client = match builder.client.as_ref() {
             AnyClient::Electrum(client) => {
                 let boltz_client = lwk_boltz::clients::ElectrumClient::from_client(
                     client.clone_client().expect("TODO"),
@@ -199,16 +253,34 @@ impl LightningSession {
             }
         };
 
-        let inner = lwk_boltz::blocking::LightningSession::new(
-            network_value,
-            client,
-            timeout.map(Duration::from_secs),
-            mnemonic.map(|e| e.inner()),
-        )
-        .map_err(|e| LwkError::Generic {
-            msg: format!("Failed to create blocking lightning session: {:?}", e),
-        })?;
-        Ok(Self { inner, logging })
+        let mut lwk_builder = lwk_boltz::BoltzSession::builder(network_value, client);
+        if let Some(timeout_secs) = builder.timeout {
+            lwk_builder = lwk_builder.create_swap_timeout(Duration::from_secs(timeout_secs));
+        }
+        if let Some(mnemonic) = builder.mnemonic {
+            lwk_builder = lwk_builder.mnemonic(mnemonic.inner());
+        }
+        lwk_builder = lwk_builder.polling(builder.polling);
+        if let Some(timeout_advance_secs) = builder.timeout_advance {
+            lwk_builder = lwk_builder.timeout_advance(Duration::from_secs(timeout_advance_secs));
+        }
+        if let Some(next_index_to_use) = builder.next_index_to_use {
+            lwk_builder = lwk_builder.next_index_to_use(next_index_to_use);
+        }
+        if let Some(referral_id) = builder.referral_id {
+            lwk_builder = lwk_builder.referral_id(referral_id);
+        }
+        lwk_builder = lwk_builder.random_preimages(builder.random_preimages);
+
+        let inner = lwk_builder
+            .build_blocking()
+            .map_err(|e| LwkError::Generic {
+                msg: format!("Failed to create blocking lightning session: {e:?}"),
+            })?;
+        Ok(Self {
+            inner,
+            logging: builder.logging,
+        })
     }
 
     /// Prepare to pay a bolt11 invoice
@@ -218,12 +290,25 @@ impl LightningSession {
         refund_address: &Address,
         webhook: Option<Arc<WebHook>>,
     ) -> Result<PreparePayResponse, LwkError> {
+        let status = webhook
+            .as_ref()
+            .filter(|w| !w.status.is_empty())
+            .map(|w| {
+                w.status
+                    .iter()
+                    .map(|s| s.parse::<SubSwapStates>())
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .transpose()
+            .map_err(|_| LwkError::Generic {
+                msg: "Invalid status".to_string(),
+            })?;
         let webhook = webhook
             .as_ref()
             .map(|w| lwk_boltz::Webhook::<SubSwapStates> {
                 url: w.url.to_string(),
                 hash_swap_id: None,
-                status: None,
+                status,
             });
         let response =
             self.inner
@@ -236,7 +321,7 @@ impl LightningSession {
 
     /// Restore a payment from its serialized data see `PreparePayResponse::serialize`
     pub fn restore_prepare_pay(&self, data: &str) -> Result<PreparePayResponse, LwkError> {
-        let data = PreparePayData::deserialize(data)?;
+        let data = PreparePayDataSerializable::deserialize(data)?;
         let response = self.inner.restore_prepare_pay(data)?;
         Ok(PreparePayResponse {
             inner: Mutex::new(Some(response)),
@@ -251,18 +336,31 @@ impl LightningSession {
         claim_address: &Address,
         webhook: Option<Arc<WebHook>>,
     ) -> Result<InvoiceResponse, LwkError> {
+        let status = webhook
+            .as_ref()
+            .filter(|w| !w.status.is_empty())
+            .map(|w| {
+                w.status
+                    .iter()
+                    .map(|s| s.parse::<RevSwapStates>())
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .transpose()
+            .map_err(|_| LwkError::Generic {
+                msg: "Invalid status".to_string(),
+            })?;
         let webhook = webhook
             .as_ref()
             .map(|w| lwk_boltz::Webhook::<RevSwapStates> {
                 url: w.url.to_string(),
                 hash_swap_id: None,
-                status: None,
+                status,
             });
         let response = self
             .inner
             .invoice(amount, description, claim_address.as_ref(), webhook)
             .map_err(|e| LwkError::Generic {
-                msg: format!("Invoice failed: {:?}", e),
+                msg: format!("Invoice failed: {e:?}"),
             })?;
 
         Ok(InvoiceResponse {
@@ -272,9 +370,71 @@ impl LightningSession {
 
     /// Restore an invoice flow from its serialized data see `InvoiceResponse::serialize`
     pub fn restore_invoice(&self, data: &str) -> Result<InvoiceResponse, LwkError> {
-        let data = InvoiceData::deserialize(data)?;
+        let data: InvoiceDataSerializable = serde_json::from_str(data)?;
         let response = self.inner.restore_invoice(data)?;
         Ok(InvoiceResponse {
+            inner: Mutex::new(Some(response)),
+        })
+    }
+
+    /// Create an onchain swap to convert BTC to LBTC
+    pub fn btc_to_lbtc(
+        &self,
+        amount: u64,
+        refund_address: &str, // TODO: convert to BitcoinAddress?
+        claim_address: &Address,
+        webhook: Option<Arc<WebHook>>,
+    ) -> Result<LockupResponse, LwkError> {
+        let webhook = webhook
+            .as_ref()
+            .map(|w| lwk_boltz::Webhook::<ChainSwapStates> {
+                url: w.url.to_string(),
+                hash_swap_id: None,
+                status: None,
+            });
+        let refund_address = bitcoin::Address::from_str(refund_address)
+            .expect("TODO")
+            .assume_checked();
+        let response =
+            self.inner
+                .btc_to_lbtc(amount, &refund_address, claim_address.as_ref(), webhook)?;
+        Ok(LockupResponse {
+            inner: Mutex::new(Some(response)),
+        })
+    }
+
+    /// Create an onchain swap to convert LBTC to BTC
+    pub fn lbtc_to_btc(
+        &self,
+        amount: u64,
+        refund_address: &Address,
+        claim_address: &str,
+        webhook: Option<Arc<WebHook>>,
+    ) -> Result<LockupResponse, LwkError> {
+        let webhook = webhook
+            .as_ref()
+            .map(|w| lwk_boltz::Webhook::<ChainSwapStates> {
+                url: w.url.to_string(),
+                hash_swap_id: None,
+                status: None,
+            });
+
+        let claim_address = bitcoin::Address::from_str(claim_address)
+            .expect("TODO")
+            .assume_checked();
+        let response =
+            self.inner
+                .lbtc_to_btc(amount, refund_address.as_ref(), &claim_address, webhook)?;
+        Ok(LockupResponse {
+            inner: Mutex::new(Some(response)),
+        })
+    }
+
+    /// Restore an onchain swap from its serialized data see `LockupResponse::serialize`
+    pub fn restore_lockup(&self, data: &str) -> Result<LockupResponse, LwkError> {
+        let data = ChainSwapDataSerializable::deserialize(data)?;
+        let response = self.inner.restore_lockup(data)?;
+        Ok(LockupResponse {
             inner: Mutex::new(Some(response)),
         })
     }
@@ -308,7 +468,7 @@ impl LightningSession {
             .restorable_reverse_swaps(&swap_list.inner, claim_address.as_ref())?;
         let data = response
             .into_iter()
-            .map(|e| self.inner.restore_invoice(e))
+            .map(|e| self.inner.restore_invoice(e.into()))
             .map(|e| e.and_then(|e| e.serialize()))
             .collect::<Result<Vec<_>, _>>()?;
 
@@ -326,7 +486,7 @@ impl LightningSession {
             .restorable_submarine_swaps(&swap_list.inner, refund_address.as_ref())?;
         let data = response
             .into_iter()
-            .map(|e| self.inner.restore_prepare_pay(e))
+            .map(|e| self.inner.restore_prepare_pay(e.into()))
             .map(|e| e.and_then(|e| e.serialize()))
             .collect::<Result<Vec<_>, _>>()?;
         Ok(data)
@@ -343,15 +503,25 @@ impl LightningSession {
         let result_json = serde_json::to_string(&result)?;
         Ok(result_json)
     }
+
+    /// Get the next index to use for deriving keypairs
+    pub fn next_index_to_use(&self) -> u32 {
+        self.inner.next_index_to_use()
+    }
+
+    /// Set the next index to use for deriving keypairs
+    ///
+    /// This may be necessary to handle multiple sessions with the same mnemonic.
+    pub fn set_next_index_to_use(&self, next_index_to_use: u32) {
+        self.inner.set_next_index_to_use(next_index_to_use);
+    }
 }
 
 #[uniffi::export]
 impl PreparePayResponse {
     pub fn complete_pay(&self) -> Result<bool, LwkError> {
         let mut lock = self.inner.lock()?;
-        let response = lock.take().ok_or_else(|| LwkError::Generic {
-            msg: "This PreparePayResponse already called complete_pay or errored".to_string(),
-        })?;
+        let response = lock.take().ok_or(LwkError::ObjectConsumed)?;
         Ok(response.complete_pay()?)
     }
 
@@ -360,9 +530,7 @@ impl PreparePayResponse {
             .inner
             .lock()?
             .as_ref()
-            .ok_or_else(|| LwkError::Generic {
-                msg: "This PreparePayResponse already called complete_pay or errored".to_string(),
-            })?
+            .ok_or(LwkError::ObjectConsumed)?
             .swap_id())
     }
 
@@ -374,9 +542,7 @@ impl PreparePayResponse {
             .inner
             .lock()?
             .as_ref()
-            .ok_or_else(|| LwkError::Generic {
-                msg: "This PreparePayResponse already called complete_pay or errored".to_string(),
-            })?
+            .ok_or(LwkError::ObjectConsumed)?
             .serialize()?)
     }
 
@@ -385,9 +551,7 @@ impl PreparePayResponse {
             .inner
             .lock()?
             .as_ref()
-            .ok_or_else(|| LwkError::Generic {
-                msg: "This PreparePayResponse already called complete_pay or errored".to_string(),
-            })?
+            .ok_or(LwkError::ObjectConsumed)?
             .uri())
     }
 
@@ -396,41 +560,54 @@ impl PreparePayResponse {
             .inner
             .lock()?
             .as_ref()
-            .ok_or_else(|| LwkError::Generic {
-                msg: "This PreparePayResponse already called complete_pay or errored".to_string(),
-            })?
-            .uri_address();
-        Address::new(&uri_address)
+            .ok_or(LwkError::ObjectConsumed)?
+            .uri_address()?;
+        Ok(Arc::new(uri_address.into()))
     }
     pub fn uri_amount(&self) -> Result<u64, LwkError> {
         Ok(self
             .inner
             .lock()?
             .as_ref()
-            .ok_or_else(|| LwkError::Generic {
-                msg: "This PreparePayResponse already called complete_pay or errored".to_string(),
-            })?
+            .ok_or(LwkError::ObjectConsumed)?
             .uri_amount())
+    }
+
+    /// The fee of the swap provider
+    ///
+    /// It is equal to the amount requested onchain minus the amount of the bolt11 invoice
+    /// Does not include the fee of the onchain transaction.
+    pub fn fee(&self) -> Result<Option<u64>, LwkError> {
+        Ok(self
+            .inner
+            .lock()?
+            .as_ref()
+            .ok_or(LwkError::ObjectConsumed)?
+            .fee())
     }
 
     pub fn advance(&self) -> Result<PaymentState, LwkError> {
         let mut lock = self.inner.lock()?;
-        let mut response = lock.take().ok_or_else(|| LwkError::Generic {
-            msg: "This PreparePayResponse already called complete_pay or errored".to_string(),
-        })?;
-        let control_flow = response.advance()?;
-        let result = match control_flow {
-            ControlFlow::Continue(_update) => PaymentState::Continue,
-            ControlFlow::Break(update) => {
+        let mut response = lock.take().ok_or(LwkError::ObjectConsumed)?;
+        Ok(match response.advance() {
+            Ok(ControlFlow::Continue(_update)) => {
+                *lock = Some(response);
+                PaymentState::Continue
+            }
+            Ok(ControlFlow::Break(update)) => {
+                *lock = Some(response);
                 if update {
                     PaymentState::Success
                 } else {
                     PaymentState::Failed
                 }
             }
-        };
-        *lock = Some(response);
-        Ok(result)
+            Err(lwk_boltz::Error::NoBoltzUpdate) => {
+                *lock = Some(response);
+                return Err(LwkError::NoBoltzUpdate);
+            }
+            Err(e) => return Err(e.into()),
+        })
     }
 }
 
@@ -441,9 +618,7 @@ impl InvoiceResponse {
             .inner
             .lock()?
             .as_ref()
-            .ok_or_else(|| LwkError::Generic {
-                msg: "This InvoiceResponse already called complete_pay or errored".to_string(),
-            })?
+            .ok_or(LwkError::ObjectConsumed)?
             .bolt11_invoice();
         Ok(Bolt11Invoice::from(bolt11_invoice))
     }
@@ -453,10 +628,21 @@ impl InvoiceResponse {
             .inner
             .lock()?
             .as_ref()
-            .ok_or_else(|| LwkError::Generic {
-                msg: "This InvoiceResponse already called complete_pay or errored".to_string(),
-            })?
+            .ok_or(LwkError::ObjectConsumed)?
             .swap_id())
+    }
+
+    /// The fee of the swap provider
+    ///
+    /// It is equal to the amount of the invoice minus the amount of the onchain transaction.
+    /// Does not include the fee of the onchain transaction.
+    pub fn fee(&self) -> Result<Option<u64>, LwkError> {
+        Ok(self
+            .inner
+            .lock()?
+            .as_ref()
+            .ok_or(LwkError::ObjectConsumed)?
+            .fee())
     }
 
     /// Serialize the prepare pay response data to a json string
@@ -467,45 +653,134 @@ impl InvoiceResponse {
             .inner
             .lock()?
             .as_ref()
-            .ok_or_else(|| LwkError::Generic {
-                msg: "This InvoiceResponse already called complete_pay or errored".to_string(),
-            })?
+            .ok_or(LwkError::ObjectConsumed)?
             .serialize()?)
     }
 
     pub fn complete_pay(&self) -> Result<bool, LwkError> {
         let mut lock = self.inner.lock()?;
-        let response = lock.take().ok_or_else(|| LwkError::Generic {
-            msg: "This InvoiceResponse already called complete_pay or errored".to_string(),
-        })?;
+        let response = lock.take().ok_or(LwkError::ObjectConsumed)?;
         Ok(response.complete_pay()?)
     }
 
     pub fn advance(&self) -> Result<PaymentState, LwkError> {
         let mut lock = self.inner.lock()?;
-        let mut response = lock.take().ok_or_else(|| LwkError::Generic {
-            msg: "This InvoiceResponse already called complete_pay or errored".to_string(),
-        })?;
-        let control_flow = response.advance()?;
-        let result = match control_flow {
-            ControlFlow::Continue(_update) => PaymentState::Continue,
-            ControlFlow::Break(update) => {
+        let mut response = lock.take().ok_or(LwkError::ObjectConsumed)?;
+        Ok(match response.advance() {
+            Ok(ControlFlow::Continue(_update)) => {
+                *lock = Some(response);
+                PaymentState::Continue
+            }
+            Ok(ControlFlow::Break(update)) => {
+                *lock = Some(response);
                 if update {
                     PaymentState::Success
                 } else {
                     PaymentState::Failed
                 }
             }
-        };
-        *lock = Some(response);
-        Ok(result)
+            Err(lwk_boltz::Error::NoBoltzUpdate) => {
+                *lock = Some(response);
+                return Err(LwkError::NoBoltzUpdate);
+            }
+            Err(e) => return Err(e.into()),
+        })
+    }
+}
+
+#[uniffi::export]
+impl LockupResponse {
+    pub fn swap_id(&self) -> Result<String, LwkError> {
+        Ok(self
+            .inner
+            .lock()?
+            .as_ref()
+            .ok_or(LwkError::ObjectConsumed)?
+            .swap_id())
+    }
+
+    pub fn lockup_address(&self) -> Result<String, LwkError> {
+        Ok(self
+            .inner
+            .lock()?
+            .as_ref()
+            .ok_or(LwkError::ObjectConsumed)?
+            .lockup_address()
+            .to_string())
+    }
+
+    pub fn expected_amount(&self) -> Result<u64, LwkError> {
+        Ok(self
+            .inner
+            .lock()?
+            .as_ref()
+            .ok_or(LwkError::ObjectConsumed)?
+            .expected_amount())
+    }
+
+    pub fn chain_from(&self) -> Result<String, LwkError> {
+        Ok(self
+            .inner
+            .lock()?
+            .as_ref()
+            .ok_or(LwkError::ObjectConsumed)?
+            .chain_from()
+            .to_string())
+    }
+
+    pub fn chain_to(&self) -> Result<String, LwkError> {
+        Ok(self
+            .inner
+            .lock()?
+            .as_ref()
+            .ok_or(LwkError::ObjectConsumed)?
+            .chain_to()
+            .to_string())
+    }
+
+    pub fn advance(&self) -> Result<PaymentState, LwkError> {
+        let mut lock = self.inner.lock()?;
+        let mut response = lock.take().ok_or(LwkError::ObjectConsumed)?;
+        Ok(match response.advance() {
+            Ok(ControlFlow::Continue(_update)) => {
+                *lock = Some(response);
+                PaymentState::Continue
+            }
+            Ok(ControlFlow::Break(update)) => {
+                if update {
+                    PaymentState::Success
+                } else {
+                    PaymentState::Failed
+                }
+            }
+            Err(lwk_boltz::Error::NoBoltzUpdate) => {
+                *lock = Some(response);
+                return Err(LwkError::NoBoltzUpdate);
+            }
+            Err(e) => return Err(e.into()),
+        })
+    }
+
+    pub fn complete(&self) -> Result<bool, LwkError> {
+        let mut lock = self.inner.lock()?;
+        let response = lock.take().ok_or(LwkError::ObjectConsumed)?;
+        Ok(response.complete()?)
+    }
+
+    pub fn serialize(&self) -> Result<String, LwkError> {
+        Ok(self
+            .inner
+            .lock()?
+            .as_ref()
+            .ok_or(LwkError::ObjectConsumed)?
+            .serialize()?)
     }
 }
 
 #[uniffi::export]
 impl WebHook {
     #[uniffi::constructor]
-    pub fn new(url: String) -> Arc<Self> {
-        Arc::new(Self { url })
+    pub fn new(url: String, status: Vec<String>) -> Arc<Self> {
+        Arc::new(Self { url, status })
     }
 }

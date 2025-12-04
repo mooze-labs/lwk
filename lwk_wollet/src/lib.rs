@@ -94,26 +94,30 @@ pub mod amp0;
 #[cfg(feature = "amp2")]
 pub mod amp2;
 
+mod cache;
 pub mod clients;
-mod config;
 mod descriptor;
 mod domain;
 mod error;
 mod liquidex;
 mod model;
+mod network;
 pub mod pegin;
 mod persister;
 mod pset_create;
 pub mod registry;
-mod store;
 mod tx_builder;
 mod update;
 mod util;
+#[cfg(feature = "amp0")]
 mod wamp;
 mod wollet;
 
+#[cfg(feature = "prices")]
+pub mod prices;
+
+pub use crate::clients::electrum_url::{ElectrumUrl, UrlError};
 pub use crate::clients::{Capability, History};
-pub use crate::config::ElementsNetwork;
 pub use crate::descriptor::{Chain, WolletDescriptor};
 pub use crate::error::Error;
 pub use crate::liquidex::{AssetAmount, LiquidexProposal, Unvalidated, Validated};
@@ -121,20 +125,26 @@ pub use crate::model::{
     AddressResult, ExternalUtxo, IssuanceDetails, Recipient, UnvalidatedRecipient, WalletTx,
     WalletTxOut,
 };
+pub use crate::network::ElementsNetwork;
 pub use crate::pegin::fed_peg_script;
 pub use crate::persister::{FsPersister, NoPersist, PersistError, Persister};
 pub use crate::registry::{asset_ids, issuance_ids, Contract, Entity, RegistryAssetData};
 pub use crate::tx_builder::{TxBuilder, WolletTxBuilder};
 pub use crate::update::{DownloadTxResult, Update};
 pub use crate::util::EC;
-pub use crate::wollet::{Tip, Wollet};
+pub use crate::wollet::{Tip, Wollet, WolletBuilder};
+
+#[cfg(feature = "prices")]
+pub use crate::prices::{
+    CurrencyCode, ExchangeRate, ExchangeRates, PricesFetcher, PricesFetcherBuilder,
+};
 
 #[cfg(feature = "electrum")]
 pub use crate::wollet::full_scan_to_index_with_electrum_client;
 #[cfg(feature = "electrum")]
 pub use crate::wollet::full_scan_with_electrum_client;
 #[cfg(feature = "electrum")]
-pub use clients::blocking::electrum_client::{ElectrumClient, ElectrumOptions, ElectrumUrl};
+pub use clients::blocking::electrum_client::{ElectrumClient, ElectrumOptions};
 
 #[cfg(feature = "esplora")]
 pub use age;
@@ -150,9 +160,6 @@ pub use clients::blocking::ElementsRpcClient;
 #[cfg(feature = "elements_rpc")]
 pub use bitcoincore_rpc;
 
-#[cfg(feature = "electrum")]
-pub use crate::clients::blocking::electrum_client::UrlError;
-
 pub use elements_miniscript;
 pub use elements_miniscript::elements;
 pub use elements_miniscript::elements::bitcoin::{self, hashes, secp256k1};
@@ -163,7 +170,7 @@ pub type BlindingPublicKey = elements::secp256k1_zkp::PublicKey;
 pub(crate) mod hex {
     use elements::{hashes::hex::DisplayHex, hex::Error, hex::FromHex};
 
-    pub fn encode(data: &[u8]) -> String {
+    pub fn _encode(data: &[u8]) -> String {
         data.to_lower_hex_string()
     }
 

@@ -2,7 +2,9 @@ use lwk_common::electrum_ssl::LIQUID_SOCKET;
 use lwk_common::electrum_ssl::LIQUID_TESTNET_SOCKET;
 use lwk_common::Network as JadeNetwork;
 use lwk_jade::TIMEOUT;
+use lwk_wollet::clients::blocking::EsploraClient;
 use lwk_wollet::elements::AssetId;
+use lwk_wollet::ElectrumClient;
 use lwk_wollet::ElementsNetwork;
 use std::fs;
 use std::net::SocketAddr;
@@ -10,22 +12,18 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::Duration;
 
-use crate::{consts, Error};
+use crate::{blockchain_client::BlockchainClient, consts, Error};
 
 #[derive(Clone, Debug)]
 pub struct Config {
     /// The address where the RPC server is listening or the client is connecting to
     pub addr: SocketAddr,
     pub datadir: PathBuf,
-    pub electrum_url: String,
+    pub server_url: String,
+    pub server_type: String,
     pub network: ElementsNetwork,
-    pub tls: bool,
-    pub validate_domain: bool,
 
     pub explorer_url: String,
-
-    // Unfortunately we cannot always derive the "api" url from "explorer_url", thus we need two separate values
-    pub esplora_api_url: String,
 
     pub registry_url: String,
     pub timeout: Duration,
@@ -37,12 +35,10 @@ impl Config {
         Self {
             addr: consts::DEFAULT_ADDR.into(),
             datadir,
-            electrum_url: LIQUID_TESTNET_SOCKET.into(),
+            server_url: format!("ssl://{LIQUID_TESTNET_SOCKET}"),
+            server_type: "electrum".into(),
             network: ElementsNetwork::LiquidTestnet,
-            tls: true,
-            validate_domain: true,
             explorer_url: "https://blockstream.info/liquidtestnet/".into(),
-            esplora_api_url: "https://blockstream.info/liquidtestnet/api/".into(),
             registry_url: "https://assets-testnet.blockstream.info/".into(),
             timeout: TIMEOUT,
             scanning_interval: consts::SCANNING_INTERVAL,
@@ -53,19 +49,17 @@ impl Config {
         Self {
             addr: consts::DEFAULT_ADDR.into(),
             datadir,
-            electrum_url: LIQUID_SOCKET.into(),
+            server_url: format!("ssl://{LIQUID_SOCKET}"),
+            server_type: "electrum".into(),
             network: ElementsNetwork::Liquid,
-            tls: true,
-            validate_domain: true,
             explorer_url: "https://blockstream.info/liquid/".into(),
-            esplora_api_url: "https://blockstream.info/liquid/api/".into(),
             registry_url: "https://assets.blockstream.info/".into(),
             timeout: TIMEOUT,
             scanning_interval: consts::SCANNING_INTERVAL,
         }
     }
 
-    /// For regtest there are no reasonable default for `electrum_url`, `explorer_url`, `esplora_api_url` and `registry_url`
+    /// For regtest there are no reasonable default for `electrum_url`, `explorer_url`, and `registry_url`
     /// It will be caller responsability to mutate them according to regtest env
     pub fn default_regtest(datadir: PathBuf) -> Self {
         let policy_asset = "5ac9f65c0efcc4775e0baec4ec03abdde22473cd3cf33c0419ca290e0751b225";
@@ -73,12 +67,10 @@ impl Config {
         Self {
             addr: consts::DEFAULT_ADDR.into(),
             datadir,
-            electrum_url: "".into(),
+            server_url: "".into(),
+            server_type: "electrum".into(),
             network: ElementsNetwork::ElementsRegtest { policy_asset },
-            tls: false,
-            validate_domain: false,
             explorer_url: "".into(),
-            esplora_api_url: "".into(),
             registry_url: "".into(),
             timeout: TIMEOUT,
             // Scan more frequently while testing
@@ -121,28 +113,27 @@ impl Config {
         matches!(self.network, ElementsNetwork::Liquid)
     }
 
-    fn electrum_url(&self) -> Result<lwk_wollet::ElectrumUrl, Error> {
-        Ok(
-            lwk_wollet::ElectrumUrl::new(&self.electrum_url, self.tls, self.validate_domain)
-                .map_err(lwk_wollet::Error::Url)?,
-        )
-    }
-
-    pub fn electrum_client(&self) -> Result<lwk_wollet::ElectrumClient, Error> {
+    pub fn blockchain_client(&self) -> Result<BlockchainClient, Error> {
         // TODO cache it instead of recreating every time
-        Ok(lwk_wollet::ElectrumClient::new(&self.electrum_url()?)?)
-    }
-
-    pub fn esplora_client(&self) -> lwk_wollet::asyncr::EsploraClient {
-        // TODO cache it instead of recreating every time
-        lwk_wollet::asyncr::EsploraClient::new(self.network, &self.esplora_api_url)
-    }
-
-    pub fn esplora_blocking_client(&self) -> Result<lwk_wollet::blocking::EsploraClient, Error> {
-        // TODO cache it instead of recreating every time
-        Ok(lwk_wollet::blocking::EsploraClient::new(
-            self.esplora_api_url.trim_end_matches('/'),
-            self.network,
-        )?)
+        match self.server_type.as_ref() {
+            "electrum" => {
+                let electrum_url = self.server_url.parse().map_err(lwk_wollet::Error::Url)?;
+                let electrum_client = ElectrumClient::new(&electrum_url)?;
+                Ok(BlockchainClient::Electrum(electrum_client))
+            }
+            "esplora" => {
+                let esplora_client = EsploraClient::new(&self.server_url, self.network)?;
+                Ok(BlockchainClient::Esplora(esplora_client))
+            }
+            "waterfalls" => {
+                let waterfalls_client =
+                    EsploraClient::new_waterfalls(&self.server_url, self.network)?;
+                Ok(BlockchainClient::Esplora(waterfalls_client))
+            }
+            _ => Err(Error::Generic(format!(
+                "Unsupported server type: {}",
+                self.server_type
+            ))),
+        }
     }
 }

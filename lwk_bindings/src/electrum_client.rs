@@ -9,7 +9,6 @@ use crate::{BlockHeader, LwkError, Transaction, Txid, Update, Wollet};
 pub struct ElectrumClient {
     inner: Arc<Mutex<lwk_wollet::ElectrumClient>>,
 
-    #[allow(unused)] // TODO remove once lwk_boltz is integrated
     url: lwk_wollet::ElectrumUrl,
 }
 
@@ -24,6 +23,19 @@ impl ElectrumClient {
     ) -> Result<Arc<Self>, LwkError> {
         let url = lwk_wollet::ElectrumUrl::new(electrum_url, tls, validate_domain)
             .map_err(lwk_wollet::Error::Url)?;
+        let client = lwk_wollet::ElectrumClient::new(&url)?;
+        Ok(Arc::new(Self {
+            inner: Arc::new(Mutex::new(client)),
+            url,
+        }))
+    }
+
+    #[uniffi::constructor]
+    /// Construct an electrum client from an Electrum URL
+    pub fn from_url(electrum_url: &str) -> Result<Arc<Self>, LwkError> {
+        let url = electrum_url
+            .parse::<lwk_wollet::ElectrumUrl>()
+            .map_err(|e| LwkError::Generic { msg: e.to_string() })?;
         let client = lwk_wollet::ElectrumClient::new(&url)?;
         Ok(Arc::new(Self {
             inner: Arc::new(Mutex::new(client)),

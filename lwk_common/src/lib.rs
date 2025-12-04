@@ -3,10 +3,10 @@
 
 //! A crate containing common code used in multiple other crate in the workspace, such as:
 //!
-//!   * Utils to inspect a PSET: get the net effect of a PSET on a given wallet [`pset_balance()`], or get how many
-//!     signatures are missing , and which signers should provide them [`pset_signatures()`].
+//!  * Utils to inspect a PSET: get the net effect of a PSET on a given wallet [`pset_balance()`], or get how many
+//!    signatures are missing , and which signers should provide them [`pset_signatures()`].
 //!  * [`Signer`] trait: contains the methods to be implemented by a signer such as signing a pset or
-//!     returning an xpub
+//!    returning an xpub
 //!
 //!  To avoid circular dependencies this crate must not depend on other crate of the workspace
 
@@ -197,25 +197,46 @@ pub fn pset_balance(
                     _ => return Err(Error::InputNotBlinded { idx }),
                 };
 
-                // We expect the input to be unblindable with the descriptor blinding key
-                let private_blinding_key = derive_blinding_key(descriptor, &txout.script_pubkey)
-                    .ok_or(Error::MissingPrivateBlindingKey)?;
-                // However the rangeproof is stored in another field
-                // since the output witness, which includes the rangeproof,
-                // is not serialized.
-                let mut txout_with_rangeproof = txout.clone();
-                txout_with_rangeproof
-                    .witness
-                    .rangeproof
-                    .clone_from(&input.in_utxo_rangeproof);
-                let txout_secrets = txout_with_rangeproof
-                    .unblind(&secp, private_blinding_key)
-                    .map_err(|_| Error::InputMineNotUnblindable { idx })?;
-                if (asset_comm, amount_comm) != commitments(&secp, &txout_secrets) {
-                    return Err(Error::InputCommitmentsMismatch { idx });
-                }
+                let (asset, value) = match (
+                    input.blind_asset_proof.as_ref(),
+                    input.blind_value_proof.as_ref(),
+                    input.asset,
+                    input.amount,
+                ) {
+                    (Some(bap), Some(bvp), Some(asset), Some(value)) => {
+                        if !bap.blind_asset_proof_verify(&secp, asset, asset_comm) {
+                            return Err(Error::InvalidAssetBlindProof { idx });
+                        }
+                        if !bvp.blind_value_proof_verify(&secp, value, asset_comm, amount_comm) {
+                            return Err(Error::InvalidValueBlindProof { idx });
+                        }
+                        (asset, value)
+                    }
+                    _ => {
+                        // To handle PSETs created before we started adding input blind proofs,
+                        // we also try to unblind the input with the descriptor blinding key
+                        let private_blinding_key =
+                            derive_blinding_key(descriptor, &txout.script_pubkey)
+                                .ok_or(Error::MissingPrivateBlindingKey)?;
+                        // However the rangeproof is stored in another field
+                        // since the output witness, which includes the rangeproof,
+                        // is not serialized.
+                        let mut txout_with_rangeproof = txout.clone();
+                        txout_with_rangeproof
+                            .witness
+                            .rangeproof
+                            .clone_from(&input.in_utxo_rangeproof);
+                        let txout_secrets = txout_with_rangeproof
+                            .unblind(&secp, private_blinding_key)
+                            .map_err(|_| Error::InputMineNotUnblindable { idx })?;
+                        if (asset_comm, amount_comm) != commitments(&secp, &txout_secrets) {
+                            return Err(Error::InputCommitmentsMismatch { idx });
+                        }
+                        (txout_secrets.asset, txout_secrets.value)
+                    }
+                };
 
-                *balances.entry(txout_secrets.asset).or_default() -= txout_secrets.value as i64;
+                *balances.entry(asset).or_default() -= value as i64;
             }
         }
     }
@@ -351,7 +372,7 @@ pub fn burn_script() -> Script {
 
 /// Create a debug string of a PSET, but remove new lines on number arrays.
 pub fn pset_debug(pset: &PartiallySignedTransaction) -> String {
-    let debug_str = format!("{:#?}", pset);
+    let debug_str = format!("{pset:#?}");
     let mut result = String::new();
 
     // Remove new line for lines that contain only a number ending with a comma so that the output is more readable
@@ -400,12 +421,30 @@ mod test {
             !balance.balances.contains_key(&asset_id),
             "redeposit (balance = 0) should disappear from the list"
         );
+
+        // Same for newly created psets with blind proofs
+        let pset_str =
+            include_str!("../test_data/pset_details/pset_with_input_blind_proofs.base64");
+        let pset: PartiallySignedTransaction = pset_str.parse().unwrap();
+        let balance = pset_balance(&pset, &desc, &elements::AddressParams::LIQUID_TESTNET).unwrap();
+        assert!(
+            !balance.balances.contains_key(&asset_id),
+            "redeposit (balance = 0) should disappear from the list"
+        );
     }
 
     #[test]
     fn test_pset_details_negative_balance() {
         let (asset_id, desc) = setup_pset_details();
         let pset_str = include_str!("../test_data/pset_details/pset2.base64");
+        let pset: PartiallySignedTransaction = pset_str.parse().unwrap();
+        let balance = pset_balance(&pset, &desc, &elements::AddressParams::LIQUID_TESTNET).unwrap();
+        let v = balance.balances.get(&asset_id).unwrap();
+        assert_eq!(*v, -1);
+
+        // Same for newly created psets with blind proofs
+        let pset_str =
+            include_str!("../test_data/pset_details/pset2_with_input_blind_proofs.base64");
         let pset: PartiallySignedTransaction = pset_str.parse().unwrap();
         let balance = pset_balance(&pset, &desc, &elements::AddressParams::LIQUID_TESTNET).unwrap();
         let v = balance.balances.get(&asset_id).unwrap();

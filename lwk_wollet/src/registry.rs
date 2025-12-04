@@ -6,13 +6,13 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::str::FromStr;
 
-use crate::config::{
-    LIQUID_DEFAULT_REGTEST_ASSET_STR, LIQUID_POLICY_ASSET_STR, LIQUID_TESTNET_POLICY_ASSET_STR,
-};
 use crate::domain::verify_domain_name;
 use crate::elements::hashes::{sha256, Hash};
 use crate::elements::{AssetId, ContractHash, OutPoint};
 use crate::error::Error;
+use crate::network::{
+    LIQUID_DEFAULT_REGTEST_ASSET_STR, LIQUID_POLICY_ASSET_STR, LIQUID_TESTNET_POLICY_ASSET_STR,
+};
 use crate::util::{serde_from_hex, serde_to_hex, verify_pubkey};
 use crate::ElementsNetwork;
 use elements::hashes::sha256::Midstate;
@@ -317,7 +317,6 @@ impl Registry {
         }
     }
 
-    #[allow(dead_code)]
     /// Return the default registry for the given network, use [`Self::new()`] to specify a custom URL
     pub fn default_for_network(network: ElementsNetwork) -> Result<Self, Error> {
         Ok(Self::new(network_default_url(network)?))
@@ -352,8 +351,7 @@ impl Registry {
         } else {
             let body = response.text().await.unwrap_or_default();
             Err(Error::Generic(format!(
-                "Failed to post contract to registry: {} {}",
-                status, body
+                "Failed to post contract to registry: {status} {body}"
             )))
         }
     }
@@ -411,9 +409,11 @@ pub mod blocking {
         pub fn fetch_with_tx(
             &self,
             asset_id: AssetId,
-            client: &crate::asyncr::EsploraClient,
+            client: &impl crate::clients::blocking::BlockchainBackend,
         ) -> Result<(super::Contract, Transaction), Error> {
-            self.rt.block_on(self.inner.fetch_with_tx(asset_id, client))
+            let data = self.fetch(asset_id)?;
+            let tx = client.get_transaction(data.issuance_txin.txid)?;
+            Ok((data.contract, tx))
         }
 
         /// Post a contract to the registry

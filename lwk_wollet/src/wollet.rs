@@ -1,6 +1,6 @@
 use crate::bitcoin::bip32::Fingerprint;
+use crate::cache::{Cache, Height, ScriptBatch, Timestamp, BATCH_SIZE};
 use crate::clients::{try_unblind, LastUnused};
-use crate::config::{Config, ElementsNetwork};
 use crate::descriptor::Chain;
 use crate::elements::confidential::{AssetBlindingFactor, ValueBlindingFactor};
 use crate::elements::pset::PartiallySignedTransaction;
@@ -12,9 +12,9 @@ use crate::model::{
     AddressResult, BitcoinAddressResult, ExternalUtxo, IssuanceDetails, WalletTx, WalletTxOut,
 };
 use crate::persister::PersistError;
-use crate::store::{Height, ScriptBatch, Store, Timestamp, BATCH_SIZE};
 use crate::tx_builder::{extract_issuances, WolletTxBuilder};
 use crate::util::EC;
+use crate::ElementsNetwork;
 use crate::{BlindingPublicKey, FsPersister, NoPersist, Persister, Update, WolletDescriptor};
 use elements::bitcoin::bip32::ChildNumber;
 use elements::{bitcoin, Address, AddressParams};
@@ -35,12 +35,61 @@ use std::sync::{atomic, Arc};
 
 /// A watch-only wallet defined by a CT descriptor.
 pub struct Wollet {
-    pub(crate) config: Config,
-    pub(crate) store: Store,
+    pub(crate) network: ElementsNetwork,
+    pub(crate) cache: Cache,
     pub(crate) persister: Arc<dyn Persister + Send + Sync>,
     pub(crate) descriptor: WolletDescriptor,
     // cached value
     max_weight_to_satisfy: usize,
+}
+
+/// A builder for constructing [`Wollet`] instances
+pub struct WolletBuilder {
+    network: ElementsNetwork,
+    descriptor: WolletDescriptor,
+    persister: Arc<dyn Persister + Send + Sync>,
+}
+
+impl WolletBuilder {
+    /// Create a `Wollet` builder
+    pub fn new(network: ElementsNetwork, descriptor: WolletDescriptor) -> Self {
+        Self {
+            network,
+            descriptor,
+            persister: Arc::new(NoPersist {}),
+        }
+    }
+
+    /// Specify the `Wollet` persister
+    pub fn with_persister(mut self, persister: Arc<dyn Persister + Send + Sync>) -> Self {
+        self.persister = persister;
+        self
+    }
+
+    /// Build the `Wollet`
+    pub fn build(self) -> Result<Wollet, Error> {
+        let cache = Cache::default();
+        let max_weight_to_satisfy = self
+            .descriptor
+            .definite_descriptor(Chain::External, 0)?
+            .max_weight_to_satisfy()?;
+        let mut wollet = Wollet {
+            cache,
+            network: self.network,
+            descriptor: self.descriptor,
+            persister: self.persister,
+            max_weight_to_satisfy,
+        };
+
+        for i in 0.. {
+            match wollet.persister.get(i)? {
+                Some(update) => wollet.apply_update_no_persist(update)?,
+                None => break,
+            }
+        }
+
+        Ok(wollet)
+    }
 }
 
 /// A coincise state of the wallet, in particular having only transactions ids instead of full
@@ -57,7 +106,6 @@ pub struct WolletConciseState {
     last_unused: LastUnused,
 }
 
-#[allow(unused)]
 pub trait WolletState {
     fn get_script_batch(
         &self,
@@ -165,7 +213,7 @@ impl WolletState for Wollet {
         batch: u32,
         descriptor: &ConfidentialDescriptor<DescriptorPublicKey>,
     ) -> Result<ScriptBatch, Error> {
-        self.store.get_script_batch(batch, descriptor)
+        self.cache.get_script_batch(batch, descriptor)
     }
 
     fn get_or_derive(
@@ -174,23 +222,23 @@ impl WolletState for Wollet {
         child: ChildNumber,
         descriptor: &ConfidentialDescriptor<DescriptorPublicKey>,
     ) -> Result<(Script, BlindingPublicKey, bool), Error> {
-        self.store.get_or_derive(ext_int, child, descriptor)
+        self.cache.get_or_derive(ext_int, child, descriptor)
     }
 
     fn heights(&self) -> &HashMap<Txid, Option<Height>> {
-        &self.store.cache.heights
+        &self.cache.heights
     }
 
     fn paths(&self) -> &HashMap<Script, (Chain, ChildNumber)> {
-        &self.store.cache.paths
+        &self.cache.paths
     }
 
     fn txs(&self) -> HashSet<Txid> {
-        self.store.cache.all_txs.keys().cloned().collect()
+        self.cache.all_txs.keys().cloned().collect()
     }
 
     fn tip(&self) -> (Height, BlockHash) {
-        self.store.cache.tip
+        self.cache.tip
     }
 
     fn last_unused(&self) -> LastUnused {
@@ -212,8 +260,8 @@ impl WolletState for Wollet {
 
 impl std::hash::Hash for Wollet {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.config.hash(state);
-        self.store.hash(state);
+        self.network.hash(state);
+        self.cache.hash(state);
         self.descriptor.hash(state);
     }
 }
@@ -225,28 +273,9 @@ impl Wollet {
         persister: Arc<dyn Persister + Send + Sync>,
         descriptor: WolletDescriptor,
     ) -> Result<Self, Error> {
-        let config = Config::new(network)?;
-
-        let store = Store::default();
-        let max_weight_to_satisfy = descriptor
-            .definite_descriptor(Chain::External, 0)?
-            .max_weight_to_satisfy()?;
-        let mut wollet = Wollet {
-            store,
-            config,
-            descriptor,
-            persister,
-            max_weight_to_satisfy,
-        };
-
-        for i in 0.. {
-            match wollet.persister.get(i)? {
-                Some(update) => wollet.apply_update_no_persist(update)?,
-                None => break,
-            }
-        }
-
-        Ok(wollet)
+        WolletBuilder::new(network, descriptor)
+            .with_persister(persister)
+            .build()
     }
 
     /// Whether the wallet is segwit (BIP141)
@@ -259,6 +288,7 @@ impl Wollet {
     }
 
     /// Whether the wallet is AMP0
+    #[cfg(feature = "amp0")]
     pub fn is_amp0(&self) -> bool {
         self.descriptor.is_amp0()
     }
@@ -270,7 +300,7 @@ impl Wollet {
 
     /// Get a concise state of the wallet, allowing to perform a scan (like [`crate::clients::blocking::BlockchainBackend::full_scan()`]) without holding the lock on the wallet.
     pub fn state(&self) -> WolletConciseState {
-        let cache = &self.store.cache;
+        let cache = &self.cache;
         WolletConciseState {
             wollet_status: self.status(),
             descriptor: self.wollet_descriptor(),
@@ -309,7 +339,7 @@ impl Wollet {
 
     /// Get the network policy asset
     pub fn policy_asset(&self) -> AssetId {
-        self.config.policy_asset()
+        self.network.policy_asset()
     }
 
     /// Creates a transaction builder with a reference to this wallet
@@ -319,7 +349,7 @@ impl Wollet {
 
     /// Get the network
     pub fn network(&self) -> ElementsNetwork {
-        self.config.network()
+        self.network
     }
 
     /// Get a reference of the wallet descriptor
@@ -334,8 +364,8 @@ impl Wollet {
 
     /// Get the blockchain tip
     pub fn tip(&self) -> Tip {
-        let (height, hash) = self.store.cache.tip;
-        let timestamp = self.store.cache.timestamps.get(&height).cloned();
+        let (height, hash) = self.cache.tip;
+        let timestamp = self.cache.timestamps.get(&height).cloned();
         Tip {
             height,
             hash,
@@ -357,7 +387,7 @@ impl Wollet {
 
         let address = self
             .descriptor
-            .address(index, self.config.address_params())?;
+            .address(index, self.network.address_params())?;
         Ok(AddressResult::new(address, index))
     }
 
@@ -385,12 +415,12 @@ impl Wollet {
     }
 
     pub(crate) fn last_unused_external(&self) -> u32 {
-        let cache = &self.store.cache;
+        let cache = &self.cache;
         cache.last_unused_external.load(atomic::Ordering::Relaxed)
     }
 
     pub(crate) fn last_unused_internal(&self) -> u32 {
-        let cache = &self.store.cache;
+        let cache = &self.cache;
         cache.last_unused_internal.load(atomic::Ordering::Relaxed)
     }
 
@@ -418,7 +448,7 @@ impl Wollet {
 
         let address = self
             .descriptor
-            .change(index, self.config.address_params())?;
+            .change(index, self.network.address_params())?;
         Ok(AddressResult::new(address, index))
     }
 
@@ -432,14 +462,13 @@ impl Wollet {
 
     fn txos_inner(&self) -> Result<Vec<WalletTxOut>, Error> {
         let mut txos = vec![];
-        let spent = self.store.spent()?;
-        for (tx_id, height) in self.store.cache.heights.iter() {
+        let spent = self.cache.spent()?;
+        for (tx_id, height) in self.cache.heights.iter() {
             let tx = self
-                .store
                 .cache
                 .all_txs
                 .get(tx_id)
-                .ok_or_else(|| Error::Generic(format!("txos no tx {}", tx_id)))?;
+                .ok_or_else(|| Error::Generic(format!("txos no tx {tx_id}")))?;
             let tx_txos = tx
                 .output
                 .iter()
@@ -452,10 +481,9 @@ impl Wollet {
                     (out_point, output, spent.contains(&out_point))
                 })
                 .filter_map(|(outpoint, output, is_spent)| {
-                    if let Some(unblinded) = self.store.cache.unblinded.get(&outpoint) {
+                    if let Some(unblinded) = self.cache.unblinded.get(&outpoint) {
                         let index = self.index(&output.script_pubkey).ok()?;
                         let blinding_pubkey = self
-                            .store
                             .cache
                             .scripts
                             .get(&(index.0, index.1.into()))
@@ -515,15 +543,15 @@ impl Wollet {
     ///
     /// They can be spent as external utxos using [`crate::TxBuilder::add_external_utxos()`].
     pub fn explicit_utxos(&self) -> Result<Vec<ExternalUtxo>, Error> {
-        let spent = self.store.spent()?;
+        let spent = self.cache.spent()?;
         let mut utxos = vec![];
-        for (txid, tx) in self.store.cache.all_txs.iter() {
+        for (txid, tx) in self.cache.all_txs.iter() {
             for (vout, o) in tx.output.iter().enumerate() {
                 let outpoint = OutPoint::new(*txid, vout as u32);
                 if !o.script_pubkey.is_empty()
                     && o.asset.is_explicit()
                     && o.value.is_explicit()
-                    && self.store.cache.paths.contains_key(&o.script_pubkey)
+                    && self.cache.paths.contains_key(&o.script_pubkey)
                     && !spent.contains(&outpoint)
                 {
                     let unblinded = TxOutSecrets::new(
@@ -562,7 +590,7 @@ impl Wollet {
         let tx = pset.extract_tx()?;
         let txid = tx.txid();
         for (vout, output) in pset.outputs().iter().enumerate() {
-            if self.store.cache.paths.contains_key(&output.script_pubkey) {
+            if self.cache.paths.contains_key(&output.script_pubkey) {
                 let outpoint = OutPoint::new(txid, vout as u32);
                 // FIXME: also extract explicit utxos
                 let txout = output.to_txout();
@@ -590,12 +618,12 @@ impl Wollet {
     /// In some particular situation they can be unblinded with [`crate::Wollet::reunblind()`].
     pub fn txos_cannot_unblind(&self) -> Result<Vec<OutPoint>, Error> {
         let mut txos = vec![];
-        for (txid, tx) in self.store.cache.all_txs.iter() {
+        for (txid, tx) in self.cache.all_txs.iter() {
             for (vout, o) in tx.output.iter().enumerate() {
                 let outpoint = OutPoint::new(*txid, vout as u32);
                 if !o.script_pubkey.is_empty()
-                    && self.store.cache.paths.contains_key(&o.script_pubkey)
-                    && !self.store.cache.unblinded.contains_key(&outpoint)
+                    && self.cache.paths.contains_key(&o.script_pubkey)
+                    && !self.cache.unblinded.contains_key(&outpoint)
                 {
                     txos.push(outpoint);
                 }
@@ -615,13 +643,13 @@ impl Wollet {
         blinding_key: bitcoin::secp256k1::SecretKey,
     ) -> Result<Vec<ExternalUtxo>, Error> {
         let mut utxos = vec![];
-        let spent = self.store.spent()?;
-        let store_unblinded = &self.store.cache.unblinded;
-        for (txid, tx) in self.store.cache.all_txs.iter() {
+        let spent = self.cache.spent()?;
+        let cache_unblinded = &self.cache.unblinded;
+        for (txid, tx) in self.cache.all_txs.iter() {
             for (i, txout) in tx.output.iter().enumerate() {
-                if self.store.cache.paths.contains_key(&txout.script_pubkey) {
+                if self.cache.paths.contains_key(&txout.script_pubkey) {
                     let outpoint = OutPoint::new(*txid, i as u32);
-                    if !spent.contains(&outpoint) && !store_unblinded.contains_key(&outpoint) {
+                    if !spent.contains(&outpoint) && !cache_unblinded.contains_key(&outpoint) {
                         if let Ok(unblinded) = txout.unblind(&EC, blinding_key) {
                             let tx_ = if self.is_segwit() {
                                 None
@@ -650,11 +678,11 @@ impl Wollet {
     /// its transaction outputs. This function allows to attempt to unblind them again.
     pub fn reunblind(&mut self) -> Result<Vec<OutPoint>, Error> {
         let mut txos = vec![];
-        for (txid, tx) in self.store.cache.all_txs.iter() {
+        for (txid, tx) in self.cache.all_txs.iter() {
             for (vout, txout) in tx.output.iter().enumerate() {
-                if self.store.cache.paths.contains_key(&txout.script_pubkey) {
+                if self.cache.paths.contains_key(&txout.script_pubkey) {
                     let outpoint = OutPoint::new(*txid, vout as u32);
-                    if let Entry::Vacant(e) = self.store.cache.unblinded.entry(outpoint) {
+                    if let Entry::Vacant(e) = self.cache.unblinded.entry(outpoint) {
                         if let Ok(unblinded) = try_unblind(txout, &self.descriptor) {
                             e.insert(unblinded);
                             txos.push(outpoint);
@@ -694,7 +722,7 @@ impl Wollet {
         limit: usize,
     ) -> Result<Vec<WalletTx>, Error> {
         let mut txs = vec![];
-        let mut my_txids: Vec<(&Txid, &Option<u32>)> = self.store.cache.heights.iter().collect();
+        let mut my_txids: Vec<(&Txid, &Option<u32>)> = self.cache.heights.iter().collect();
         my_txids.sort_by(|a, b| {
             let height_cmp = b.1.unwrap_or(u32::MAX).cmp(&a.1.unwrap_or(u32::MAX));
             match height_cmp {
@@ -706,11 +734,10 @@ impl Wollet {
         let txos = self.txos_map()?;
         for (txid, height) in my_txids.iter().skip(offset).take(limit) {
             let tx = self
-                .store
                 .cache
                 .all_txs
                 .get(*txid)
-                .ok_or_else(|| Error::Generic(format!("list_tx no tx {}", txid)))?;
+                .ok_or_else(|| Error::Generic(format!("list_tx no tx {txid}")))?;
 
             let balance = tx_balance(**txid, tx, &txos);
             if balance.is_empty() {
@@ -721,7 +748,7 @@ impl Wollet {
             let fee = tx_fee(tx);
             let policy_asset = self.policy_asset();
             let type_ = tx_type(tx, &policy_asset, &balance, fee);
-            let timestamp = height.and_then(|h| self.store.cache.timestamps.get(&h).cloned());
+            let timestamp = height.and_then(|h| self.cache.timestamps.get(&h).cloned());
             let inputs = tx_inputs(tx, &txos);
             let outputs = tx_outputs(**txid, tx, &txos);
             txs.push(WalletTx {
@@ -747,8 +774,8 @@ impl Wollet {
 
     /// Get a wallet transaction
     pub fn transaction(&self, txid: &Txid) -> Result<Option<WalletTx>, Error> {
-        let height = self.store.cache.heights.get(txid);
-        let tx = self.store.cache.all_txs.get(txid);
+        let height = self.cache.heights.get(txid);
+        let tx = self.cache.all_txs.get(txid);
         if let (Some(height), Some(tx)) = (height, tx) {
             let txos = self.txos_map()?;
 
@@ -756,7 +783,7 @@ impl Wollet {
             let fee = tx_fee(tx);
             let policy_asset = self.policy_asset();
             let type_ = tx_type(tx, &policy_asset, &balance, fee);
-            let timestamp = height.and_then(|h| self.store.cache.timestamps.get(&h).cloned());
+            let timestamp = height.and_then(|h| self.cache.timestamps.get(&h).cloned());
             let inputs = tx_inputs(tx, &txos);
             let outputs = tx_outputs(*txid, tx, &txos);
 
@@ -799,7 +826,7 @@ impl Wollet {
     /// Get the PSET details with respect to the wallet
     pub fn get_details(&self, pset: &PartiallySignedTransaction) -> Result<PsetDetails, Error> {
         Ok(PsetDetails {
-            balance: pset_balance(pset, self.descriptor(), self.config.address_params())?,
+            balance: pset_balance(pset, self.descriptor(), self.network.address_params())?,
             sig_details: pset_signatures(pset),
             issuances: pset_issuances(pset),
         })
@@ -807,7 +834,6 @@ impl Wollet {
 
     pub(crate) fn index(&self, script_pubkey: &Script) -> Result<(Chain, u32), Error> {
         let (ext_int, index) = self
-            .store
             .cache
             .paths
             .get(script_pubkey)
@@ -954,7 +980,7 @@ impl Wollet {
                 if !pset.inputs().iter().all(seems_finalized) {
                     // Failed to finalize all inputs
                     // TODO: do not use Generic
-                    return Err(Error::Generic(format!("{:?}", errors)));
+                    return Err(Error::Generic(format!("{errors:?}")));
                 }
             }
             // If some inputs have been finalized ignore the other errors
@@ -977,7 +1003,7 @@ impl Wollet {
     }
 
     /// A deterministic value derived from the descriptor, the config and the content of this wollet,
-    /// including what's in the wallet store (transactions etc)
+    /// including what's in the wallet cache (transactions etc)
     ///
     /// In this case, we don't need cryptographic assurance guaranteed by the std default hasher (siphash)
     /// And we can use a much faster hasher, which is used also in the rust compiler.
@@ -990,7 +1016,7 @@ impl Wollet {
 
     /// Returns true if this wollet has never received an updated applyed to it
     pub fn never_scanned(&self) -> bool {
-        self.store.cache.tip == (0, BlockHash::all_zeros())
+        self.cache.tip == (0, BlockHash::all_zeros())
     }
 }
 
@@ -1191,10 +1217,7 @@ mod tests {
         let master_blinding_key =
             "9c8e4f05c7711a98c838be228bcb84924d4570ca53f35fa1c793e58841d47023";
         let checksum = "qw2qy2ml";
-        let desc_str = format!(
-            "ct(slip77({}),elwpkh({}))#{}",
-            master_blinding_key, xpub, checksum
-        );
+        let desc_str = format!("ct(slip77({master_blinding_key}),elwpkh({xpub}))#{checksum}");
         let desc = ConfidentialDescriptor::<DefiniteDescriptorKey>::from_str(&desc_str).unwrap();
         let addr = desc.address(&EC, &AddressParams::ELEMENTS).unwrap();
         let expected_addr = "el1qqthj9zn320epzlcgd07kktp5ae2xgx82fkm42qqxaqg80l0fszueszj4mdsceqqfpv24x0cmkvd8awux8agrc32m9nj9sp0hk";
@@ -1208,7 +1231,7 @@ mod tests {
         let xprv = Xpriv::new_master(Network::Regtest, &seed).unwrap();
         let xpub = Xpub::from_priv(&EC, &xprv);
         let checksum = "h0ej28gv";
-        let desc_str = format!("ct({},elwpkh({}))#{}", xprv, xpub, checksum);
+        let desc_str = format!("ct({xprv},elwpkh({xpub}))#{checksum}");
         let desc = ConfidentialDescriptor::<DefiniteDescriptorKey>::from_str(&desc_str).unwrap();
         let address = desc.address(&EC, &AddressParams::ELEMENTS).unwrap();
         // and extract the public blinding key
@@ -1230,13 +1253,13 @@ mod tests {
         let descriptor_blinding_key =
             "1111111111111111111111111111111111111111111111111111111111111111";
         let xpub = "tpubDD7tXK8KeQ3YY83yWq755fHY2JW8Ha8Q765tknUM5rSvjPcGWfUppDFMpQ1ScziKfW3ZNtZvAD7M3u7bSs7HofjTD3KP3YxPK7X6hwV8Rk2";
-        let desc_str = format!("ct({},elwpkh({}))", descriptor_blinding_key, xpub);
-        let desc_str = format!("{}#{}", desc_str, desc_checksum(&desc_str).unwrap());
+        let desc_str = format!("ct({descriptor_blinding_key},elwpkh({xpub}))");
+        let desc_str = format!("{desc_str}#{}", desc_checksum(&desc_str).unwrap());
         let _desc = ConfidentialDescriptor::<DefiniteDescriptorKey>::from_str(&desc_str).unwrap();
     }
 
     fn new_wollet(desc: &str) -> Wollet {
-        let desc: WolletDescriptor = format!("{}#{}", desc, desc_checksum(desc).unwrap())
+        let desc: WolletDescriptor = format!("{desc}#{}", desc_checksum(desc).unwrap())
             .parse()
             .unwrap();
         Wollet::new(ElementsNetwork::LiquidTestnet, NoPersist::new(), desc).unwrap()
@@ -1274,7 +1297,7 @@ mod tests {
     #[test]
     fn test_restore_only_tip() {
         let desc_str = "ct(slip77(9c8e4f05c7711a98c838be228bcb84924d4570ca53f35fa1c793e58841d47023),elwpkh([73c5da0a/84'/1'/0']tpubDC8msFGeGuwnKG9Upg7DM2b4DaRqg3CUZa5g8v2SRQ6K4NSkxUgd7HsL2XVWbVm39yBA4LAxysQAm397zwQSQoQgewGiYZqrA9DsP4zbQ1M/<0;1>/*))";
-        let desc: WolletDescriptor = format!("{}#{}", desc_str, desc_checksum(desc_str).unwrap())
+        let desc: WolletDescriptor = format!("{desc_str}#{}", desc_checksum(desc_str).unwrap())
             .parse()
             .unwrap();
 
@@ -1459,7 +1482,7 @@ mod tests {
         let start = std::time::Instant::now();
         let _txs = wollet.transactions().unwrap();
         let duration = start.elapsed();
-        println!("duration: {:?}", duration);
+        println!("duration: {duration:?}");
         assert!(duration < MAX_DURATION);
 
         let start = std::time::Instant::now();
@@ -1505,9 +1528,7 @@ mod tests {
             assert_eq!(
                 paginated_txs.len(),
                 expected_count,
-                "Wrong number of transactions for offset={}, limit={}",
-                offset,
-                limit
+                "Wrong number of transactions for offset={offset}, limit={limit}",
             );
 
             // Verify the transactions match the expected slice of all transactions
@@ -1515,8 +1536,7 @@ mod tests {
                 let expected_txs = &all_txs[offset..offset + paginated_txs.len()];
                 assert_eq!(
                     paginated_txs, expected_txs,
-                    "Transactions don't match for offset={}, limit={}",
-                    offset, limit
+                    "Transactions don't match for offset={offset}, limit={limit}",
                 );
             }
         }
@@ -1528,12 +1548,8 @@ mod tests {
         let descriptor = lwk_test_util::wollet_descriptor_many_transactions();
         let descriptor: WolletDescriptor = descriptor.parse().unwrap();
         let update = Update::deserialize(&update).unwrap();
-        let mut wollet = Wollet::new(
-            ElementsNetwork::LiquidTestnet,
-            std::sync::Arc::new(NoPersist {}),
-            descriptor,
-        )
-        .unwrap();
+        let network = ElementsNetwork::LiquidTestnet;
+        let mut wollet = WolletBuilder::new(network, descriptor).build().unwrap();
         wollet.apply_update(update).unwrap();
         wollet
     }

@@ -10,8 +10,7 @@ use lwk_common::Signer;
 use lwk_signer::AnySigner;
 use lwk_signer::SwSigner;
 use lwk_test_util::{
-    add_checksum, assert_fee_rate, compute_fee_rate, n_issuances, n_reissuances, pset_rt,
-    TestElectrumServer,
+    add_checksum, assert_fee_rate, compute_fee_rate, n_issuances, n_reissuances, pset_rt, TestEnv,
 };
 use lwk_test_util::{generate_mnemonic, generate_slip77};
 use lwk_wollet::clients::blocking::BlockchainBackend;
@@ -38,6 +37,7 @@ fn sync<S: BlockchainBackend>(wollet: &mut Wollet, client: &mut S) {
 }
 
 pub fn test_client_electrum(url: &str) -> ElectrumClient {
+    let url = &url.replace("tcp://", "");
     let tls = false;
     let validate_domain = false;
     let electrum_url = ElectrumUrl::new(url, tls, validate_domain).unwrap();
@@ -53,7 +53,7 @@ pub fn wait_for_tx<S: BlockchainBackend>(wollet: &mut Wollet, client: &mut S, tx
         }
         thread::sleep(Duration::from_millis(500));
     }
-    panic!("Wallet does not have {} in its list", txid);
+    panic!("Wallet does not have {txid} in its list");
 }
 
 impl<C: BlockchainBackend> TestWollet<C> {
@@ -134,7 +134,7 @@ impl<C: BlockchainBackend> TestWollet<C> {
             }
             thread::sleep(Duration::from_millis(500));
         }
-        panic!("Wallet does not have {} in its list", txid);
+        panic!("Wallet does not have {txid} in its list");
     }
 
     /// asset balance in satoshi
@@ -153,7 +153,7 @@ impl<C: BlockchainBackend> TestWollet<C> {
 
     pub fn fund(
         &mut self,
-        server: &TestElectrumServer,
+        env: &TestEnv,
         satoshi: u64,
         address: Option<Address>,
         asset: Option<AssetId>,
@@ -162,7 +162,7 @@ impl<C: BlockchainBackend> TestWollet<C> {
         let balance_before = self.balance(&asset.unwrap_or(self.policy_asset()));
 
         let address = address.unwrap_or_else(|| self.address());
-        let txid = server.elementsd_sendtoaddress(&address, satoshi, asset);
+        let txid = env.elementsd_sendtoaddress(&address, satoshi, asset);
         self.wait_for_tx(&txid);
         let tx = self.get_tx(&txid);
         // We only received, all balances are positive
@@ -179,20 +179,20 @@ impl<C: BlockchainBackend> TestWollet<C> {
         assert_eq!(balance_before + satoshi, balance_after);
     }
 
-    pub fn fund_btc(&mut self, server: &TestElectrumServer) {
-        self.fund(server, 1_000_000, Some(self.address()), None);
+    pub fn fund_btc(&mut self, env: &TestEnv) {
+        self.fund(env, 1_000_000, Some(self.address()), None);
     }
 
-    pub fn fund_asset(&mut self, server: &TestElectrumServer) -> AssetId {
+    pub fn fund_asset(&mut self, env: &TestEnv) -> AssetId {
         let satoshi = 10_000;
-        let asset = server.elementsd_issueasset(satoshi);
-        self.fund(server, satoshi, Some(self.address()), Some(asset));
+        let asset = env.elementsd_issueasset(satoshi);
+        self.fund(env, satoshi, Some(self.address()), Some(asset));
         asset
     }
 
     pub fn fund_explicit(
         &mut self,
-        server: &TestElectrumServer,
+        env: &TestEnv,
         satoshi: u64,
         address: Option<Address>,
         asset: Option<AssetId>,
@@ -202,7 +202,7 @@ impl<C: BlockchainBackend> TestWollet<C> {
         let address = address
             .unwrap_or_else(|| self.address())
             .to_unconfidential();
-        let txid = server.elementsd_sendtoaddress(&address, satoshi, asset);
+        let txid = env.elementsd_sendtoaddress(&address, satoshi, asset);
         self.wait_for_tx_outside_list(&txid);
 
         let explicit_utxos_after = self.wollet.explicit_utxos().unwrap().len();

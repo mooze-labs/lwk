@@ -1,45 +1,67 @@
 from lwk import *
 
-node = LwkTestEnv() # launch electrs and elementsd
+# Start nodes
+node = LwkTestEnv()
 
-
-mnemonic = Mnemonic("abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about")
+# ANCHOR: test_issue_asset
 network = Network.regtest_default()
 policy_asset = network.policy_asset()
-client = ElectrumClient(node.electrum_url(), tls=False, validate_domain=False)
+client = ElectrumClient.from_url(node.electrum_url())
+
+# Create wallet
+mnemonic = Mnemonic("abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about")
 
 signer = Signer(mnemonic, network)
 desc = signer.wpkh_slip77_descriptor()
-
-assert(str(desc) == "ct(slip77(9c8e4f05c7711a98c838be228bcb84924d4570ca53f35fa1c793e58841d47023),elwpkh([73c5da0a/84'/1'/0']tpubDC8msFGeGuwnKG9Upg7DM2b4DaRqg3CUZa5g8v2SRQ6K4NSkxUgd7HsL2XVWbVm39yBA4LAxysQAm397zwQSQoQgewGiYZqrA9DsP4zbQ1M/<0;1>/*))#2e4n992d")
+assert(str(desc) == "ct(slip77(9c8e4f05c7711a98c838be228bcb84924d4570ca53f35fa1c793e58841d47023),elwpkh([73c5da0a/84'/1'/0']tpubDC8msFGeGuwnKG9Upg7DM2b4DaRqg3CUZa5g8v2SRQ6K4NSkxUgd7HsL2XVWbVm39yBA4LAxysQAm397zwQSQoQgewGiYZqrA9DsP4zbQ1M/<0;1>/*))#2e4n992d") # ANCHOR: ignore
 
 wollet = Wollet(network, desc, datadir=None)
 wollet_address_result = wollet.address(0)
-assert(wollet_address_result.index() == 0)
+assert(wollet_address_result.index() == 0) # ANCHOR: ignore
 wollet_adddress = wollet_address_result.address()
-assert(str(wollet_adddress) == "el1qq2xvpcvfup5j8zscjq05u2wxxjcyewk7979f3mmz5l7uw5pqmx6xf5xy50hsn6vhkm5euwt72x878eq6zxx2z0z676mna6kdq")
+assert(str(wollet_adddress) == "el1qq2xvpcvfup5j8zscjq05u2wxxjcyewk7979f3mmz5l7uw5pqmx6xf5xy50hsn6vhkm5euwt72x878eq6zxx2z0z676mna6kdq") # ANCHOR: ignore
 
-funded_satoshi = 100000
-txid = node.send_to_address(wollet_address_result.address(), funded_satoshi, asset=None)
-wollet.wait_for_tx(txid, client)
+funded_satoshi = 100000 # ANCHOR: ignore
+txid = node.send_to_address(wollet_address_result.address(), funded_satoshi, asset=None) # ANCHOR: ignore
+wollet.wait_for_tx(txid, client) # ANCHOR: ignore
+assert(wollet.balance()[policy_asset] == funded_satoshi) # ANCHOR: ignore
 
-assert(wollet.balance()[policy_asset] == funded_satoshi)
+# ANCHOR: contract
+contract = Contract(
+    domain = "ciao.it", \
+    issuer_pubkey = "0337cceec0beea0232ebe14cba0197a9fbd45fcf2ec946749de920e71434c2b904", \
+    name = "name", \
+    precision = 8, 
+    ticker = "TTT", 
+    version = 0)
+assert(str(contract) == '{"entity":{"domain":"ciao.it"},"issuer_pubkey":"0337cceec0beea0232ebe14cba0197a9fbd45fcf2ec946749de920e71434c2b904","name":"name","precision":8,"ticker":"TTT","version":0}') # ANCHOR: ignore
+# ANCHOR_END: contract
 
-contract = Contract(domain = "ciao.it", issuer_pubkey = "0337cceec0beea0232ebe14cba0197a9fbd45fcf2ec946749de920e71434c2b904", name = "name", precision = 8, ticker = "TTT", version = 0)
-assert(str(contract) == '{"entity":{"domain":"ciao.it"},"issuer_pubkey":"0337cceec0beea0232ebe14cba0197a9fbd45fcf2ec946749de920e71434c2b904","name":"name","precision":8,"ticker":"TTT","version":0}')
-
+# ANCHOR: issue_asset
 issued_asset = 10000
 reissuance_tokens = 1
+
+# Create an issuance transaction 
 builder = network.tx_builder()
 builder.issue_asset(issued_asset, wollet_adddress, reissuance_tokens, wollet_adddress, contract)
 unsigned_pset = builder.finish(wollet)
+# ANCHOR_END: issue_asset
+# Sign the transaction and finalize it
 signed_pset = signer.sign(unsigned_pset)
 finalized_pset = wollet.finalize(signed_pset)
 tx = finalized_pset.extract_tx()
+
+# Broadcast the transaction
 txid = client.broadcast(tx)
 
+# ANCHOR: issuance_ids
 asset_id = signed_pset.inputs()[0].issuance_asset()
 token_id = signed_pset.inputs()[0].issuance_token()
+# ANCHOR_END: issuance_ids
+# ANCHOR_END: test_issue_asset
+txin = tx.inputs()[0]
+assert derive_asset_id(txin, contract) == asset_id
+assert derive_token_id(txin, contract) == token_id
 
 issuance = unsigned_pset.inputs()[0].issuance()
 assert issuance.asset() == asset_id
@@ -56,15 +78,18 @@ wollet.wait_for_tx(txid, client)
 assert(wollet.balance()[asset_id] == issued_asset)
 assert(wollet.balance()[token_id] == reissuance_tokens)
 
-## reissue the asset
+# ANCHOR: reissue_asset
 reissue_asset = 100
+asset_receiver = None  # Send the asset to the wollet creating the PSET
+issuance_tx = None # issunce transaction is present in the same wallet
 builder = network.tx_builder()
-builder.reissue_asset(asset_id, 100, None, None)
+builder.reissue_asset(asset_id, reissue_asset, asset_receiver, issuance_tx)
 unsigned_pset = builder.finish(wollet)
 signed_pset = signer.sign(unsigned_pset)
 finalized_pset = wollet.finalize(signed_pset)
 tx = finalized_pset.extract_tx()
 txid = client.broadcast(tx)
+# ANCHOR_END: reissue_asset
 
 reissuance = next(e.issuance() for e in unsigned_pset.inputs() if e.issuance())
 assert reissuance.asset() == asset_id
@@ -80,4 +105,18 @@ wollet.wait_for_tx(txid, client)
 
 assert(wollet.balance()[asset_id] == issued_asset + reissue_asset)
 
+# ANCHOR: burn_asset
+burn_asset = 50
+builder = network.tx_builder()
+builder.add_burn(burn_asset, asset_id)
+unsigned_pset = builder.finish(wollet)
+signed_pset = signer.sign(unsigned_pset)
+finalized_pset = wollet.finalize(signed_pset)
+tx = finalized_pset.extract_tx()
+txid = client.broadcast(tx)
+# ANCHOR_END: burn_asset
+
+wollet.wait_for_tx(txid, client)
+
+assert(wollet.balance()[asset_id] == issued_asset + reissue_asset - burn_asset)
 

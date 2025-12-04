@@ -8,7 +8,6 @@ use boltz_client::network::LiquidChain;
 use boltz_client::ToHex;
 use lwk_wollet::ElementsNetwork;
 
-#[allow(dead_code)]
 pub struct EsploraClient {
     inner: Arc<lwk_wollet::asyncr::EsploraClient>,
     network: ElementsNetwork,
@@ -33,7 +32,8 @@ impl EsploraClient {
     }
 }
 
-#[async_trait]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 impl boltz_client::network::LiquidClient for EsploraClient {
     async fn get_address_utxo(
         &self,

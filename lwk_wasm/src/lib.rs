@@ -9,6 +9,7 @@ mod amp2;
 mod balance;
 mod bip;
 mod blockdata;
+mod boltz;
 mod contract;
 mod descriptor;
 mod error;
@@ -23,6 +24,7 @@ mod liquidex;
 mod mnemonic;
 mod network;
 mod precision;
+mod prices;
 mod pset;
 mod pset_details;
 mod registry;
@@ -52,9 +54,12 @@ pub use blockdata::transaction::{Transaction, Txid};
 pub use blockdata::tx_out_secrets::TxOutSecrets;
 pub use blockdata::wallet_tx::WalletTx;
 pub use blockdata::wallet_tx_out::{OptionWalletTxOut, WalletTxOut};
+pub use boltz::LightningPayment;
+pub use boltz::{BoltzSession, BoltzSessionBuilder};
 pub use contract::Contract;
 pub use descriptor::WolletDescriptor;
 pub(crate) use error::Error;
+pub use error::MagicRoutingHint;
 pub use esplora::EsploraClient;
 #[cfg(all(feature = "serial", target_arch = "wasm32"))]
 pub use jade::{Jade, Singlesig};
@@ -63,6 +68,7 @@ pub use jade_websocket::JadeWebSocket;
 pub use mnemonic::Mnemonic;
 pub use network::Network;
 pub use precision::Precision;
+pub use prices::{ExchangeRates, PricesFetcher, PricesFetcherBuilder};
 pub use pset::Pset;
 pub use pset_details::{Issuance, PsetDetails};
 pub use registry::{AssetMeta, Registry, RegistryPost};
@@ -78,6 +84,19 @@ pub use xpub::Xpub;
 
 #[cfg(all(feature = "serial", target_arch = "wasm32"))]
 pub use ledger::search_ledger_device;
+
+use wasm_bindgen::prelude::*;
+
+/// Convert the given string to a QR code image uri
+///
+/// The image format is monocromatic bitmap, returned as an encoded in base64 uri.
+///
+/// Without `pixel_per_module` the default is no border, and 1 pixel per module, to be used
+/// for example in html: `style="image-rendering: pixelated; border: 20px solid white;"`
+#[wasm_bindgen(js_name = stringToQr)]
+pub fn string_to_qr(str: &str, pixel_per_module: Option<u8>) -> Result<String, Error> {
+    Ok(lwk_common::string_to_qr(str, pixel_per_module)?)
+}
 
 #[cfg(all(test, target_arch = "wasm32"))]
 mod tests {

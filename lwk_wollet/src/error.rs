@@ -186,10 +186,10 @@ pub enum Error {
     #[error("Contract does not commit to asset id")]
     ContractDoesNotCommitToAssetId,
 
-    #[error("Update height {update_tip_height} too old (internal height {store_tip_height})")]
+    #[error("Update height {update_tip_height} too old (internal height {cache_tip_height})")]
     UpdateHeightTooOld {
         update_tip_height: u32,
-        store_tip_height: u32,
+        cache_tip_height: u32,
     },
 
     #[error("Update created on a wallet with status {update_status} while current wallet has {wollet_status}")]
@@ -215,7 +215,7 @@ pub enum Error {
 
     #[cfg(feature = "electrum")]
     #[error(transparent)]
-    Url(#[from] crate::clients::blocking::electrum_client::UrlError),
+    Url(#[from] crate::UrlError),
 
     #[error("Manual coin selection is not allowed when assets are involved (this limitation will be removed in the future)")]
     ManualCoinSelectionOnlyLbtc,
@@ -248,18 +248,23 @@ pub enum Error {
     #[error(transparent)]
     SignerError(#[from] lwk_signer::NewError),
 
+    #[cfg(feature = "amp0")]
     #[error(transparent)]
     RmpvDecodeError(#[from] rmpv::decode::Error),
 
+    #[cfg(feature = "amp0")]
     #[error(transparent)]
     RmpvEncodeError(#[from] rmpv::encode::Error),
 
+    #[cfg(feature = "amp0")]
     #[error(transparent)]
     RmpvExtError(#[from] rmpv::ext::Error),
 
+    #[cfg(feature = "amp0")]
     #[error(transparent)]
     RmpSerdeDecodeError(#[from] rmp_serde::decode::Error),
 
+    #[cfg(feature = "amp0")]
     #[error(transparent)]
     RmpSerdeEncodeError(#[from] rmp_serde::encode::Error),
 

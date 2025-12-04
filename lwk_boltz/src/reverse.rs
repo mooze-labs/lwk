@@ -1,3 +1,4 @@
+use std::fmt;
 use std::ops::ControlFlow;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -19,22 +20,20 @@ use boltz_client::swaps::ChainClient;
 use boltz_client::swaps::SwapScript;
 use boltz_client::swaps::SwapTransactionParams;
 use boltz_client::swaps::TransactionOptions;
-use boltz_client::util::secrets::Preimage;
 use boltz_client::Bolt11Invoice;
-use boltz_client::Keypair;
 use boltz_client::PublicKey;
-use boltz_client::Secp256k1;
 use lwk_wollet::elements;
-use lwk_wollet::hashes::sha256;
-use lwk_wollet::hashes::Hash;
-use lwk_wollet::secp256k1::All;
 
 use crate::derive_keypair;
 use crate::error::Error;
 use crate::invoice_data::InvoiceData;
+use crate::invoice_data::InvoiceDataSerializable;
+use crate::mnemonic_identifier;
+use crate::preimage_from_keypair;
 use crate::swap_state::SwapStateTrait;
+use crate::to_invoice_data;
 use crate::SwapType;
-use crate::{broadcast_tx_with_retry, next_status, LightningSession, SwapState};
+use crate::{broadcast_tx_with_retry, next_status, BoltzSession, SwapState};
 
 pub struct InvoiceResponse {
     pub data: InvoiceData,
@@ -44,10 +43,17 @@ pub struct InvoiceResponse {
     swap_script: SwapScript,
     api: Arc<BoltzApiClientV2>,
     chain_client: Arc<ChainClient>,
-    claim_broadcasted: bool,
+    polling: bool,
+    timeout_advance: Duration,
 }
 
-impl LightningSession {
+impl fmt::Debug for InvoiceResponse {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "InvoiceResponse {{ data: {:?}, rx: {:?}, swap_script: {:?}, api: {:?}, polling: {:?}, timeout_advance: {:?} }}", self.data, self.rx, self.swap_script, self.api, self.polling, self.timeout_advance)
+    }
+}
+
+impl BoltzSession {
     pub async fn invoice(
         &self,
         amount: u64,
@@ -56,14 +62,14 @@ impl LightningSession {
         webhook: Option<Webhook<RevSwapStates>>,
     ) -> Result<InvoiceResponse, Error> {
         let chain = self.chain();
-        let our_keys = self.derive_next_keypair()?;
-        let preimage = preimage_from_keypair(&our_keys)?;
+        let (key_index, our_keys) = self.derive_next_keypair()?;
+        let preimage = self.preimage(&our_keys);
 
         let claim_public_key = PublicKey {
             compressed: true,
             inner: our_keys.public_key(),
         };
-        let webhook_str = format!("{:?}", webhook);
+        let webhook_str = format!("{webhook:?}");
 
         let addrs_sig = sign_address(&claim_address.to_string(), &our_keys)?;
         let create_reverse_req = CreateReverseRequest {
@@ -77,7 +83,7 @@ impl LightningSession {
             address_signature: Some(addrs_sig.to_string()),
             address: Some(claim_address.to_string()),
             claim_public_key,
-            referral_id: None,
+            referral_id: self.referral_id.clone(),
             webhook,
         };
 
@@ -105,11 +111,13 @@ impl LightningSession {
         self.ws.subscribe_swap(&swap_id).await?;
         let mut rx = self.ws.updates();
 
-        let update = next_status(&mut rx, self.timeout, &swap_id).await?;
+        let update = next_status(&mut rx, self.timeout, &swap_id, false).await?;
         let last_state = update.swap_state()?;
         log::debug!("Waiting for Invoice to be paid: {}", &invoice);
 
         Ok(InvoiceResponse {
+            polling: self.polling,
+            timeout_advance: self.timeout_advance,
             data: InvoiceData {
                 last_state,
                 swap_type: SwapType::Reverse,
@@ -118,16 +126,23 @@ impl LightningSession {
                 our_keys,
                 preimage,
                 claim_address: claim_address.clone(),
+                key_index,
+                mnemonic_identifier: mnemonic_identifier(&self.mnemonic)?,
+                claim_broadcasted: false,
+                random_preimage: self.random_preimages,
             },
             rx,
             swap_script,
             api: self.api.clone(),
             chain_client: self.chain_client.clone(),
-            claim_broadcasted: false,
         })
     }
 
-    pub async fn restore_invoice(&self, data: InvoiceData) -> Result<InvoiceResponse, Error> {
+    pub async fn restore_invoice(
+        &self,
+        data: InvoiceDataSerializable,
+    ) -> Result<InvoiceResponse, Error> {
+        let data = to_invoice_data(data, &self.mnemonic)?;
         let p = data.our_keys.public_key();
         let swap_script = SwapScript::reverse_from_swap_resp(
             self.chain(),
@@ -142,16 +157,17 @@ impl LightningSession {
         self.ws.subscribe_swap(&swap_id).await?;
 
         Ok(InvoiceResponse {
+            polling: self.polling,
+            timeout_advance: self.timeout_advance,
             data,
             rx,
             swap_script,
             api: self.api.clone(),
             chain_client: self.chain_client.clone(),
-            claim_broadcasted: false,
         })
     }
 
-    /// From the swaps returned by the boltz api via [`LightningSession::fetch_swaps`]:
+    /// From the swaps returned by the boltz api via [`BoltzSession::swap_restore`]:
     ///
     /// - filter the reverse swaps that can be restored
     /// - Add the private information from the session needed to restore the swap
@@ -167,12 +183,7 @@ impl LightningSession {
             .filter(|e| matches!(e.swap_type, SwapRestoreType::Reverse))
             .filter(|e| e.status != "swap.expired" && e.status != "invoice.settled")
             .map(|e| {
-                convert_swap_restore_response_to_invoice_data(
-                    e,
-                    &self.mnemonic,
-                    &self.secp,
-                    claim_address,
-                )
+                convert_swap_restore_response_to_invoice_data(e, &self.mnemonic, claim_address)
             })
             .collect()
     }
@@ -181,7 +192,6 @@ impl LightningSession {
 pub(crate) fn convert_swap_restore_response_to_invoice_data(
     e: &boltz_client::boltz::SwapRestoreResponse,
     mnemonic: &Mnemonic,
-    secp: &Secp256k1<All>,
     claim_address: &elements::Address,
 ) -> Result<InvoiceData, Error> {
     // Only handle reverse swaps for now
@@ -201,15 +211,15 @@ pub(crate) fn convert_swap_restore_response_to_invoice_data(
     })?;
 
     // Derive the keypair from the mnemonic at the key_index
-    let our_keys = derive_keypair(claim_details.key_index, mnemonic, secp)?;
+    let our_keys = derive_keypair(claim_details.key_index, mnemonic)?;
 
-    let preimage = preimage_from_keypair(&our_keys)?;
+    let preimage = preimage_from_keypair(&our_keys);
 
     // Parse the server public key
     let refund_public_key_bitcoin = lwk_wollet::bitcoin::PublicKey::from_str(
         &claim_details.server_public_key,
     )
-    .map_err(|e| Error::SwapRestoration(format!("Failed to parse server public key: {}", e)))?;
+    .map_err(|e| Error::SwapRestoration(format!("Failed to parse server public key: {e}")))?;
     let refund_public_key = PublicKey {
         inner: refund_public_key_bitcoin.inner,
         compressed: refund_public_key_bitcoin.compressed,
@@ -223,15 +233,15 @@ pub(crate) fn convert_swap_restore_response_to_invoice_data(
         lockup_address: claim_details.lockup_address.clone(),
         refund_public_key,
         timeout_block_height: claim_details.timeout_block_height,
-        onchain_amount: claim_details.amount,
-        blinding_key: Some(claim_details.blinding_key.clone()),
+        onchain_amount: claim_details.amount.unwrap_or(0), // TODO, not sure how to handle this better
+        blinding_key: claim_details.blinding_key.clone(),
     };
 
     // Parse the status to SwapState
     let last_state = e.status.parse::<SwapState>().map_err(|err| {
         Error::SwapRestoration(format!(
-            "Failed to parse status '{}' as SwapState: {}",
-            e.status, err
+            "Failed to parse status '{}' as SwapState: {err}",
+            e.status
         ))
     })?;
 
@@ -243,25 +253,24 @@ pub(crate) fn convert_swap_restore_response_to_invoice_data(
         our_keys,
         preimage,
         claim_address: claim_address.clone(),
+        key_index: claim_details.key_index,
+        mnemonic_identifier: mnemonic_identifier(mnemonic)?,
+        claim_broadcasted: false,
+        random_preimage: false, // when trying to restore from boltz only deterministic preimage are supported
     })
-}
-
-fn preimage_from_keypair(our_keys: &Keypair) -> Result<Preimage, Error> {
-    let hashed_bytes = sha256::Hash::hash(&our_keys.secret_bytes());
-    Ok(Preimage::from_vec(hashed_bytes.as_byte_array().to_vec())?)
 }
 
 impl InvoiceResponse {
     async fn next_status(&mut self) -> Result<SwapStatus, Error> {
         let swap_id = self.swap_id().to_string();
-        next_status(&mut self.rx, Duration::from_secs(180), &swap_id).await
+        next_status(&mut self.rx, self.timeout_advance, &swap_id, self.polling).await
     }
 
     async fn handle_claim_transaction_if_necessary(
         &mut self,
         update: SwapStatus,
     ) -> Result<ControlFlow<bool, SwapStatus>, Error> {
-        if self.claim_broadcasted {
+        if self.data.claim_broadcasted {
             return Ok(ControlFlow::Continue(update));
         }
 
@@ -273,7 +282,7 @@ impl InvoiceResponse {
                 SwapTransactionParams {
                     keys: self.data.our_keys,
                     output_address: self.data.claim_address.to_string(),
-                    fee: Fee::Relative(1.0),
+                    fee: Fee::Relative(0.12), // TODO make it configurable
                     swap_id: self.swap_id().to_string(),
                     options: Some(TransactionOptions::default().with_cooperative(true)),
                     chain_client: &self.chain_client,
@@ -283,7 +292,7 @@ impl InvoiceResponse {
             .await?;
 
         broadcast_tx_with_retry(&self.chain_client, &tx).await?;
-        self.claim_broadcasted = true;
+        self.data.claim_broadcasted = true;
 
         log::info!("Successfully broadcasted claim tx!");
         log::debug!("Claim Tx {tx:?}");
@@ -295,16 +304,23 @@ impl InvoiceResponse {
     }
 
     pub fn serialize(&self) -> Result<String, Error> {
-        Ok(serde_json::to_string(&self.data)?)
+        let x = InvoiceDataSerializable::from(self.data.clone());
+        Ok(serde_json::to_string(&x)?)
     }
 
     pub fn bolt11_invoice(&self) -> Bolt11Invoice {
         Bolt11Invoice::from_str(self.data.create_reverse_response.invoice.as_ref().expect(
-            "Invoice must be present or we would have errored on the LightningSession::invoice",
+            "Invoice must be present or we would have errored on the BoltzSession::invoice",
         ))
-        .expect(
-            "Invoice must be parsable or we would have errored on the LightningSession::invoice",
-        )
+        .expect("Invoice must be parsable or we would have errored on the BoltzSession::invoice")
+    }
+
+    /// The fee of the swap provider
+    ///
+    /// It is equal to the amount of the invoice minus the amount of the onchain transaction.
+    /// Does not include the fee of the onchain transaction.
+    pub fn fee(&self) -> Option<u64> {
+        self.data.fee
     }
 
     pub async fn advance(&mut self) -> Result<ControlFlow<bool, SwapStatus>, Error> {
@@ -341,6 +357,12 @@ impl InvoiceResponse {
                 last_state: self.data.last_state,
             }),
         };
+
+        if let Ok(ControlFlow::Break(_)) = flow.as_ref() {
+            // if the swap is terminated, but the caller call advance() again we don't
+            // want to error for timeout (it will trigger NoBoltzUpdate)
+            self.polling = true;
+        }
 
         self.data.last_state = update_status;
 

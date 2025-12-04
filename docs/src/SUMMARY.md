@@ -11,15 +11,15 @@
   * [Transaction Signing](sign.md) ✅
   * [Transaction Broadcast](broadcast.md) ✅
 * [Advanced]() #(advanced.md) ❌
-  * [Blockchain Clients]() #(clients.md) ❌
+  * [Blockchain Clients](clients.md) ✅
   * [Multisig](multisig.md) ✅
   * [Custom Wollet Persister]() #(persiter.md) ❌
-  * [Issuance]() #(issuance.md) ❌
-  * [Reissuance]() #(reissuance.md) ❌
-  * [Burn]() #(burn.md) ❌
+  * [Issuance](issuance.md) ✅
+  * [Reissuance](reissuance.md) ✅
+  * [Burn](burn.md) ✅
   * [Manual Coin Selection]() #(manual.md) ❌
   * [Add External Inputs]() #(external.md) ❌
-  * [Send All Funds]() #(sendall.md) ❌
+  * [Send All Funds](sendall.md) ✅
   * [Explicit Input and Outputs]() #(explicit.md) ❌
   * [AMP0](amp0.md) ✅
   * [AMP2]() #(amp2.md) ❌
@@ -27,7 +27,7 @@
   * [Ledger]() #(ledger.md) ❌
   * [LiquiDEX]() #(liquidex.md) ❌
   * [Pegin]() #(pegin.md) ❌
-  * [Bip85]() #(bip85.md) ❌
+  * [Bip85](bip85.md) ✅
   * [CLI]() #(cli.md) 🚧
 * [Miscellaneous]() #(misc.md) ❌
   * [Architecture](arch.md) 🚧

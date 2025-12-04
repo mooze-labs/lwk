@@ -12,7 +12,7 @@ mod tests {
     };
     use lwk_boltz::{
         clients::{AnyClient, ElectrumClient},
-        Error, LightningSession,
+        BoltzSession, Error,
     };
     use lwk_wollet::{elements, ElementsNetwork};
 
@@ -29,15 +29,12 @@ mod tests {
         let client =
             Arc::new(ElectrumClient::new(DEFAULT_REGTEST_NODE, false, false, network).unwrap());
 
-        // Receiver: Create a LightningSession and generate an invoice with MRH
-        let receiver_session = LightningSession::new(
-            network,
-            AnyClient::Electrum(client.clone()),
-            Some(TIMEOUT),
-            None,
-        )
-        .await
-        .unwrap();
+        // Receiver: Create a BoltzSession and generate an invoice with MRH
+        let receiver_session = BoltzSession::builder(network, AnyClient::Electrum(client.clone()))
+            .create_swap_timeout(TIMEOUT)
+            .build()
+            .await
+            .unwrap();
         let claim_address = utils::generate_address(Chain::Liquid(LiquidChain::LiquidRegtest))
             .await
             .unwrap();
@@ -53,7 +50,7 @@ mod tests {
             )
             .await
             .unwrap();
-        log::info!("claim_address: {}", claim_address);
+        log::info!("claim_address: {claim_address}");
         log::info!("Receiver created invoice: {}", invoice.bolt11_invoice());
         log::info!("Invoice fee: {:?}", invoice.data.fee);
 
@@ -73,11 +70,7 @@ mod tests {
         );
 
         let (mrh_address, mrh_amount) = mrh_result.unwrap();
-        log::info!(
-            "Found MRH - Address: {}, Amount: {}",
-            mrh_address,
-            mrh_amount
-        );
+        log::info!("Found MRH - Address: {mrh_address}, Amount: {mrh_amount}");
 
         // Verify the MRH amount is less than the invoice amount (due to fees)
         assert!(
@@ -102,14 +95,11 @@ mod tests {
         // TODO complete the payment from a sender that detects the MRH and pays directly to the MRH address
 
         // Sender: Detect MRH in the invoice
-        let sender_session = LightningSession::new(
-            network,
-            AnyClient::Electrum(client.clone()),
-            Some(TIMEOUT),
-            None,
-        )
-        .await
-        .unwrap();
+        let sender_session = BoltzSession::builder(network, AnyClient::Electrum(client.clone()))
+            .create_swap_timeout(TIMEOUT)
+            .build()
+            .await
+            .unwrap();
         let bolt11_parsed = invoice.bolt11_invoice();
         let prepare_pay_response = sender_session
             .prepare_pay(&bolt11_parsed.into(), &claim_address, None)
@@ -123,7 +113,7 @@ mod tests {
             utils::send_to_address(Chain::Liquid(LiquidChain::LiquidRegtest), &address, amount)
                 .await
                 .unwrap();
-            log::info!("Sent {} sats to {} or use uri {}", amount, address, uri);
+            log::info!("Sent {amount} sats to {address} or use uri {uri}");
         }
 
         invoice.complete_pay().await.unwrap();

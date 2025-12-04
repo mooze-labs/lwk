@@ -4,8 +4,8 @@ use std::collections::{HashMap, HashSet};
 use tokio::runtime::Runtime;
 
 use crate::{
+    cache::Height,
     clients::{asyncr, Capability, Data, EsploraClientBuilder, History},
-    store::Height,
     wollet::WolletState,
     ElementsNetwork, Error, WolletDescriptor,
 };
@@ -128,7 +128,7 @@ mod tests {
     use elements::{encode::Decodable, BlockHash};
 
     fn get_block(base_url: &str, hash: BlockHash) -> elements::Block {
-        let url = format!("{}/block/{}/raw", base_url, hash);
+        let url = format!("{base_url}/block/{hash}/raw");
         let response = reqwest::blocking::get(url).unwrap();
         elements::Block::consensus_decode(&response.bytes().unwrap()[..]).unwrap()
     }
@@ -136,10 +136,11 @@ mod tests {
     #[ignore = "Should be integration test, but it is testing private function"]
     #[test]
     fn esplora_local() {
-        let server = lwk_test_util::setup_with_esplora();
+        let env = lwk_test_util::TestEnvBuilder::from_env()
+            .with_esplora()
+            .build();
 
-        let esplora_url = format!("http://{}", server.electrs.esplora_url.as_ref().unwrap());
-        test_esplora_url(&esplora_url);
+        test_esplora_url(&env.esplora_url());
     }
 
     #[ignore]
@@ -150,7 +151,7 @@ mod tests {
     }
 
     fn test_esplora_url(esplora_url: &str) {
-        println!("{}", esplora_url);
+        println!("{esplora_url}");
 
         let mut client =
             EsploraClient::new(esplora_url, ElementsNetwork::default_regtest()).unwrap();

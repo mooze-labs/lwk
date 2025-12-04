@@ -708,9 +708,9 @@ pub enum WalletCommand {
         #[arg(short, long)]
         txid: String,
 
-        /// Use the explorer if necessary
+        /// Attempt to fetch the transaction if not available locally
         #[arg(long, action)]
-        from_explorer: bool,
+        fetch: bool,
     },
 
     /// Set a wallet tx memo
@@ -869,10 +869,10 @@ pub enum AssetCommand {
         asset: String,
     },
 
-    /// Insert an asset getting data from the block explorer
+    /// Insert an asset getting data from the asset registry
     ///
     /// This is worse from a privacy perspective.
-    FromExplorer {
+    FromRegistry {
         /// Asset ID in hex
         #[arg(short, long)]
         asset: String,
@@ -927,22 +927,39 @@ pub struct ServerArgs {
     pub command: ServerCommand,
 }
 
+#[derive(ValueEnum, Clone, Debug)]
+pub enum ServerType {
+    Electrum,
+    Esplora,
+    Waterfalls,
+}
+
+impl std::fmt::Display for ServerType {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            ServerType::Electrum => write!(f, "electrum"),
+            ServerType::Esplora => write!(f, "esplora"),
+            ServerType::Waterfalls => write!(f, "waterfalls"),
+        }
+    }
+}
+
 #[derive(Debug, Subcommand)]
 pub enum ServerCommand {
     /// Start the server
     Start {
-        /// Electrum URL, if not specified a reasonable default is used according to the network
+        /// Server URL, if not specified a reasonable default is used according to the network
         #[arg(short, long)]
-        electrum_url: Option<String>,
+        server_url: Option<String>,
+
+        /// Server type
+        #[arg(long, default_value = "electrum")]
+        server_type: ServerType,
 
         #[arg(long)]
         #[cfg(feature = "registry")]
         /// Needed only in regtest because public network have their official defaults
         registry_url: Option<String>,
-
-        #[arg(long)]
-        /// Esplora API URL, if not specified a reasonable default is used according to the network
-        esplora_api_url: Option<String>,
 
         /// Location for logs, server state, and other LWK data
         ///

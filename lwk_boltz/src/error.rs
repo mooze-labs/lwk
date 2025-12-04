@@ -1,10 +1,14 @@
+use crate::SwapState;
+use boltz_client::elements::AddressError;
 use boltz_client::error::Error as BoltzError;
 use boltz_client::lightning_invoice::ParseOrSemanticError;
-
-use crate::SwapState;
+use lightning::bitcoin::XKeyIdentifier;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    #[error("Invalid electrum url: {0}")]
+    InvalidElectrumUrl(#[from] lwk_wollet::UrlError),
+
     #[error("Invalid swap state: {0}")]
     InvalidSwapState(String),
 
@@ -14,8 +18,14 @@ pub enum Error {
     #[error("Boltz API error: {0}")]
     BoltzApi(BoltzError),
 
+    #[error("Elements address error: {0}")]
+    ElementsAddressError(#[from] AddressError),
+
     #[error("Receiver error: {0}")]
     Receiver(#[from] tokio::sync::broadcast::error::RecvError),
+
+    #[error("TryReceiver error: {0}")]
+    TryReceiver(#[from] tokio::sync::broadcast::error::TryRecvError),
 
     #[error("Unexpected status {status} for swap {swap_id}. Last state: {last_state}")]
     UnexpectedUpdate {
@@ -69,6 +79,12 @@ pub enum Error {
 
     #[error("Bolt12 (offers) are not yet supported")]
     Bolt12Unsupported,
+
+    #[error("Mnemonic identifier mismatch: {0} != {1}")]
+    MnemonicIdentifierMismatch(XKeyIdentifier, XKeyIdentifier),
+
+    #[error("No update available, continuing polling")]
+    NoBoltzUpdate,
 }
 
 impl From<BoltzError> for Error {

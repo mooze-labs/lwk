@@ -42,7 +42,7 @@ pub fn inner_main(args: args::Cli) -> anyhow::Result<Value> {
         Err(_) => log::debug!("logging already initialized"),
     }
 
-    log::info!("CLI initialized with args: {:?}", args);
+    log::info!("CLI initialized with args: {args:?}");
 
     // TODO: improve network types conversion or comparison
     let (network, default_port) = match args.network {
@@ -60,7 +60,7 @@ pub fn inner_main(args: args::Cli) -> anyhow::Result<Value> {
     if args.command.requires_server_running() {
         let version = client
             .version()
-            .with_context(|| format!("Is the server at {:?} running?", addr))?;
+            .with_context(|| format!("Is the server at {addr:?} running?"))?;
         let server_network = version.network;
 
         if server_network != network {
@@ -74,10 +74,10 @@ pub fn inner_main(args: args::Cli) -> anyhow::Result<Value> {
         CliCommand::Server(a) => {
             match a.command {
                 ServerCommand::Start {
-                    electrum_url,
+                    server_url,
+                    server_type,
                     #[cfg(feature = "registry")]
                     registry_url,
-                    esplora_api_url,
                     datadir,
                     timeout,
                     scanning_interval,
@@ -102,14 +102,12 @@ pub fn inner_main(args: args::Cli) -> anyhow::Result<Value> {
                     if let Some(scanning_interval) = scanning_interval {
                         config.scanning_interval = Duration::from_secs(scanning_interval);
                     };
-                    if let Some(url) = electrum_url {
-                        config.electrum_url = url;
+                    if let Some(url) = server_url {
+                        config.server_url = url;
                     } else if let Network::Regtest = args.network {
                         anyhow::bail!("on regtest you have to specify --electrum-url");
                     };
-                    if let Some(url) = esplora_api_url {
-                        config.esplora_api_url = url;
-                    };
+                    config.server_type = server_type.to_string();
 
                     #[cfg(feature = "registry")]
                     if let Some(url) = registry_url {
@@ -123,7 +121,7 @@ pub fn inner_main(args: args::Cli) -> anyhow::Result<Value> {
 
                     // get the app version
                     let version = client.version()?.version;
-                    log::info!("App running version {}", version);
+                    log::info!("App running version {version}");
 
                     loop {
                         match rx.recv_timeout(Duration::from_millis(100)) {
@@ -373,9 +371,9 @@ pub fn inner_main(args: args::Cli) -> anyhow::Result<Value> {
             WalletCommand::Tx {
                 wallet,
                 txid,
-                from_explorer,
+                fetch,
             } => {
-                let r = client.wallet_tx(wallet, txid, from_explorer)?;
+                let r = client.wallet_tx(wallet, txid, fetch)?;
                 serde_json::to_value(r)?
             }
             WalletCommand::SetTxMemo { wallet, txid, memo } => {
@@ -447,8 +445,8 @@ pub fn inner_main(args: args::Cli) -> anyhow::Result<Value> {
                 let r = client.asset_remove(asset)?;
                 serde_json::to_value(r)?
             }
-            AssetCommand::FromExplorer { asset } => {
-                let r = client.asset_from_explorer(asset)?;
+            AssetCommand::FromRegistry { asset } => {
+                let r = client.asset_from_registry(asset)?;
                 serde_json::to_value(r)?
             }
             AssetCommand::Publish { asset } => {

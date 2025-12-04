@@ -1,3 +1,4 @@
+mod amp0;
 mod test_jade;
 mod test_ledger;
 mod test_wollet;
@@ -53,25 +54,25 @@ fn liquid_issue_software_signer() {
 }
 
 fn liquid_send(signers: &[&AnySigner]) {
-    let server = setup();
+    let env = TestEnvBuilder::from_env().with_electrum().build();
     let slip77_key = "9c8e4f05c7711a98c838be228bcb84924d4570ca53f35fa1c793e58841d47023";
     let desc_str = format!(
         "ct(slip77({}),elwpkh({}/*))",
         slip77_key,
         signers[0].xpub().unwrap()
     );
-    let client = test_client_electrum(&server.electrs.electrum_url);
+    let client = test_client_electrum(&env.electrum_url());
     let mut wallet = TestWollet::new(client, &desc_str);
 
-    wallet.fund_btc(&server);
-    let asset = wallet.fund_asset(&server);
-    server.elementsd_generate(1);
+    wallet.fund_btc(&env);
+    let asset = wallet.fund_asset(&env);
+    env.elementsd_generate(1);
 
     wallet.send_btc(signers, None, None);
-    let node_address = server.elementsd_getnewaddress();
+    let node_address = env.elementsd_getnewaddress();
     wallet.send_asset(signers, &node_address, &asset, None);
-    let node_address1 = server.elementsd_getnewaddress();
-    let node_address2 = server.elementsd_getnewaddress();
+    let node_address1 = env.elementsd_getnewaddress();
+    let node_address2 = env.elementsd_getnewaddress();
     wallet.send_many(
         signers,
         &node_address1,
@@ -85,17 +86,17 @@ fn liquid_send(signers: &[&AnySigner]) {
 }
 
 fn liquid_issue(signers: &[&AnySigner]) {
-    let server = setup();
+    let env = TestEnvBuilder::from_env().with_electrum().build();
     let slip77_key = "9c8e4f05c7711a98c838be228bcb84924d4570ca53f35fa1c793e58841d47023";
     let desc_str = format!(
         "ct(slip77({}),elwpkh({}/*))",
         slip77_key,
         signers[0].xpub().unwrap()
     );
-    let client = test_client_electrum(&server.electrs.electrum_url);
+    let client = test_client_electrum(&env.electrum_url());
     let mut wallet = TestWollet::new(client, &desc_str);
 
-    wallet.fund_btc(&server);
+    wallet.fund_btc(&env);
 
     let (asset, _token) = wallet.issueasset(signers, 10, 1, None, None);
     wallet.reissueasset(signers, 10, &asset, None);
@@ -108,30 +109,30 @@ fn liquid_issue(signers: &[&AnySigner]) {
 
 #[test]
 fn view() {
-    let server = setup();
+    let env = TestEnvBuilder::from_env().with_electrum().build();
     // "view" descriptor
     let xpub = "tpubD6NzVbkrYhZ4Was8nwnZi7eiWUNJq2LFpPSCMQLioUfUtT1e72GkRbmVeRAZc26j5MRUz2hRLsaVHJfs6L7ppNfLUrm9btQTuaEsLrT7D87";
     let descriptor_blinding_key =
         "1111111111111111111111111111111111111111111111111111111111111111";
-    let desc_str = format!("ct({},elwpkh({}/*))", descriptor_blinding_key, xpub);
-    let client = test_client_electrum(&server.electrs.electrum_url);
+    let desc_str = format!("ct({descriptor_blinding_key},elwpkh({xpub}/*))");
+    let client = test_client_electrum(&env.electrum_url());
     let mut wallet = TestWollet::new(client, &desc_str);
 
-    wallet.fund_btc(&server);
-    let _asset = wallet.fund_asset(&server);
+    wallet.fund_btc(&env);
+    let _asset = wallet.fund_asset(&env);
 
     let descriptor_blinding_key =
         "slip77(9c8e4f05c7711a98c838be228bcb84924d4570ca53f35fa1c793e58841d47023)";
-    let desc_str = format!("ct({},elwpkh({}/*))", descriptor_blinding_key, xpub);
-    let client = test_client_electrum(&server.electrs.electrum_url);
+    let desc_str = format!("ct({descriptor_blinding_key},elwpkh({xpub}/*))");
+    let client = test_client_electrum(&env.electrum_url());
     let mut wallet = TestWollet::new(client, &desc_str);
 
-    wallet.fund_btc(&server);
+    wallet.fund_btc(&env);
 }
 
 #[test]
 fn origin() {
-    let server = setup();
+    let env = TestEnvBuilder::from_env().with_electrum().build();
     let signer = generate_signer();
     let fingerprint = signer.fingerprint();
     let path = "84h/1776h/0h";
@@ -141,20 +142,20 @@ fn origin() {
 
     let view_key = generate_view_key();
     let desc_str = format!("ct({view_key},elwpkh([{fingerprint}/{path}]{xpub}/*))");
-    let client = test_client_electrum(&server.electrs.electrum_url);
+    let client = test_client_electrum(&env.electrum_url());
     let mut wallet = TestWollet::new(client, &desc_str);
 
     let signers: [&AnySigner; 1] = [&AnySigner::Software(signer)];
 
-    let address = server.elementsd_getnewaddress();
+    let address = env.elementsd_getnewaddress();
 
-    wallet.fund_btc(&server);
+    wallet.fund_btc(&env);
     wallet.send_btc(&signers, None, Some((address, 10_000)));
 }
 
 #[test]
 fn roundtrip() {
-    let server = setup();
+    let env = TestEnvBuilder::from_env().with_electrum().build();
 
     let signer1 = generate_signer();
     let slip77_key = generate_slip77();
@@ -208,11 +209,11 @@ fn roundtrip() {
             (&signers6[..], desc6),
             (&signers7[..], desc7),
         ] {
-            let server = &server;
-            let client = test_client_electrum(&server.electrs.electrum_url);
+            let env = &env;
+            let client = test_client_electrum(&env.electrum_url());
             let wallet = TestWollet::new(client, &desc);
             s.spawn(move || {
-                roundtrip_inner(wallet, server, signers);
+                roundtrip_inner(wallet, env, signers);
             });
         }
     });
@@ -220,17 +221,17 @@ fn roundtrip() {
 
 fn roundtrip_inner<C: BlockchainBackend>(
     mut wallet: TestWollet<C>,
-    server: &TestElectrumServer,
+    env: &TestEnv,
     signers: &[&AnySigner],
 ) {
-    wallet.fund_btc(server);
-    server.elementsd_generate(1);
+    wallet.fund_btc(env);
+    env.elementsd_generate(1);
     wallet.send_btc(signers, None, None);
     let (asset, _token) = wallet.issueasset(signers, 100_000, 1, None, None);
-    let node_address = server.elementsd_getnewaddress();
+    let node_address = env.elementsd_getnewaddress();
     wallet.send_asset(signers, &node_address, &asset, None);
-    let node_address1 = server.elementsd_getnewaddress();
-    let node_address2 = server.elementsd_getnewaddress();
+    let node_address1 = env.elementsd_getnewaddress();
+    let node_address2 = env.elementsd_getnewaddress();
     wallet.send_many(
         signers,
         &node_address1,
@@ -241,7 +242,7 @@ fn roundtrip_inner<C: BlockchainBackend>(
     );
     wallet.reissueasset(signers, 10_000, &asset, None);
     wallet.burnasset(signers, 5_000, &asset, None);
-    server.elementsd_generate(2);
+    env.elementsd_generate(2);
 }
 
 #[test]
@@ -288,13 +289,13 @@ fn unsupported_descriptor() {
 
 #[test]
 fn address() {
-    let server = setup();
+    let env = TestEnvBuilder::from_env().with_electrum().build();
 
     let signer = generate_signer();
     let view_key = generate_view_key();
     let desc = format!("ct({},elwpkh({}/*))", view_key, signer.xpub());
 
-    let client = test_client_electrum(&server.electrs.electrum_url);
+    let client = test_client_electrum(&env.electrum_url());
     let mut wallet = TestWollet::new(client, &desc);
 
     let gap_limit: u32 = 20;
@@ -325,10 +326,10 @@ fn address() {
     assert_eq!(last_address.index(), gap_limit);
     let mid_address = Some(mid_address.address().clone());
     let last_address = Some(last_address.address().clone());
-    wallet.fund(&server, satoshi, mid_address.clone(), None);
-    wallet.fund(&server, satoshi, last_address, None);
+    wallet.fund(&env, satoshi, mid_address.clone(), None);
+    wallet.fund(&env, satoshi, last_address, None);
     let last_unused_before = wallet.address_result(None).index();
-    wallet.fund(&server, satoshi, mid_address, None);
+    wallet.fund(&env, satoshi, mid_address, None);
     let last_unused_after = wallet.address_result(None).index();
     assert!(
         last_unused_before <= last_unused_after,
@@ -339,7 +340,7 @@ fn address() {
 #[test]
 fn different_blinding_keys() {
     // Two wallet with same "bitcoin" descriptor but different blinding keys
-    let server = setup();
+    let env = TestEnvBuilder::from_env().with_electrum().build();
 
     let signer = generate_signer();
     let view_key1 = generate_view_key();
@@ -347,18 +348,18 @@ fn different_blinding_keys() {
     let desc1 = format!("ct({},elwpkh({}/*))", view_key1, signer.xpub());
     let desc2 = format!("ct({},elwpkh({}/*))", view_key2, signer.xpub());
 
-    let client = test_client_electrum(&server.electrs.electrum_url);
+    let client = test_client_electrum(&env.electrum_url());
     let mut wallet1 = TestWollet::new(client, &desc1);
     wallet1.sync();
     assert_eq!(wallet1.address_result(None).index(), 0);
-    wallet1.fund_btc(&server);
+    wallet1.fund_btc(&env);
     assert_eq!(wallet1.address_result(None).index(), 1);
 
-    let client = test_client_electrum(&server.electrs.electrum_url);
+    let client = test_client_electrum(&env.electrum_url());
     let mut wallet2 = TestWollet::new(client, &desc2);
     wallet2.sync();
     assert_eq!(wallet2.address_result(None).index(), 0);
-    wallet2.fund_btc(&server);
+    wallet2.fund_btc(&env);
     assert_eq!(wallet2.address_result(None).index(), 1);
 
     // Both wallets have 1 tx in the tx list,
@@ -387,21 +388,21 @@ fn fee_rate() {
     // Use a fee rate different from the default one
     let fee_rate = Some(200.0);
 
-    let server = setup();
+    let env = TestEnvBuilder::from_env().with_electrum().build();
     let signer = generate_signer();
     let view_key = generate_view_key();
     let desc = format!("ct({},elwpkh({}/*))", view_key, signer.xpub());
     let signers = [&AnySigner::Software(signer)];
 
-    let client = test_client_electrum(&server.electrs.electrum_url);
+    let client = test_client_electrum(&env.electrum_url());
     let mut wallet = TestWollet::new(client, &desc);
-    wallet.fund_btc(&server);
+    wallet.fund_btc(&env);
     wallet.send_btc(&signers, fee_rate, None);
     let (asset, _token) = wallet.issueasset(&signers, 100_000, 1, None, fee_rate);
-    let node_address = server.elementsd_getnewaddress();
+    let node_address = env.elementsd_getnewaddress();
     wallet.send_asset(&signers, &node_address, &asset, fee_rate);
-    let node_address1 = server.elementsd_getnewaddress();
-    let node_address2 = server.elementsd_getnewaddress();
+    let node_address1 = env.elementsd_getnewaddress();
+    let node_address2 = env.elementsd_getnewaddress();
     wallet.send_many(
         &signers,
         &node_address1,
@@ -419,15 +420,15 @@ fn contract() {
     // Issue an asset with a contract
     let contract = "{\"entity\":{\"domain\":\"test.com\"},\"issuer_pubkey\":\"0337cceec0beea0232ebe14cba0197a9fbd45fcf2ec946749de920e71434c2b904\",\"name\":\"Test\",\"precision\":8,\"ticker\":\"TEST\",\"version\":0}";
 
-    let server = setup();
+    let env = TestEnvBuilder::from_env().with_electrum().build();
     let signer = generate_signer();
     let view_key = generate_view_key();
     let desc = format!("ct({},elwpkh({}/*))", view_key, signer.xpub());
     let signers = [&AnySigner::Software(signer)];
 
-    let client = test_client_electrum(&server.electrs.electrum_url);
+    let client = test_client_electrum(&env.electrum_url());
     let mut wallet = TestWollet::new(client, &desc);
-    wallet.fund_btc(&server);
+    wallet.fund_btc(&env);
     wallet.send_btc(&signers, None, None);
     let (_asset, _token) = wallet.issueasset(&signers, 100_000, 1, Some(contract), None);
 
@@ -456,12 +457,12 @@ fn contract() {
 fn multiple_descriptors() {
     // Use a different descriptors for the asset and the reissuance token
 
-    let server = setup();
+    let env = TestEnvBuilder::from_env().with_electrum().build();
     // Asset descriptor and signers
     let signer_a = generate_signer();
     let view_key_a = generate_view_key();
     let desc_a = format!("ct({},elwpkh({}/*))", view_key_a, signer_a.xpub());
-    let client = test_client_electrum(&server.electrs.electrum_url);
+    let client = test_client_electrum(&env.electrum_url());
     let mut wallet_a = TestWollet::new(client, &desc_a);
     // Token descriptor and signers
     let signer_t1 = generate_signer();
@@ -473,12 +474,12 @@ fn multiple_descriptors() {
         signer_t1.xpub(),
         signer_t2.xpub()
     );
-    let client = test_client_electrum(&server.electrs.electrum_url);
+    let client = test_client_electrum(&env.electrum_url());
     let mut wallet_t = TestWollet::new(client, &desc_t);
 
     // Fund both wallets
-    wallet_a.fund_btc(&server);
-    wallet_t.fund_btc(&server);
+    wallet_a.fund_btc(&env);
+    wallet_t.fund_btc(&env);
 
     // Issue an asset, sending the asset to asset wallet, and the token to the token wallet
     let satoshi_a = 100_000;
@@ -545,10 +546,10 @@ fn multiple_descriptors() {
     let signer_nt = generate_signer();
     let view_key_nt = generate_view_key();
     let desc_nt = format!("ct({},elwpkh({}/*))", view_key_nt, signer_nt.xpub());
-    let client = test_client_electrum(&server.electrs.electrum_url);
+    let client = test_client_electrum(&env.electrum_url());
     let mut wallet_nt = TestWollet::new(client, &desc_nt);
 
-    wallet_nt.fund_btc(&server);
+    wallet_nt.fund_btc(&env);
     let address_nt = wallet_nt.address();
     let mut pset = wallet_t
         .tx_builder()
@@ -600,14 +601,14 @@ fn multiple_descriptors() {
 
 #[test]
 fn create_pset_error() {
-    let server = setup();
+    let env = TestEnvBuilder::from_env().with_electrum().build();
     let signer = generate_signer();
     let view_key = generate_view_key();
     let desc = format!("ct({},elwpkh({}/*))", view_key, signer.xpub());
 
-    let client = test_client_electrum(&server.electrs.electrum_url);
+    let client = test_client_electrum(&env.electrum_url());
     let mut wallet = TestWollet::new(client, &desc);
-    wallet.fund_btc(&server);
+    wallet.fund_btc(&env);
     let satoshi_a = 100_000;
     let satoshi_t = 1;
     let (asset, token) = wallet.issueasset(
@@ -716,7 +717,7 @@ fn create_pset_error() {
     let signer2 = generate_signer();
     let view_key2 = generate_view_key();
     let desc2 = format!("ct({},elwpkh({}/*))", view_key2, signer2.xpub());
-    let client = test_client_electrum(&server.electrs.electrum_url);
+    let client = test_client_electrum(&env.electrum_url());
     let wallet2 = TestWollet::new(client, &desc2);
 
     // Send token elsewhere
@@ -766,7 +767,7 @@ fn create_pset_error() {
 #[test]
 fn multisig_flow() {
     // Simulate a multisig workflow
-    let server = setup();
+    let env = TestEnvBuilder::from_env().with_electrum().build();
 
     // * Multisig Setup: Start
     // We have 2 signers
@@ -790,7 +791,7 @@ fn multisig_flow() {
         signer1.xpub(),
         signer2_xpub
     );
-    let client = test_client_electrum(&server.electrs.electrum_url);
+    let client = test_client_electrum(&env.electrum_url());
     let mut wallet = TestWollet::new(client, &desc_str);
 
     // Sharing desc_str grants watch only access to the wallet.
@@ -800,10 +801,10 @@ fn multisig_flow() {
 
     // * Multisig Sign: Start
     // Fund the wallet
-    wallet.fund_btc(&server);
+    wallet.fund_btc(&env);
     // Create a simple PSET
     let satoshi = 1_000;
-    let node_addr = server.elementsd_getnewaddress();
+    let node_addr = env.elementsd_getnewaddress();
     let pset = wallet
         .tx_builder()
         .add_lbtc_recipient(&node_addr, satoshi)
@@ -839,15 +840,15 @@ fn multisig_flow() {
 }
 #[test]
 fn jade_sign_wollet_pset() {
-    let server = setup();
+    let env = TestEnvBuilder::from_env().with_electrum().build();
     let mnemonic = TEST_MNEMONIC;
     let signer = SwSigner::new(mnemonic, false).unwrap();
     let slip77_key = "9c8e4f05c7711a98c838be228bcb84924d4570ca53f35fa1c793e58841d47023";
     let desc_str = format!("ct(slip77({}),elwpkh({}/*))", slip77_key, signer.xpub());
-    let client = test_client_electrum(&server.electrs.electrum_url);
+    let client = test_client_electrum(&env.electrum_url());
     let mut wallet = TestWollet::new(client, &desc_str);
 
-    wallet.fund_btc(&server);
+    wallet.fund_btc(&env);
 
     let my_addr = wallet.address();
 
@@ -879,7 +880,7 @@ fn jade_sign_wollet_pset() {
 
 #[test]
 fn jade_single_sig() {
-    let server = setup();
+    let env = TestEnvBuilder::from_env().with_electrum().build();
     let mnemonic = TEST_MNEMONIC;
     let docker = Cli::default();
     let jade_init = jade_setup(&docker, mnemonic);
@@ -890,16 +891,16 @@ fn jade_single_sig() {
     let xpub = SwSigner::new(mnemonic, false).unwrap().xpub();
 
     let slip77_key = "9c8e4f05c7711a98c838be228bcb84924d4570ca53f35fa1c793e58841d47023";
-    let desc_str = format!("ct(slip77({}),elwpkh({}/*))", slip77_key, xpub);
-    let client = test_client_electrum(&server.electrs.electrum_url);
+    let desc_str = format!("ct(slip77({slip77_key}),elwpkh({xpub}/*))");
+    let client = test_client_electrum(&env.electrum_url());
     let mut wallet = TestWollet::new(client, &desc_str);
 
-    wallet.fund_btc(&server);
+    wallet.fund_btc(&env);
     let satoshi_utxo1 = wallet.balance(&wallet.policy_asset());
-    wallet.fund_btc(&server);
+    wallet.fund_btc(&env);
 
     let satoshi = satoshi_utxo1 + 1;
-    let node_addr = server.elementsd_getnewaddress();
+    let node_addr = env.elementsd_getnewaddress();
 
     let mut pset = wallet
         .tx_builder()
@@ -915,23 +916,22 @@ fn jade_single_sig() {
 
 #[test]
 fn address_status() {
-    let server = setup();
-    let electrum_url = ElectrumUrl::new(&server.electrs.electrum_url, false, false).unwrap();
-    let mut client = ElectrumClient::new(&electrum_url).unwrap();
+    let env = TestEnvBuilder::from_env().with_electrum().build();
+    let mut client = test_client_electrum(&env.electrum_url());
     client.ping().unwrap();
-    let address = server.elementsd_getnewaddress();
+    let address = env.elementsd_getnewaddress();
     let initial_status = client.address_status(&address).unwrap();
     assert_eq!(initial_status, None);
 
-    server.elementsd_sendtoaddress(&address, 10000, None);
+    env.elementsd_sendtoaddress(&address, 10000, None);
 
     let new_status = wait_status_change(&mut client, &address, initial_status);
 
-    server.elementsd_generate(1);
+    env.elementsd_generate(1);
 
     let last_status = wait_status_change(&mut client, &address, new_status);
 
-    let mut client = ElectrumClient::new(&electrum_url).unwrap();
+    let mut client = test_client_electrum(&env.electrum_url());
     let new_client_status = client.address_status(&address).unwrap();
     assert_eq!(last_status, new_client_status);
 }
@@ -954,8 +954,8 @@ fn wait_status_change(
 #[cfg(feature = "esplora")]
 #[tokio::test]
 async fn test_esplora_wasm_client() {
-    let server = setup_with_esplora();
-    let url = format!("http://{}", server.electrs.esplora_url.as_ref().unwrap());
+    let env = TestEnvBuilder::from_env().with_esplora().build();
+    let url = env.esplora_url();
     let mut client = clients::asyncr::EsploraClient::new(ElementsNetwork::default_regtest(), &url);
     let signer = generate_signer();
     let view_key = generate_view_key();
@@ -964,13 +964,13 @@ async fn test_esplora_wasm_client() {
 
     let descriptor: WolletDescriptor = descriptor.parse().unwrap();
 
-    let mut wollet = Wollet::new(network, NoPersist::new(), descriptor).unwrap();
+    let mut wollet = WolletBuilder::new(network, descriptor).build().unwrap();
 
     let update = client.full_scan(&wollet).await.unwrap().unwrap();
     wollet.apply_update(update).unwrap();
 
     let address = wollet.address(None).unwrap();
-    let txid = server.elementsd_sendtoaddress(address.address(), 10000, None);
+    let txid = env.elementsd_sendtoaddress(address.address(), 10000, None);
 
     let update = wait_update_with_txs(&mut client, &wollet).await;
     wollet.apply_update(update).unwrap();
@@ -978,7 +978,7 @@ async fn test_esplora_wasm_client() {
     assert!(tx.height.is_none());
     assert!(wollet.tip().timestamp().is_some());
 
-    server.elementsd_generate(1);
+    env.elementsd_generate(1);
     let update = wait_update_with_txs(&mut client, &wollet).await;
     wollet.apply_update(update).unwrap();
     let tx = wollet.transaction(&txid).unwrap().unwrap();
@@ -1008,8 +1008,8 @@ async fn wait_update_with_txs(
 async fn test_esplora_requests_counter() {
     use std::collections::HashMap;
 
-    let server = setup_with_esplora();
-    let esplora_url = format!("http://{}", server.electrs.esplora_url.as_ref().unwrap());
+    let env = TestEnvBuilder::from_env().with_esplora().build();
+    let esplora_url = env.esplora_url();
 
     let mut client =
         clients::asyncr::EsploraClient::new(ElementsNetwork::default_regtest(), &esplora_url);
@@ -1310,90 +1310,15 @@ async fn test_esplora_waterfalls_testnet_utxo_only_2() {
         .unwrap();
 }
 
-#[cfg(feature = "esplora")]
-#[tokio::test]
-async fn test_esplora_wasm_local_waterfalls() {
-    use clients::asyncr::{self, async_sleep};
-
-    init_logging();
-    let exe = std::env::var("ELEMENTSD_EXEC").unwrap();
-    let test_env = waterfalls::test_env::launch(exe, Family::Elements).await;
-
-    let desc = "ct(slip77(ac53739ddde9fdf6bba3dbc51e989b09aa8c9cdce7b7d7eddd49cec86ddf71f7),elwpkh([93970d14/84'/1'/0']tpubDC3BrFCCjXq4jAceV8k6UACxDDJCFb1eb7R7BiKYUGZdNagEhNfJoYtUrRdci9JFs1meiGGModvmNm8PrqkrEjJ6mpt6gA1DRNU8vu7GqXH/<0;1>/*))#u0y4axgs";
-    let desc = WolletDescriptor::from_str(desc).unwrap();
-
-    let network = ElementsNetwork::default_regtest();
-    let mut wollet = Wollet::without_persist(network, desc.clone()).unwrap();
-    let mut client = asyncr::EsploraClientBuilder::new(test_env.base_url(), network)
-        .waterfalls(true)
-        .build()
-        .unwrap();
-
-    let update = client.full_scan(&wollet).await.unwrap().unwrap();
-    wollet.apply_update(update).unwrap();
-
-    assert_eq!(
-        format!("{:?}", *wollet.balance().unwrap()),
-        "{5ac9f65c0efcc4775e0baec4ec03abdde22473cd3cf33c0419ca290e0751b225: 0}"
-    );
-
-    let address = wollet.address(None).unwrap();
-    let txid = test_env
-        .send_to(&to_be(address.address()), 1_000_000)
-        .elements();
-
-    async_sleep(2_000).await;
-
-    let update = client.full_scan(&wollet).await.unwrap().unwrap();
-    wollet.apply_update(update).unwrap();
-
-    assert_eq!(
-        format!("{:?}", *wollet.balance().unwrap()),
-        "{5ac9f65c0efcc4775e0baec4ec03abdde22473cd3cf33c0419ca290e0751b225: 1000000}"
-    );
-    let tx = wollet.transaction(&txid).unwrap().unwrap();
-
-    assert!(tx.height.is_none());
-    test_env.node_generate(1).await;
-
-    let update = client.full_scan(&wollet).await.unwrap().unwrap();
-    wollet.apply_update(update).unwrap();
-
-    let tx = wollet.transaction(&txid).unwrap().unwrap();
-    assert_eq!(tx.height.unwrap(), 103);
-    let balance = wollet.balance().unwrap();
-
-    let mut wollet =
-        Wollet::without_persist(ElementsNetwork::default_regtest(), desc.clone()).unwrap();
-    client.avoid_encryption();
-    let update = client.full_scan(&wollet).await.unwrap().unwrap();
-    wollet.apply_update(update).unwrap();
-    assert_eq!(balance, wollet.balance().unwrap());
-
-    // test fallback (no waterfalls) because elip151 desc
-    // note the scan will find transactions because the descriptor was used above (with different blinding key)
-    let desc = "ct(elip151,elwpkh(tpubDC3BrFCCjXq4jAceV8k6UACxDDJCFb1eb7R7BiKYUGZdNagEhNfJoYtUrRdci9JFs1meiGGModvmNm8PrqkrEjJ6mpt6gA1DRNU8vu7GqXH/<0;1>/*))";
-    let desc = WolletDescriptor::from_str(desc).unwrap();
-    let mut wollet = Wollet::new(network, NoPersist::new(), desc).unwrap();
-    let update = client.full_scan(&wollet).await.unwrap().unwrap();
-    wollet.apply_update(update).unwrap();
-    assert!(
-        wollet.transactions().unwrap().is_empty(),
-        "different blinding key should have no txs"
-    );
-
-    test_env.shutdown().await;
-}
-
 #[test]
 fn test_tip() {
-    let server = setup();
-    let client = test_client_electrum(&server.electrs.electrum_url);
+    let env = TestEnvBuilder::from_env().with_electrum().build();
+    let client = test_client_electrum(&env.electrum_url());
     let mut w = TestWollet::new(client, TEST_DESCRIPTOR);
     w.wait_height(101); // node mines 101 blocks on start
     assert_eq!(w.tip().height(), 101);
     assert!(w.tip().timestamp().is_some());
-    server.elementsd_generate(1);
+    env.elementsd_generate(1);
     w.wait_height(102);
     assert_eq!(w.tip().height(), 102);
     assert!(w.tip().timestamp().is_some());
@@ -1402,37 +1327,37 @@ fn test_tip() {
 #[test]
 fn drain() {
     // Send all funds from a wallet
-    let server = setup();
+    let env = TestEnvBuilder::from_env().with_electrum().build();
     let signer = generate_signer();
     let view_key = generate_view_key();
     let desc = format!("ct({},elwpkh({}/*))", view_key, signer.xpub());
     let signers = [&AnySigner::Software(signer)];
 
-    let client = test_client_electrum(&server.electrs.electrum_url);
+    let client = test_client_electrum(&env.electrum_url());
     let mut wallet = TestWollet::new(client, &desc);
 
     // One utxo L-BTC
-    wallet.fund_btc(&server);
-    let node_address = server.elementsd_getnewaddress();
+    wallet.fund_btc(&env);
+    let node_address = env.elementsd_getnewaddress();
     wallet.assert_spent_unspent(0, 1);
     wallet.send_all_btc(&signers, None, node_address);
     wallet.assert_spent_unspent(1, 0);
 
     // Multiple utxos
-    wallet.fund_btc(&server);
-    wallet.fund_btc(&server);
+    wallet.fund_btc(&env);
+    wallet.fund_btc(&env);
     wallet.assert_spent_unspent(1, 2);
 
-    let node_address = server.elementsd_getnewaddress();
+    let node_address = env.elementsd_getnewaddress();
     wallet.send_all_btc(&signers, None, node_address);
     wallet.assert_spent_unspent(3, 0);
 
     // Drain ignores assets, since their change handling and coin selection is cosiderably easier
-    wallet.fund_btc(&server);
+    wallet.fund_btc(&env);
     wallet.assert_spent_unspent(3, 1);
     let (asset, token) = wallet.issueasset(&signers, 10, 1, None, None);
     wallet.assert_spent_unspent(4, 3); // unspents are: asset+reissuance_token+change
-    let node_address = server.elementsd_getnewaddress();
+    let node_address = env.elementsd_getnewaddress();
     wallet.send_all_btc(&signers, None, node_address);
     wallet.assert_spent_unspent(5, 2);
 
@@ -1440,7 +1365,7 @@ fn drain() {
     assert!(wallet.balance(&token) > 0);
 
     // Confirm the transactions
-    server.elementsd_generate(1);
+    env.elementsd_generate(1);
     wait_tx_update(&mut wallet);
     let txs = wallet.wollet.transactions().unwrap();
     for tx in txs {
@@ -1469,17 +1394,17 @@ fn wait_tx_update<C: BlockchainBackend>(wallet: &mut TestWollet<C>) {
 #[test]
 fn ct_discount() {
     // Send transactions with ELIP200 discounted fees for Confidential Transactions
-    let server = setup();
+    let env = TestEnvBuilder::from_env().with_electrum().build();
     let signer = generate_signer();
     let view_key = generate_view_key();
     let desc = format!("ct({},elwpkh({}/*))", view_key, signer.xpub());
     let signer = AnySigner::Software(signer);
 
-    let client = test_client_electrum(&server.electrs.electrum_url);
+    let client = test_client_electrum(&env.electrum_url());
     let mut wallet = TestWollet::new(client, &desc);
 
-    wallet.fund_btc(&server);
-    let node_address = server.elementsd_getnewaddress();
+    wallet.fund_btc(&env);
+    let node_address = env.elementsd_getnewaddress();
 
     // Send without CT discount
     let mut pset = wallet
@@ -1514,7 +1439,7 @@ fn ct_discount() {
     assert_fee_rate(compute_fee_rate(&pset), None);
 
     // Confirm the transactions
-    server.elementsd_generate(1);
+    env.elementsd_generate(1);
     wait_tx_update(&mut wallet);
     let txs = wallet.wollet.transactions().unwrap();
     for tx in txs {
@@ -1546,12 +1471,12 @@ fn ct_discount() {
 fn claim_pegin() {
     // TODO this test makes a pegin using the node as a reference implementation to implement the pegin
     // in the lwk wallet
-    let server = setup_with_bitcoind();
+    let env = TestEnvBuilder::from_env().with_bitcoind().build();
 
-    server.bitcoind_generate(101);
-    let (mainchain_address, claim_script) = server.elementsd_getpeginaddress();
-    let txid = server.bitcoind_sendtoaddress(&mainchain_address, 100_000_000);
-    let tx = server.bitcoind_getrawtransaction(txid);
+    env.bitcoind_generate(101);
+    let (mainchain_address, claim_script) = env.elementsd_getpeginaddress();
+    let txid = env.bitcoind_sendtoaddress(&mainchain_address, 100_000_000);
+    let tx = env.bitcoind_getrawtransaction(txid);
     let tx_bytes = bitcoin::consensus::serialize(&tx);
 
     let pegin_vout = tx
@@ -1560,12 +1485,12 @@ fn claim_pegin() {
         .position(|o| o.script_pubkey == mainchain_address.script_pubkey())
         .unwrap();
 
-    server.bitcoind_generate(101);
-    let proof = server.bitcoind_gettxoutproof(txid);
+    env.bitcoind_generate(101);
+    let proof = env.bitcoind_gettxoutproof(txid);
 
-    server.elementsd_generate(2);
+    env.elementsd_generate(2);
 
-    let address_lbtc = server.elementsd_getnewaddress().to_string();
+    let address_lbtc = env.elementsd_getnewaddress().to_string();
 
     let inputs = serde_json::json!([ {"txid":txid, "vout": pegin_vout,"pegin_bitcoin_tx": tx_bytes.to_hex(), "pegin_txout_proof": proof, "pegin_claim_script": claim_script } ]);
     let outputs = serde_json::json!([
@@ -1573,21 +1498,19 @@ fn claim_pegin() {
         {"fee": "0.1" }
     ]);
 
-    let psbt = server.elementsd_raw_createpsbt(inputs, outputs);
+    let psbt = env.elementsd_raw_createpsbt(inputs, outputs);
 
-    assert_eq!(server.elementsd_expected_next(&psbt), "updater");
-    let psbt = server.elementsd_walletprocesspsbt(&psbt);
-    assert_eq!(server.elementsd_expected_next(&psbt), "extractor");
-    let tx_hex = server.elementsd_finalizepsbt(&psbt);
-    let _txid = server.elementsd_sendrawtransaction(&tx_hex);
+    assert_eq!(env.elementsd_expected_next(&psbt), "updater");
+    let psbt = env.elementsd_walletprocesspsbt(&psbt);
+    assert_eq!(env.elementsd_expected_next(&psbt), "extractor");
+    let tx_hex = env.elementsd_finalizepsbt(&psbt);
+    let _txid = env.elementsd_sendrawtransaction(&tx_hex);
 }
 
 #[test]
 fn test_fetch_full_header_regtest() {
-    let server = setup();
-    let url = &server.electrs.electrum_url;
-    let electrum_url = ElectrumUrl::new(url, false, false).unwrap();
-    let client = ElectrumClient::new(&electrum_url).unwrap();
+    let env = TestEnvBuilder::from_env().with_electrum().build();
+    let client = test_client_electrum(&env.electrum_url());
 
     test_fetch_last_full_header(client, ElementsNetwork::default_regtest());
 }
@@ -1617,29 +1540,29 @@ fn test_fetch_last_full_header(mut client: ElectrumClient, network: ElementsNetw
 #[test]
 fn few_lbtc() {
     // Send from a wallet with few lbtc
-    let server = setup();
+    let env = TestEnvBuilder::from_env().with_electrum().build();
     let signer = generate_signer();
     let view_key = generate_view_key();
     let desc = format!("ct({},elwpkh({}/*))", view_key, signer.xpub());
     let signers = [&AnySigner::Software(signer)];
 
-    let client = test_client_electrum(&server.electrs.electrum_url);
+    let client = test_client_electrum(&env.electrum_url());
     let mut wallet = TestWollet::new(client, &desc);
 
     let address = wallet.address();
-    wallet.fund(&server, 1000, Some(address), None);
+    wallet.fund(&env, 1000, Some(address), None);
 
-    let node_address = server.elementsd_getnewaddress();
+    let node_address = env.elementsd_getnewaddress();
     wallet.send_btc(&signers, None, Some((node_address, 1)));
 
     // Drain the wallet and fund it with a single utxo insufficient to pay for the fee
-    let node_address = server.elementsd_getnewaddress();
+    let node_address = env.elementsd_getnewaddress();
     wallet.send_all_btc(&signers, None, node_address);
 
     let address = wallet.address();
-    wallet.fund(&server, 10, Some(address), None);
+    wallet.fund(&env, 10, Some(address), None);
 
-    let node_address = server.elementsd_getnewaddress();
+    let node_address = env.elementsd_getnewaddress();
     let err = wallet
         .tx_builder()
         .add_lbtc_recipient(&node_address, 1)
@@ -1649,7 +1572,7 @@ fn few_lbtc() {
     assert!(matches!(err, Error::InsufficientFunds { .. }));
 
     // Send an asset to the wallet and check that we have the same error
-    let asset = wallet.fund_asset(&server);
+    let asset = wallet.fund_asset(&env);
     assert!(wallet.balance(&asset) > 0);
 
     let err = wallet
@@ -1662,7 +1585,7 @@ fn few_lbtc() {
 
     // Send some more lbtc and we can send the asset and lbtc
     let address = wallet.address();
-    wallet.fund(&server, 1000, Some(address), None);
+    wallet.fund(&env, 1000, Some(address), None);
     wallet.send_asset(&signers, &node_address, &asset, None);
     wallet.send_btc(&signers, None, Some((node_address, 1)));
 }
@@ -1671,26 +1594,25 @@ pub fn new_unsupported_wallet(desc: &str, expected: lwk_wollet::Error) {
     let r: Result<WolletDescriptor, _> = add_checksum(desc).parse();
 
     match r {
-        Ok(_) => panic!("Expected unsupported descriptor\n{}\n{:?}", desc, expected),
+        Ok(_) => panic!("Expected unsupported descriptor\n{desc}\n{expected:?}"),
         Err(err) => assert_eq!(err.to_string(), expected.to_string()),
     }
 }
 
 #[test]
 fn test_prune() {
-    let server = setup();
+    let env = TestEnvBuilder::from_env().with_electrum().build();
     let signer = generate_signer();
     let view_key = generate_view_key();
-    let desc = format!("ct({},elwpkh({}/*))", view_key, signer.xpub());
+    let desc = format!("ct({view_key},elwpkh({}/*))", signer.xpub());
 
-    let client = test_client_electrum(&server.electrs.electrum_url);
+    let client = test_client_electrum(&env.electrum_url());
     let mut wallet = TestWollet::new(client, &desc);
 
     let address = wallet.address();
-    let _ = server.elementsd_sendtoaddress(&address, 100_000, None);
+    let _ = env.elementsd_sendtoaddress(&address, 100_000, None);
 
-    let electrum_url = ElectrumUrl::new(&server.electrs.electrum_url, false, false).unwrap();
-    let mut client = ElectrumClient::new(&electrum_url).unwrap();
+    let mut client = test_client_electrum(&env.electrum_url());
     let mut attempts = 50;
     let mut update = loop {
         if let Some(u) = client.full_scan(&wallet.wollet).unwrap() {
@@ -1726,32 +1648,32 @@ fn test_prune() {
 #[test]
 fn test_external_utxo() {
     // Send tx with external utxos
-    let server = setup();
+    let env = TestEnvBuilder::from_env().with_electrum().build();
 
     let signer1 = generate_signer();
     let view_key1 = generate_view_key();
     let desc1 = format!("ct({},elwpkh({}/*))", view_key1, signer1.xpub());
-    let client = test_client_electrum(&server.electrs.electrum_url);
+    let client = test_client_electrum(&env.electrum_url());
     let mut w1 = TestWollet::new(client, &desc1);
 
     let signer2 = generate_signer();
     let view_key2 = generate_view_key();
     let desc2 = format!("ct({},elwpkh({}/*))", view_key2, signer2.xpub());
-    let client = test_client_electrum(&server.electrs.electrum_url);
+    let client = test_client_electrum(&env.electrum_url());
     let mut w2 = TestWollet::new(client, &desc2);
 
     let policy_asset = w1.policy_asset();
 
     let address = w1.address();
-    w1.fund(&server, 100_000, Some(address), None);
+    w1.fund(&env, 100_000, Some(address), None);
 
     let address = w2.address();
-    w2.fund(&server, 100_000, Some(address), None);
+    w2.fund(&env, 100_000, Some(address), None);
 
     let utxo = &w2.wollet.utxos().unwrap()[0];
     let external_utxo = w2.make_external(utxo);
 
-    let node_address = server.elementsd_getnewaddress();
+    let node_address = env.elementsd_getnewaddress();
     let mut pset = w1
         .tx_builder()
         .add_lbtc_recipient(&node_address, 110_000)
@@ -1785,7 +1707,7 @@ fn test_external_utxo() {
 
     // External UTXO can be asset UTXOs
     w2.sync();
-    let asset = w2.fund_asset(&server);
+    let asset = w2.fund_asset(&env);
     let utxo = &w2.wollet.utxos().unwrap()[0];
     let external_utxo = w2.make_external(utxo);
     assert_eq!(w1.balance(&asset), 0);
@@ -1888,12 +1810,12 @@ fn test_external_utxo() {
 #[test]
 fn test_unblinded_utxo() {
     // Receive unblinded utxo and spend it
-    let server = setup();
+    let env = TestEnvBuilder::from_env().with_electrum().build();
 
     let signer = generate_signer();
     let view_key = generate_view_key();
     let desc = format!("ct({},elwpkh({}/*))", view_key, signer.xpub());
-    let client = test_client_electrum(&server.electrs.electrum_url);
+    let client = test_client_electrum(&env.electrum_url());
     let mut w = TestWollet::new(client, &desc);
     let signers = [&AnySigner::Software(signer)];
 
@@ -1901,14 +1823,14 @@ fn test_unblinded_utxo() {
 
     // Fund the wallet with an unblinded UTXO
     let satoshi = 100_000;
-    w.fund_explicit(&server, satoshi, None, None);
+    w.fund_explicit(&env, satoshi, None, None);
 
     assert_eq!(w.balance(&policy_asset), 0);
 
     let external_utxo = w.wollet.explicit_utxos().unwrap()[0].clone();
 
     // Create tx sending the unblinded utxo
-    let node_address = server.elementsd_getnewaddress();
+    let node_address = env.elementsd_getnewaddress();
 
     let mut pset = w
         .tx_builder()
@@ -1934,7 +1856,7 @@ fn test_unblinded_utxo() {
     assert!(w.balance(&policy_asset) > 0);
 
     // Fund the wallet with another unblinded UTXO
-    w.fund_explicit(&server, satoshi, None, None);
+    w.fund_explicit(&env, satoshi, None, None);
 
     let explicit_utxos = w.wollet.explicit_utxos().unwrap();
     assert_eq!(explicit_utxos.len(), 1);
@@ -1963,13 +1885,14 @@ fn test_unblinded_utxo() {
     assert_eq!(w.balance(&policy_asset), 0);
 
     // 1 unblinded input, 1 blinded output: we can still blind the transaction
-    w.fund_explicit(&server, satoshi, None, None);
+    w.fund_explicit(&env, satoshi, None, None);
 
     let explicit_utxos = w.wollet.explicit_utxos().unwrap();
     let external_utxo = explicit_utxos.last().unwrap().clone();
 
     // Send all funds
-    let node_address = server.elementsd_getnewaddress();
+    let node_address = env.elementsd_getnewaddress();
+
     let mut pset = w
         .tx_builder()
         .add_external_utxos(vec![external_utxo])
@@ -1991,19 +1914,19 @@ fn test_unblinded_utxo() {
 
 #[test]
 fn test_spend_blinded_utxo_with_custom_blinding_key() {
-    let server = setup();
+    let env = TestEnvBuilder::from_env().with_electrum().build();
     let signer = generate_signer();
     let blinding_key = secp256k1::SecretKey::new(&mut rand::thread_rng());
     let desc = format!("ct(elip151,elwpkh({}/*))", signer.xpub());
-    let client = test_client_electrum(&server.electrs.electrum_url);
+    let client = test_client_electrum(&env.electrum_url());
     let mut w = TestWollet::new(client, &desc);
     let policy_asset = w.policy_asset();
     let mut address_with_custom_blinding = w.address();
     address_with_custom_blinding.blinding_pubkey = Some(blinding_key.public_key(&EC));
 
     let amount = 100_000;
-    let txid = server.elementsd_sendtoaddress(&address_with_custom_blinding, amount, None);
-    server.elementsd_generate(1);
+    let txid = env.elementsd_sendtoaddress(&address_with_custom_blinding, amount, None);
+    env.elementsd_generate(1);
 
     w.wait_for_tx_outside_list(&txid);
 
@@ -2037,10 +1960,10 @@ fn test_spend_blinded_utxo_with_custom_blinding_key() {
 #[cfg(feature = "elements_rpc")]
 #[test]
 fn test_elements_rpc() {
-    let server = setup();
-    assert_eq!(server.elementsd_height(), 101);
-    let url = server.elements_rpc_url();
-    let (user, pass) = server.elements_rpc_credentials();
+    let env = TestEnvBuilder::from_env().with_electrum().build();
+    assert_eq!(env.elementsd_height(), 101);
+    let url = env.elements_rpc_url();
+    let (user, pass) = env.elements_rpc_credentials();
     let network = ElementsNetwork::default_regtest();
     let elements_rpc_client =
         ElementsRpcClient::new_from_credentials(network, &url, &user, &pass).unwrap();
@@ -2053,16 +1976,16 @@ fn test_elements_rpc() {
     // Create wallet fund wallet
     let signer = generate_signer();
     let desc = format!("ct(elip151,elwpkh({}/*))", signer.xpub());
-    let client = test_client_electrum(&server.electrs.electrum_url);
+    let client = test_client_electrum(&env.electrum_url());
     let mut wallet = TestWollet::new(client, &desc);
     let wd = wallet.wollet.wollet_descriptor();
 
-    wallet.fund_btc(&server);
+    wallet.fund_btc(&env);
     let utxos = elements_rpc_client.confirmed_utxos(&wd, 20).unwrap();
     assert_eq!(utxos.len(), 0);
 
     // Confirm funds
-    server.elementsd_generate(1);
+    env.elementsd_generate(1);
     let utxos = elements_rpc_client.confirmed_utxos(&wd, 20).unwrap();
     assert_eq!(utxos.len(), 1);
 }
@@ -2070,21 +1993,25 @@ fn test_elements_rpc() {
 #[cfg(feature = "esplora")]
 #[test]
 fn test_clients() {
-    let server = setup_with_esplora();
+    let env = TestEnvBuilder::from_env()
+        .with_electrum()
+        .with_esplora()
+        .with_waterfalls()
+        .build();
 
-    let electrum_url = ElectrumUrl::new(&server.electrs.electrum_url, false, false).unwrap();
-    let electrum_client = ElectrumClient::new(&electrum_url).unwrap();
+    let electrum_client = test_client_electrum(&env.electrum_url());
 
-    let esplora_url = format!("http://{}", server.electrs.esplora_url.as_ref().unwrap());
-    let esplora_client =
-        clients::blocking::EsploraClient::new(&esplora_url, ElementsNetwork::default_regtest())
-            .unwrap();
+    let esplora_client = clients::blocking::EsploraClient::new(
+        &env.esplora_url(),
+        ElementsNetwork::default_regtest(),
+    )
+    .unwrap();
 
     assert_eq!(electrum_client.capabilities().len(), 0);
     assert_eq!(esplora_client.capabilities().len(), 0);
 
     let esplora_waterfalls_client = clients::blocking::EsploraClient::new_waterfalls(
-        &esplora_url,
+        &env.waterfalls_url(),
         ElementsNetwork::default_regtest(),
     )
     .unwrap();
@@ -2106,21 +2033,12 @@ fn wait_esplora_tx_update(client: &mut blocking::EsploraClient, wollet: &Wollet)
 
 #[cfg(feature = "esplora")]
 #[test]
-fn test_waterfalls_esplora() {
+fn test_waterfalls_esplora() -> Result<(), Box<dyn std::error::Error>> {
     // TODO: use TestWollet also for EsploraClient
-    // FIXME: add launch_sync or similar to waterfalls
-
-    init_logging();
-    let rt = tokio::runtime::Runtime::new().unwrap();
-    let exe = std::env::var("ELEMENTSD_EXEC").unwrap();
-
-    let test_env = rt.block_on(waterfalls::test_env::launch(exe, Family::Elements));
-
-    let url = format!("{}/blocks/tip/hash", test_env.base_url());
-    let _r = reqwest::blocking::get(url).unwrap().text().unwrap();
+    let env = TestEnvBuilder::from_env().with_waterfalls().build();
 
     let mut client = clients::blocking::EsploraClient::new_waterfalls(
-        test_env.base_url(),
+        &env.waterfalls_url(),
         ElementsNetwork::default_regtest(),
     )
     .unwrap();
@@ -2136,15 +2054,15 @@ fn test_waterfalls_esplora() {
 
     let sats = 1_000;
     let address = wollet.address(None).unwrap();
-    let _txid = test_env.send_to(&to_be(address.address()), sats);
+    let _txid = env.elementsd_sendtoaddress(address.address(), sats, None);
 
     let update = wait_esplora_tx_update(&mut client, &wollet);
     wollet.apply_update(update).unwrap();
     let balance = wollet.balance().unwrap();
     assert_eq!(sats, *balance.get(&network.policy_asset()).unwrap());
 
-    let address = test_env.get_new_address(None);
-    let address = address.elements().unwrap();
+    // ANCHOR: drain_lbtc_wallet
+    let address = env.elementsd_getnewaddress();
     let mut pset = wollet
         .tx_builder()
         .drain_lbtc_wallet()
@@ -2178,14 +2096,14 @@ fn test_waterfalls_esplora() {
     assert_eq!(history[0].len(), 1);
     assert_eq!(history[0][0].txid, txid);
 
-    rt.block_on(test_env.shutdown());
+    Ok(())
 }
 
 #[cfg(feature = "esplora")]
 #[test]
 fn test_esplora_client() {
-    let server = setup_with_esplora();
-    let url = format!("http://{}", server.electrs.esplora_url.as_ref().unwrap());
+    let env = TestEnvBuilder::from_env().with_esplora().build();
+    let url = env.esplora_url();
     let client =
         clients::blocking::EsploraClient::new(&url, ElementsNetwork::default_regtest()).unwrap();
 
@@ -2195,20 +2113,20 @@ fn test_esplora_client() {
     let signers = &[&AnySigner::Software(signer)];
 
     let wallet = TestWollet::new(client, &desc);
-    roundtrip_inner(wallet, &server, signers);
+    roundtrip_inner(wallet, &env, signers);
 }
 
 #[test]
 fn test_persistence_reload_after_only_tip() {
-    let server = setup();
+    let env = TestEnvBuilder::from_env().with_electrum().build();
 
     let signer = generate_signer();
     let view_key = generate_view_key();
     let desc = format!("ct({},elwpkh({}/*))", view_key, signer.xpub());
-    let client = test_client_electrum(&server.electrs.electrum_url);
+    let client = test_client_electrum(&env.electrum_url());
     let mut wallet = TestWollet::new(client, &desc);
 
-    server.elementsd_generate(1);
+    env.elementsd_generate(1);
     wallet.wait_height(102);
     wallet.sync();
 
@@ -2217,12 +2135,12 @@ fn test_persistence_reload_after_only_tip() {
 
 #[test]
 fn test_non_standard_gap_limit() {
-    let server = setup();
+    let env = TestEnvBuilder::from_env().with_electrum().build();
     let signer = generate_signer();
     let view_key = generate_view_key();
     let desc = format!("ct({},elwpkh({}/*))", view_key, signer.xpub());
     let wollet_desc = WolletDescriptor::from_str(&desc).unwrap();
-    let mut client = test_client_electrum(&server.electrs.electrum_url);
+    let mut client = test_client_electrum(&env.electrum_url());
     let network = ElementsNetwork::default_regtest();
     let satoshi = 1_000_000;
 
@@ -2240,8 +2158,8 @@ fn test_non_standard_gap_limit() {
     let address_check = wollet_longer_gap.address(i).unwrap().address().clone();
     assert_eq!(address_after_gap_limit, address_check);
 
-    let txid = server.elementsd_sendtoaddress(&address_after_gap_limit, satoshi, None);
-    server.elementsd_generate(1);
+    let txid = env.elementsd_sendtoaddress(&address_after_gap_limit, satoshi, None);
+    env.elementsd_generate(1);
 
     // custom wait_for_tx using custom gap limit
     for i in 0..60 {
@@ -2276,8 +2194,8 @@ fn test_non_standard_gap_limit() {
 #[tokio::test]
 #[cfg(feature = "esplora")]
 async fn test_non_standard_gap_limit_esplora() {
-    let server = setup_with_esplora();
-    let url = format!("http://{}", server.electrs.esplora_url.as_ref().unwrap());
+    let env = TestEnvBuilder::from_env().with_esplora().build();
+    let url = env.esplora_url();
     let network = ElementsNetwork::default_regtest();
     let mut client = clients::asyncr::EsploraClient::new(network, &url);
     let signer = generate_signer();
@@ -2291,8 +2209,8 @@ async fn test_non_standard_gap_limit_esplora() {
     let i = Some(25);
     let address_after_gap_limit = wollet.address(i).unwrap().address().clone();
 
-    let txid = server.elementsd_sendtoaddress(&address_after_gap_limit, satoshi, None);
-    server.elementsd_generate(1);
+    let txid = env.elementsd_sendtoaddress(&address_after_gap_limit, satoshi, None);
+    env.elementsd_generate(1);
 
     // custom wait_for_tx using custom gap limit
     for i in 0..60 {
@@ -2322,17 +2240,10 @@ async fn test_non_standard_gap_limit_esplora() {
 #[cfg(feature = "esplora")]
 fn test_non_standard_gap_limit_waterfalls_esplora() {
     // TODO: use TestWollet also for EsploraClient
-    // FIXME: add launch_sync or similar to waterfalls
-
-    init_logging();
-    let rt = tokio::runtime::Runtime::new().unwrap();
-    let exe = std::env::var("ELEMENTSD_EXEC").unwrap();
-    let test_env = rt.block_on(waterfalls::test_env::launch(exe, Family::Elements));
-    let url = format!("{}/blocks/tip/hash", test_env.base_url());
-    let _r = reqwest::blocking::get(url).unwrap().text().unwrap();
+    let env = TestEnvBuilder::from_env().with_waterfalls().build();
 
     let mut client = clients::blocking::EsploraClient::new_waterfalls(
-        test_env.base_url(),
+        &env.waterfalls_url(),
         ElementsNetwork::default_regtest(),
     )
     .unwrap();
@@ -2348,8 +2259,8 @@ fn test_non_standard_gap_limit_waterfalls_esplora() {
     let address_after_gap_limit = wollet.address(i).unwrap().address().clone();
 
     let satoshi = 1_000_000;
-    let txid = test_env.send_to(&to_be(&address_after_gap_limit), satoshi);
-    rt.block_on(test_env.node_generate(1));
+    let txid = env.elementsd_sendtoaddress(&address_after_gap_limit, satoshi, None);
+    env.elementsd_generate(1);
 
     // custom wait_for_tx using custom gap limit
     for i in 0..60 {
@@ -2361,7 +2272,7 @@ fn test_non_standard_gap_limit_waterfalls_esplora() {
             .transactions()
             .unwrap()
             .iter()
-            .any(|tx| tx.txid == txid.elements());
+            .any(|tx| tx.txid == txid);
         if tx_found {
             break;
         }
@@ -2373,27 +2284,25 @@ fn test_non_standard_gap_limit_waterfalls_esplora() {
 
     let balance = wollet.balance().unwrap();
     assert_eq!(balance.get(&network.policy_asset()).unwrap(), &satoshi);
-
-    rt.block_on(test_env.shutdown());
 }
 
 #[test]
 fn test_manual_coin_selection() {
-    let server = setup();
+    let env = TestEnvBuilder::from_env().with_electrum().build();
 
     let signer = generate_signer();
     let view_key = generate_view_key();
     let desc = format!("ct({},elwpkh({}/*))", view_key, signer.xpub());
-    let client = test_client_electrum(&server.electrs.electrum_url);
+    let client = test_client_electrum(&env.electrum_url());
     let mut w = TestWollet::new(client, &desc);
-    let node_address = server.elementsd_getnewaddress();
+    let node_address = env.elementsd_getnewaddress();
 
     let policy_asset = w.policy_asset();
 
     // Fund the wallet with 2 L-BTC UTXOs
-    w.fund(&server, 100_000, None, None);
-    w.fund(&server, 500_000, None, None);
-    server.elementsd_generate(1);
+    w.fund(&env, 100_000, None, None);
+    w.fund(&env, 500_000, None, None);
+    env.elementsd_generate(1);
 
     assert_eq!(w.balance(&policy_asset), 600_000);
     let utxos = w.wollet.utxos().unwrap();
@@ -2435,7 +2344,7 @@ fn test_manual_coin_selection() {
     signer.sign(&mut pset).unwrap();
     let tx = w.wollet.finalize(&mut pset).unwrap();
     let tx = serialize(&tx);
-    assert!(server.elementsd_testmempoolaccept(&tx.to_hex()));
+    assert!(env.elementsd_testmempoolaccept(&tx.to_hex()));
 
     let mut pset = w
         .tx_builder()
@@ -2450,7 +2359,7 @@ fn test_manual_coin_selection() {
     signer.sign(&mut pset).unwrap();
     let tx = w.wollet.finalize(&mut pset).unwrap();
     let tx = serialize(&tx);
-    assert!(server.elementsd_testmempoolaccept(&tx.to_hex()));
+    assert!(env.elementsd_testmempoolaccept(&tx.to_hex()));
 
     let non_wallet_outpoint = OutPoint::new(txid_test_vector(), 0);
     let err = w
@@ -2464,7 +2373,7 @@ fn test_manual_coin_selection() {
 
     let signers = [&AnySigner::Software(signer.clone())];
     let (asset, token) = w.issueasset(&signers, 10, 1, None, None);
-    server.elementsd_generate(1);
+    env.elementsd_generate(1);
     let utxos = w.wollet.utxos().unwrap();
     assert_eq!(utxos.len(), 3);
     let asset_utxo = &utxos[1];
@@ -2503,7 +2412,7 @@ fn test_manual_coin_selection() {
     signer.sign(&mut pset).unwrap();
     let tx = w.wollet.finalize(&mut pset).unwrap();
     let tx = serialize(&tx);
-    assert!(server.elementsd_testmempoolaccept(&tx.to_hex()));
+    assert!(env.elementsd_testmempoolaccept(&tx.to_hex()));
 
     // Two assets and LBTC
     let mut pset = w
@@ -2525,7 +2434,7 @@ fn test_manual_coin_selection() {
     signer.sign(&mut pset).unwrap();
     let tx = w.wollet.finalize(&mut pset).unwrap();
     let tx = serialize(&tx);
-    assert!(server.elementsd_testmempoolaccept(&tx.to_hex()));
+    assert!(env.elementsd_testmempoolaccept(&tx.to_hex()));
 
     // Two assets, LBTC and no recipient
     // If the recipient is not specified, funds are sent back to the wallet as change.
@@ -2544,7 +2453,7 @@ fn test_manual_coin_selection() {
     signer.sign(&mut pset).unwrap();
     let tx = w.wollet.finalize(&mut pset).unwrap();
     let tx = serialize(&tx);
-    assert!(server.elementsd_testmempoolaccept(&tx.to_hex()));
+    assert!(env.elementsd_testmempoolaccept(&tx.to_hex()));
 }
 
 #[ignore = "This test connects to liquid testnet"]
@@ -2588,18 +2497,18 @@ fn test_update_v2_after_old_updates() {
 #[test]
 fn test_update_transaction() {
     // Get a transaction in the wallet before it's returned by the blockchain client
-    let server = setup();
+    let env = TestEnvBuilder::from_env().with_electrum().build();
 
     let view_key = generate_view_key();
     let signer = generate_signer();
     let xpub = signer.xpub();
-    let desc_str = format!("ct({},elwpkh({}/*))", view_key, xpub);
-    let client = test_client_electrum(&server.electrs.electrum_url);
+    let desc_str = format!("ct({view_key},elwpkh({xpub}/*))");
+    let client = test_client_electrum(&env.electrum_url());
     let mut w = TestWollet::new(client, &desc_str);
 
-    w.fund_btc(&server);
+    w.fund_btc(&env);
 
-    let node_addr = server.elementsd_getnewaddress();
+    let node_addr = env.elementsd_getnewaddress();
     let mut pset = w
         .tx_builder()
         .add_lbtc_recipient(&node_addr, 1_000)
@@ -2616,7 +2525,7 @@ fn test_update_transaction() {
     // Apply the transaction to the wallet
     let net = w.wollet.apply_transaction(tx.clone()).unwrap();
     assert_eq!(
-        format!("{:?}", net),
+        format!("{net:?}"),
         "SignedBalance({5ac9f65c0efcc4775e0baec4ec03abdde22473cd3cf33c0419ca290e0751b225: -1026})"
     );
 
@@ -2639,7 +2548,7 @@ fn test_update_transaction() {
 
     // Applying the transaction again does nothing
     let net = w.wollet.apply_transaction(tx.clone()).unwrap();
-    assert_eq!(format!("{:?}", net), "SignedBalance({})");
+    assert_eq!(format!("{net:?}"), "SignedBalance({})");
 
     let txs = w.wollet.transactions().unwrap();
     assert_eq!(txs.len(), 2);
@@ -2666,7 +2575,7 @@ fn test_update_transaction() {
     // Apply the transaction
     let net = w.wollet.apply_transaction(tx.clone()).unwrap();
     assert_eq!(
-        format!("{:?}", net),
+        format!("{net:?}"),
         "SignedBalance({5ac9f65c0efcc4775e0baec4ec03abdde22473cd3cf33c0419ca290e0751b225: -1026})"
     );
 
@@ -2769,14 +2678,14 @@ fn liquidex<C: BlockchainBackend>(
 
 #[test]
 fn test_liquidex() {
-    let server = setup();
+    let env = TestEnvBuilder::from_env().with_electrum().build();
 
     // Alice
     let signer_a = generate_signer();
     let view_key = generate_view_key();
     let desc_a = format!("ct({},elwpkh({}/*))", view_key, signer_a.xpub());
     let sa = AnySigner::Software(signer_a);
-    let client = test_client_electrum(&server.electrs.electrum_url);
+    let client = test_client_electrum(&env.electrum_url());
     let mut wa = TestWollet::new(client, &desc_a);
 
     // Bob
@@ -2784,11 +2693,11 @@ fn test_liquidex() {
     let view_key = generate_view_key();
     let desc_b = format!("ct({},elwpkh({}/*))", view_key, signer_b.xpub());
     let sb = AnySigner::Software(signer_b);
-    let client = test_client_electrum(&server.electrs.electrum_url);
+    let client = test_client_electrum(&env.electrum_url());
     let mut wb = TestWollet::new(client, &desc_b);
 
-    wa.fund_btc(&server);
-    wb.fund_btc(&server);
+    wa.fund_btc(&env);
+    wb.fund_btc(&env);
 
     let (asset_1, _) = wa.issueasset(&[&sa], 10, 1, None, None);
     let (asset_2, _) = wb.issueasset(&[&sb], 10, 1, None, None);
@@ -2852,21 +2761,21 @@ fn test_liquidex() {
 
 #[test]
 fn test_no_wildcard_with_path_after() {
-    let server = setup_with_esplora();
+    let env = TestEnvBuilder::from_env().with_electrum().build();
 
     let slip77_key = generate_slip77();
     let signer = generate_signer();
     let xpub = signer.xpub();
-    let desc = format!("ct(slip77({}),elwpkh({}/0/0))", slip77_key, xpub);
+    let desc = format!("ct(slip77({slip77_key}),elwpkh({xpub}/0/0))");
 
-    let client = test_client_electrum(&server.electrs.electrum_url);
+    let client = test_client_electrum(&env.electrum_url());
     let mut wallet = TestWollet::new(client, &desc);
 
     let balance_1 = wallet.balance_btc();
     assert_eq!(balance_1, 0);
 
     // Fund
-    wallet.fund_btc(&server);
+    wallet.fund_btc(&env);
 
     let balance_2 = wallet.balance_btc();
     assert!(balance_1 < balance_2);
@@ -2891,8 +2800,8 @@ fn test_no_wildcard_with_path_after() {
     assert_eq!(wallet.address(), wallet.address());
 
     // Address match the first from the descriptor with wildcard
-    let desc = format!("ct(slip77({}),elwpkh({}/<0;1>/*))", slip77_key, xpub);
-    let client = test_client_electrum(&server.electrs.electrum_url);
+    let desc = format!("ct(slip77({slip77_key}),elwpkh({xpub}/<0;1>/*))");
+    let client = test_client_electrum(&env.electrum_url());
     let wallet = TestWollet::new(client, &desc);
 
     // for some reason the first last unused has index 1 instead of 0
@@ -2905,50 +2814,23 @@ fn test_no_wildcard_with_path_after() {
 }
 
 #[test]
-fn test_no_wildcard_waterfalls() {
-    let network = ElementsNetwork::default_regtest();
-
-    let slip77_key = generate_slip77();
-    let signer = generate_signer();
-    let xpub = signer.xpub();
-    let desc = format!("ct(slip77({}),elwpkh({}))", slip77_key, xpub);
-    let rt = tokio::runtime::Runtime::new().unwrap();
-    let exe = std::env::var("ELEMENTSD_EXEC").unwrap();
-    let test_env = rt.block_on(waterfalls::test_env::launch(exe, Family::Elements));
-    let desc: WolletDescriptor = desc.parse().unwrap();
-    let mut wollet = Wollet::without_persist(network, desc.clone()).unwrap();
-
-    let address = wollet.address(None).unwrap();
-    let _txid = test_env.send_to(&to_be(address.address()), 10000);
-    std::thread::sleep(std::time::Duration::from_secs(10));
-
-    let mut waterfalls_client =
-        clients::blocking::EsploraClient::new_waterfalls(test_env.base_url(), network).unwrap();
-
-    let update = waterfalls_client.full_scan(&wollet).unwrap().unwrap();
-
-    wollet.apply_update(update).unwrap();
-
-    let waterfalls_txs = wollet.transactions().unwrap();
-    assert_eq!(waterfalls_txs.len(), 1);
-
-    rt.block_on(test_env.shutdown());
-}
-
-#[test]
 fn test_no_wildcard() {
-    let server = setup_with_esplora();
+    let env = TestEnvBuilder::from_env()
+        .with_electrum()
+        .with_esplora()
+        .with_waterfalls()
+        .build();
 
     let slip77_key = generate_slip77();
     let signer = generate_signer();
     let xpub = signer.xpub();
-    let desc = format!("ct(slip77({}),elwpkh({}))", slip77_key, xpub);
+    let desc = format!("ct(slip77({slip77_key}),elwpkh({xpub}))");
 
-    let client = test_client_electrum(&server.electrs.electrum_url);
+    let client = test_client_electrum(&env.electrum_url());
     let mut wallet = TestWollet::new(client, &desc);
 
     // Receive
-    wallet.fund_btc(&server);
+    wallet.fund_btc(&env);
 
     // Send
     let balance_before = wallet.balance_btc();
@@ -2989,7 +2871,7 @@ fn test_no_wildcard() {
     )
     .unwrap();
 
-    let esplora_url = format!("http://{}", server.electrs.esplora_url.as_ref().unwrap());
+    let esplora_url = env.esplora_url();
     let mut esplora_client = clients::blocking::EsploraClient::new(&esplora_url, network).unwrap();
 
     let update = esplora_client.full_scan(&esplora_wollet).unwrap();
@@ -2999,28 +2881,40 @@ fn test_no_wildcard() {
 
     let esplora_txs = esplora_wollet.transactions().unwrap();
     assert_eq!(esplora_txs.len(), 2);
+
+    // Use waterfalls client
+    let mut waterfalls_wollet = Wollet::without_persist(network, desc.parse().unwrap()).unwrap();
+
+    let mut waterfalls_client =
+        clients::blocking::EsploraClient::new_waterfalls(&env.waterfalls_url(), network).unwrap();
+
+    // TODO: improve this
+    std::thread::sleep(std::time::Duration::from_millis(1000));
+    let update = waterfalls_client.full_scan(&waterfalls_wollet).unwrap();
+    if let Some(update) = update {
+        waterfalls_wollet.apply_update(update).unwrap();
+    }
+
+    let waterfalls_txs = waterfalls_wollet.transactions().unwrap();
+    assert_eq!(waterfalls_txs.len(), 2);
 }
 
 #[test]
 fn test_sh_multi() {
-    //let server = setup_with_esplora();
-    let server = setup();
+    let env = TestEnvBuilder::from_env().with_electrum().build();
 
     let slip77_key = generate_slip77();
     let signer1 = generate_signer();
     let signer2 = generate_signer();
     let xpub1 = signer1.xpub();
     let xpub2 = signer2.xpub();
-    let desc = format!(
-        "ct(slip77({}),elsh(multi(1,{}/*,{}/*)))",
-        slip77_key, xpub1, xpub2
-    );
+    let desc = format!("ct(slip77({slip77_key}),elsh(multi(1,{xpub1}/*,{xpub2}/*)))");
 
-    let client = test_client_electrum(&server.electrs.electrum_url);
+    let client = test_client_electrum(&env.electrum_url());
     let mut wallet = TestWollet::new(client, &desc);
 
     // Receive
-    wallet.fund_btc(&server);
+    wallet.fund_btc(&env);
 
     // Send
     let balance_before = wallet.balance_btc();
@@ -3052,7 +2946,7 @@ fn test_sh_multi() {
 
 #[test]
 fn test_singlekey() {
-    let server = setup_with_esplora();
+    let env = TestEnvBuilder::from_env().with_electrum().build();
     let view_key = "1111111111111111111111111111111111111111111111111111111111111111";
     let sk_a = secp256k1::SecretKey::from_str(
         "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
@@ -3069,15 +2963,15 @@ fn test_singlekey() {
     let pk_a = sk_a.public_key(&EC);
     let pk_b = sk_b.public_key(&EC);
     let pk_c = sk_c.public_key(&EC);
-    let desc = format!("ct({},elsh(multi(2,{},{},{})))", view_key, pk_a, pk_b, pk_c);
-    let client = test_client_electrum(&server.electrs.electrum_url);
+    let desc = format!("ct({view_key},elsh(multi(2,{pk_a},{pk_b},{pk_c})))");
+    let client = test_client_electrum(&env.electrum_url());
     let mut wallet = TestWollet::new(client, &desc);
 
-    wallet.fund_btc(&server);
+    wallet.fund_btc(&env);
     let balance_before = wallet.balance_btc();
 
     // Send some L-BTC to another address
-    let node_addr = server.elementsd_getnewaddress();
+    let node_addr = env.elementsd_getnewaddress();
     let satoshi = 5000;
 
     // Create tx
@@ -3102,14 +2996,14 @@ fn test_singlekey() {
 
 #[test]
 fn test_issuance_amount_limits() {
-    let server = setup();
+    let env = TestEnvBuilder::from_env().with_electrum().build();
     let signer = generate_signer();
     let view_key = generate_view_key();
     let desc = format!("ct({},elwpkh({}/*))", view_key, signer.xpub());
 
-    let client = test_client_electrum(&server.electrs.electrum_url);
+    let client = test_client_electrum(&env.electrum_url());
     let mut wallet = TestWollet::new(client, &desc);
-    wallet.fund_btc(&server);
+    wallet.fund_btc(&env);
 
     // Let's test an issuance of 21M*10^8,
     let amount_21m = 21_000_000 * 100_000_000;
@@ -3146,7 +3040,7 @@ fn test_issuance_amount_limits() {
     // let tx_hex = elements::encode::serialize(&tx).to_hex();
 
     // // The node rejects more than 21M BTC issuance.
-    // assert!(!server.elementsd_testmempoolaccept(&tx_hex));
+    // assert!(!env.elementsd_testmempoolaccept(&tx_hex));
 
     let amount = 21_000_000 * 100_000_000;
     let mut pset = wallet
@@ -3172,13 +3066,13 @@ fn test_issuance_amount_limits() {
 
 #[test]
 fn test_non_std_legacy_multisig() {
-    let server = setup_with_esplora();
+    let env = TestEnvBuilder::from_env().with_esplora().build();
 
     // Receiver wallet
     let recv_signer = generate_signer();
     let recv_xpub = recv_signer.xpub();
-    let recv_desc = format!("ct(elip151,elwpkh({}/*))", recv_xpub);
-    let recv_client = test_client_electrum(&server.electrs.electrum_url);
+    let recv_desc = format!("ct(elip151,elwpkh({recv_xpub}/*))");
+    let recv_client = test_client_electrum(&env.electrum_url());
     let mut recv_wallet = TestWollet::new(recv_client, &recv_desc);
     let recv_addr = recv_wallet.address();
     assert_eq!(recv_wallet.balance_btc(), 0);
@@ -3199,10 +3093,10 @@ fn test_non_std_legacy_multisig() {
     // A temporary descriptor blinding key
     let view_key = "1111111111111111111111111111111111111111111111111111111111111111";
     // P2SH 2of3 with 3 single pubkeys
-    let desc = format!("ct({},elsh(multi(2,{},{},{})))", view_key, pk_a, pk_b, pk_c);
+    let desc = format!("ct({view_key},elsh(multi(2,{pk_a},{pk_b},{pk_c})))");
 
     // Create the wallet
-    let client = test_client_electrum(&server.electrs.electrum_url);
+    let client = test_client_electrum(&env.electrum_url());
     let mut wallet = TestWollet::new(client, &desc);
 
     // Get an address
@@ -3217,8 +3111,8 @@ fn test_non_std_legacy_multisig() {
 
     // Fund the address with an asset
     let satoshi = 10_000;
-    let asset = server.elementsd_issueasset(satoshi);
-    let txid = server.elementsd_sendtoaddress(&addr, satoshi, Some(asset));
+    let asset = env.elementsd_issueasset(satoshi);
+    let txid = env.elementsd_sendtoaddress(&addr, satoshi, Some(asset));
     wallet.wait_for_tx_outside_list(&txid);
 
     // Get external utxo
@@ -3227,7 +3121,7 @@ fn test_non_std_legacy_multisig() {
     let external_utxo = utxos.pop().unwrap();
 
     // Fund with some btc for the fees
-    wallet.fund_btc(&server);
+    wallet.fund_btc(&env);
 
     // Create spending tx
     let mut pset = wallet
@@ -3255,18 +3149,14 @@ fn test_non_std_legacy_multisig() {
 
 #[test]
 fn test_sync_high_index() {
-    init_logging();
+    let env = TestEnvBuilder::from_env().with_waterfalls().build();
     // TODO: extend to test also with Esplora and Electrum
     // This test was reported as a waterfalls issue, but it actually affects also the other clients
     // (tested locally) ideally we should extend this test to also be run for the other clients.
     let network = ElementsNetwork::default_regtest();
 
-    // Start Waterfalls
-    let rt = tokio::runtime::Runtime::new().unwrap();
-    let exe = std::env::var("ELEMENTSD_EXEC").unwrap();
-    let test_env = rt.block_on(waterfalls::test_env::launch(exe, Family::Elements));
     let mut client =
-        clients::blocking::EsploraClient::new_waterfalls(test_env.base_url(), network).unwrap();
+        clients::blocking::EsploraClient::new_waterfalls(&env.waterfalls_url(), network).unwrap();
 
     // Signer
     let slip77_key = generate_slip77();
@@ -3274,11 +3164,11 @@ fn test_sync_high_index() {
     let xpub = signer.xpub();
 
     // Descriptor 1
-    let d1 = format!("ct(slip77({}),elwsh(pkh({}/*)))", slip77_key, xpub);
+    let d1 = format!("ct(slip77({slip77_key}),elwsh(pkh({xpub}/*)))");
     let d1: WolletDescriptor = d1.parse().unwrap();
 
     // Descriptor 2
-    let d2 = format!("ct(slip77({}),elwpkh({}/*))", slip77_key, xpub);
+    let d2 = format!("ct(slip77({slip77_key}),elwpkh({xpub}/*))");
     let d2: WolletDescriptor = d2.parse().unwrap();
 
     // Wallet 1: receives from node, sends 2 outputs to w2 in the same tx
@@ -3291,8 +3181,8 @@ fn test_sync_high_index() {
     // w1 receive funds from node
     let addr = w1.address(None).unwrap();
 
-    let txid = test_env.send_to(&to_be(addr.address()), 10000);
-    wait_for_tx(&mut w1, &mut client, &txid.elements());
+    let txid = env.elementsd_sendtoaddress(addr.address(), 10000, None);
+    wait_for_tx(&mut w1, &mut client, &txid);
 
     // w1 sends to w2 on 2 addresses
     let addr0 = w2.address(Some(0)).unwrap();
@@ -3362,27 +3252,25 @@ fn test_sync_high_index() {
     // Output was unblinded, w3 does not see outputs that it cannot unblind anymore
     assert_eq!(0, w3.txos_cannot_unblind().unwrap().len());
     assert_eq!(0, w3.reunblind().unwrap().len());
-
-    rt.block_on(test_env.shutdown());
 }
 
 #[test]
 fn test_chain_tx() {
     // Create a chain of transaction spending the outputs of the previous one, while the previous
     // transaction is still unspent
-    let server = setup();
+    let env = TestEnvBuilder::from_env().with_electrum().build();
 
     let slip77_key = generate_slip77();
     let signer = generate_signer();
     let xpub = signer.xpub();
-    let desc_str = format!("ct(slip77({}),elwpkh({}/*))", slip77_key, xpub);
+    let desc_str = format!("ct(slip77({slip77_key}),elwpkh({xpub}/*))");
 
-    let client = test_client_electrum(&server.electrs.electrum_url);
+    let client = test_client_electrum(&env.electrum_url());
     let mut wallet = TestWollet::new(client, &desc_str);
 
-    wallet.fund_btc(&server);
+    wallet.fund_btc(&env);
 
-    let node_addr = server.elementsd_getnewaddress();
+    let node_addr = env.elementsd_getnewaddress();
 
     // Create 1st tx
     let mut pset0 = wallet
@@ -3431,20 +3319,20 @@ fn test_chain_tx() {
 #[test]
 fn test_explicit_send() {
     // Send an explicit output
-    let server = setup();
+    let env = TestEnvBuilder::from_env().with_electrum().build();
 
     let slip77_key = generate_slip77();
     let signer = generate_signer();
     let xpub = signer.xpub();
-    let desc_str = format!("ct(slip77({}),elwpkh({}/*))", slip77_key, xpub);
+    let desc_str = format!("ct(slip77({slip77_key}),elwpkh({xpub}/*))");
 
-    let client = test_client_electrum(&server.electrs.electrum_url);
+    let client = test_client_electrum(&env.electrum_url());
     let mut wallet = TestWollet::new(client, &desc_str);
 
-    wallet.fund_btc(&server);
+    wallet.fund_btc(&env);
 
     let lbtc = wallet.policy_asset();
-    let mut addr_explicit = server.elementsd_getnewaddress();
+    let mut addr_explicit = env.elementsd_getnewaddress();
     addr_explicit.blinding_pubkey = None;
 
     let mut pset = wallet
@@ -3501,7 +3389,7 @@ fn test_explicit_send() {
 #[test]
 fn test_finalize_diff_sighashes() {
     // Finalize a transaction with an input signed with different sighashes
-    let server = setup();
+    let env = TestEnvBuilder::from_env().with_electrum().build();
 
     let view_key = generate_view_key();
     let s1 = generate_signer();
@@ -3510,12 +3398,12 @@ fn test_finalize_diff_sighashes() {
     let xpub2 = s2.xpub();
     let desc_str = format!("ct({view_key},elwsh(multi(2,{xpub1}/<0;1>/*,{xpub2}/<0;1>/*)))");
 
-    let client = test_client_electrum(&server.electrs.electrum_url);
+    let client = test_client_electrum(&env.electrum_url());
     let mut wallet = TestWollet::new(client, &desc_str);
 
-    wallet.fund_btc(&server);
+    wallet.fund_btc(&env);
 
-    let addr = server.elementsd_getnewaddress();
+    let addr = env.elementsd_getnewaddress();
     let mut pset = wallet
         .tx_builder()
         .add_lbtc_recipient(&addr, 1_000)
@@ -3554,17 +3442,17 @@ fn test_skip_signing_utxo() {
     // we edit the PSET and we set the input "bip32_derivation"
     // to the empty map, removing references to the signer
     // fingerprint in the input.
-    let server = setup();
+    let env = TestEnvBuilder::from_env().with_electrum().build();
 
     let signer = generate_signer();
     let fp = signer.fingerprint();
     let view_key = generate_view_key();
     let desc = format!("ct({},elwpkh({}/*))", view_key, signer.xpub());
-    let client = test_client_electrum(&server.electrs.electrum_url);
+    let client = test_client_electrum(&env.electrum_url());
     let mut w = TestWollet::new(client, &desc);
 
-    w.fund_btc(&server);
-    w.fund_btc(&server);
+    w.fund_btc(&env);
+    w.fund_btc(&env);
 
     // Send all funds
     let pset = w.tx_builder().drain_lbtc_wallet().finish().unwrap().0;
@@ -3615,24 +3503,24 @@ fn test_skip_signing_utxo() {
 #[test]
 fn test_fee_service() {
     // User uses a Fee Service to pay for its transactions fees
-    let server = setup();
+    let env = TestEnvBuilder::from_env().with_electrum().build();
 
     // User wallet, that will never hold LBTC
     let signer = generate_signer();
     let view_key = generate_view_key();
-    let desc = format!("ct({},elwpkh({}/*))", view_key, signer.xpub());
-    let client = test_client_electrum(&server.electrs.electrum_url);
+    let desc = format!("ct({view_key},elwpkh({}/*))", signer.xpub());
+    let client = test_client_electrum(&env.electrum_url());
     let mut w = TestWollet::new(client, &desc);
 
     // Fee Service wallet, that pays for fee for user
     let signer_fee = generate_signer();
     let view_key = generate_view_key();
-    let desc = format!("ct({},elwpkh({}/*))", view_key, signer_fee.xpub());
-    let client = test_client_electrum(&server.electrs.electrum_url);
+    let desc = format!("ct({view_key},elwpkh({}/*))", signer_fee.xpub());
+    let client = test_client_electrum(&env.electrum_url());
     let mut wf = TestWollet::new(client, &desc);
 
     let lbtc = w.policy_asset();
-    wf.fund_btc(&server);
+    wf.fund_btc(&env);
 
     // Issue an asset and send it to the user
     let signers_fee = [&AnySigner::Software(signer_fee.clone())];
@@ -3722,45 +3610,97 @@ fn to_be(addr: &elements::Address) -> be::Address {
     be::Address::Elements(addr.clone())
 }
 
+#[tokio::test]
+#[ignore = "requires internet connection and env vars"]
+#[allow(unused)]
+async fn async_clients() -> Result<(), Box<dyn std::error::Error>> {
+    init_logging();
+    // ANCHOR: authenticated_esplora_client
+    use lwk_wollet::clients::asyncr::{EsploraClient as AsyncEsploraClient, EsploraClientBuilder};
+    use lwk_wollet::clients::TokenProvider;
+
+    let base_url = "https://enterprise.blockstream.info/liquid/api";
+    let client_id = "your_client_id";
+    let client_secret = "your_client_secret";
+    let client_id = std::env::var("CLIENT_ID").unwrap(); // ANCHOR: ignore
+    let client_secret = std::env::var("CLIENT_SECRET").unwrap(); // ANCHOR: ignore
+    let login_url =
+        "https://login.blockstream.com/realms/blockstream-public/protocol/openid-connect/token";
+
+    let mut client = EsploraClientBuilder::new(base_url, ElementsNetwork::Liquid)
+        .token_provider(TokenProvider::Blockstream {
+            url: login_url.to_string(),
+            client_id: client_id.to_string(),
+            client_secret: client_secret.to_string(),
+        })
+        .build()?;
+    // ANCHOR_END: authenticated_esplora_client
+    let tip = client.tip().await.unwrap();
+    assert!(tip.height > 100);
+
+    // ANCHOR: waterfalls_client
+    let waterfalls_url = "https://waterfalls.liquidwebwallet.org/liquid/api";
+    let mut client = EsploraClientBuilder::new(waterfalls_url, ElementsNetwork::Liquid)
+        .waterfalls(true)
+        .build()?;
+    // ANCHOR_END: waterfalls_client
+    let tip = client.tip().await.unwrap();
+    assert!(tip.height > 100);
+
+    // ANCHOR: authenticated_waterfalls_client
+    let base_url = "https://enterprise.blockstream.info/liquid/api/waterfalls"; // <- changed
+    let client_id = "your_client_id";
+    let client_secret = "your_client_secret";
+    let client_id = std::env::var("CLIENT_ID").unwrap(); // ANCHOR: ignore
+    let client_secret = std::env::var("CLIENT_SECRET").unwrap(); // ANCHOR: ignore
+    let login_url =
+        "https://login.blockstream.com/realms/blockstream-public/protocol/openid-connect/token";
+
+    let mut client = EsploraClientBuilder::new(base_url, ElementsNetwork::Liquid)
+        .waterfalls(true) // <- added
+        .token_provider(TokenProvider::Blockstream {
+            url: login_url.to_string(),
+            client_id: client_id.to_string(),
+            client_secret: client_secret.to_string(),
+        })
+        .build()?;
+    // ANCHOR_END: authenticated_waterfalls_client
+    let tip = client.tip().await.unwrap();
+    assert!(tip.height > 100);
+
+    Ok(())
+}
+
 #[test]
-fn test_blinding_nonces() {
-    // Construct a transaction and obtain the blinding nonces
-    let server = setup();
+#[ignore = "requires internet connection"]
+#[allow(unused)]
+fn blocking_clients() -> Result<(), Box<dyn std::error::Error>> {
+    init_logging();
+    // ANCHOR: electrum_client
+    use lwk_wollet::{ElectrumClient, ElectrumUrl};
 
-    let signer = generate_signer();
-    let view_key = generate_view_key();
-    let desc = format!("ct({},elwpkh({}/*))", view_key, signer.xpub());
-    let client = test_client_electrum(&server.electrs.electrum_url);
-    let mut w = TestWollet::new(client, &desc);
+    let electrum_url = ElectrumUrl::new("blockstream.info:995", true, true)?;
+    let mut client = ElectrumClient::new(&electrum_url)?;
+    // ANCHOR_END: electrum_client
+    let tip = client.tip().unwrap();
+    assert!(tip.height > 100);
 
-    let lbtc = w.policy_asset();
-    w.fund_btc(&server);
+    // ANCHOR: esplora_client
+    use lwk_wollet::clients::blocking::EsploraClient;
 
-    let node_addr = server.elementsd_getnewaddress();
-    let amp0pset = w
-        .tx_builder()
-        .add_recipient(&node_addr, 1000, lbtc)
-        .unwrap()
-        .finish_for_amp0()
-        .unwrap();
-    let mut pset = amp0pset.pset().clone();
-    let blinding_nonces = amp0pset.blinding_nonces();
+    let esplora_url = "https://blockstream.info/liquid/api";
+    let mut client = EsploraClient::new(esplora_url, ElementsNetwork::Liquid)?;
+    // ANCHOR_END: esplora_client
+    let tip = client.tip().unwrap();
+    assert!(tip.height > 100);
 
-    let sigs = signer.sign(&mut pset).unwrap();
-    assert!(sigs > 0);
-
-    w.send(&mut pset);
-
-    // Amp0Pset::new checks that blinding nonces and PSET are consistent
-    let fake_blinding_nonces = vec![String::new(); blinding_nonces.len()];
-    let res = crate::amp0::Amp0Pset::new(pset, fake_blinding_nonces);
-    assert!(res.is_err());
+    Ok(())
 }
 
 #[test]
 #[allow(unused)]
 fn basics() -> Result<(), Box<dyn std::error::Error>> {
-    let server = setup_with_esplora();
+    let env = TestEnvBuilder::from_env().with_esplora().build();
 
     // ANCHOR: generate-signer
     use lwk_signer::{bip39::Mnemonic, SwSigner};
@@ -3799,11 +3739,10 @@ fn basics() -> Result<(), Box<dyn std::error::Error>> {
     let balance = wollet.balance()?;
     // ANCHOR_END: txs
 
-    let url = format!("http://{}", server.electrs.esplora_url.as_ref().unwrap());
+    let url = env.esplora_url();
 
     // ANCHOR: client
     use lwk_wollet::clients::blocking::EsploraClient;
-
     // let url = "https://blockstream.info/liquidtestnet/api";
     // let url = "https://blockstream.info/liquid/api";
 
@@ -3815,10 +3754,10 @@ fn basics() -> Result<(), Box<dyn std::error::Error>> {
     // ANCHOR_END: client
 
     // Receive some funds
-    let txid = server.elementsd_sendtoaddress(addr.address(), 10_000, None);
+    let txid = env.elementsd_sendtoaddress(addr.address(), 10_000, None);
     wait_for_tx(&mut wollet, &mut client, &txid);
 
-    let address = server.elementsd_getnewaddress();
+    let address = env.elementsd_getnewaddress();
     let sats = 1000;
     let lbtc = network.policy_asset();
 
@@ -3852,136 +3791,8 @@ fn basics() -> Result<(), Box<dyn std::error::Error>> {
 
 #[test]
 #[allow(unused)]
-#[cfg(feature = "amp0")]
-#[ignore = "requires network calls"]
-fn test_amp0_setup() -> Result<(), Box<dyn std::error::Error>> {
-    // ANCHOR: amp0-setup
-    use lwk_common::{Amp0Signer, Network};
-    use lwk_signer::SwSigner;
-    use lwk_wollet::amp0::blocking::{Amp0, Amp0Connected};
-
-    // Create signer and watch only credentials
-    let network = Network::TestnetLiquid;
-    let is_mainnet = false;
-    let (signer, mnemonic) = SwSigner::random(is_mainnet)?;
-    let username = "<username>";
-    let password = "<password>";
-    let username = format!("user{}", signer.fingerprint()); // ANCHOR: ignore
-    let password = format!("pass{}", signer.fingerprint()); // ANCHOR: ignore
-
-    // Collect signer data
-    let signer_data = signer.amp0_signer_data()?;
-
-    // Connect to AMP0
-    let amp0 = Amp0Connected::new(network, signer_data)?;
-
-    // Obtain and sign the authentication challenge
-    let challenge = amp0.get_challenge()?;
-    let sig = signer.amp0_sign_challenge(&challenge)?;
-
-    // Login
-    let mut amp0 = amp0.login(&sig)?;
-
-    // Create a new AMP0 account
-    let pointer = amp0.next_account()?;
-    let account_xpub = signer.amp0_account_xpub(pointer)?;
-    let amp_id = amp0.create_amp0_account(pointer, &account_xpub)?;
-
-    // Create watch only entries
-    amp0.create_watch_only(&username, &password)?;
-
-    // Use watch only credentials to interact with AMP0
-    let amp0 = Amp0::new(network, &username, &password, &amp_id)?;
-    // ANCHOR_END: amp0-setup
-
-    Ok(())
-}
-
-#[test]
-#[allow(unused)]
-#[cfg(feature = "amp0")]
-#[ignore = "requires network calls"]
-#[rustfmt::skip] // our priority here is that generated docs renders nicely
-fn test_amp0_daily_ops() -> Result<(), Box<dyn std::error::Error>> {
-    // ANCHOR: amp0-daily-ops
-    use lwk_common::{Network, Signer};
-    use lwk_signer::SwSigner;
-    use lwk_wollet::amp0::{blocking::Amp0, Amp0Pset};
-    use lwk_wollet::{clients::blocking::EsploraClient, ElementsNetwork, Wollet};
-
-    // Signer
-    let mnemonic = "<mnemonic>";
-    // AMP0 Watch-Only credentials
-    let username = "<username>";
-    let password = "<password>";
-    let mnemonic = "thrive metal cactus come oval candy medal bounce captain shock permit joke"; // ANCHOR: ignore
-    let username = "userlwk001"; // ANCHOR: ignore
-    let password = "userlwk001"; // ANCHOR: ignore
-    // AMP ID (optional)
-    let amp_id = "";
-
-    // Create AMP0 context
-    let network = Network::TestnetLiquid;
-
-    let mut amp0 = Amp0::new(network, username, password, amp_id)?;
-
-    // Create AMP0 Wollet
-    let wd = amp0.wollet_descriptor();
-    let mut wollet = Wollet::without_persist(ElementsNetwork::LiquidTestnet, wd)?;
-
-    // Get a new address
-    let addr = amp0.address(None);
-
-    // Update the wallet with (new) blockchain data
-    let url = "https://blockstream.info/liquidtestnet/api";
-    let mut client = EsploraClient::new(url, ElementsNetwork::LiquidTestnet)?;
-    // esplora is too slow // ANCHOR: ignore
-    let url = "https://waterfalls.liquidwebwallet.org/liquidtestnet/api"; // ANCHOR: ignore
-    let mut client = EsploraClient::new_waterfalls(url, ElementsNetwork::LiquidTestnet)?; // ANCHOR: ignore
-    if let Some(update) = client.full_scan_to_index(&wollet, amp0.last_index())? {
-        wollet.apply_update(update)?;
-    }
-
-    // Get balance
-    let balance = wollet.balance()?;
-    let lbtc = wollet.policy_asset(); // ANCHOR: ignore
-    let balance = *balance.get(&lbtc).unwrap_or(&0); // ANCHOR: ignore
-    if balance < 500 { // ANCHOR: ignore
-        let addr = amp0.address(Some(1)).unwrap(); // ANCHOR: ignore
-        panic!("Send some tLBTC to {}", addr.address()); // ANCHOR: ignore
-    } // ANCHOR: ignore
-
-    // Construct a PSET sending LBTC back to the wallet
-    let amp0pset = wollet
-        .tx_builder()
-        .drain_lbtc_wallet()
-        .finish_for_amp0()?;
-    let mut pset = amp0pset.pset().clone();
-    let blinding_nonces = amp0pset.blinding_nonces();
-
-    // User signs the PSET
-    let is_mainnet = false;
-    let signer = SwSigner::new(mnemonic, is_mainnet)?;
-    let sigs = signer.sign(&mut pset)?;
-    assert!(sigs > 0);
-
-    // Reconstruct the Amp0 PSET with the PSET signed by the user
-    let amp0pset = Amp0Pset::new(pset, blinding_nonces.to_vec())?;
-
-    // AMP0 signs
-    let tx = amp0.sign(&amp0pset)?;
-
-    // Broadcast the transaction
-    let txid = client.broadcast(&tx)?;
-    // ANCHOR_END: amp0-daily-ops
-
-    Ok(())
-}
-
-#[test]
-#[allow(unused)]
 fn snippet_multisig() -> Result<(), Box<dyn std::error::Error>> {
-    let server = setup_with_esplora();
+    let env = TestEnvBuilder::from_env().with_esplora().build();
 
     use lwk_signer::{bip39::Mnemonic, SwSigner};
     use lwk_wollet::clients::blocking::EsploraClient;
@@ -4035,7 +3846,7 @@ fn snippet_multisig() -> Result<(), Box<dyn std::error::Error>> {
 
     // Update the wollet state
     let url = "https://blockstream.info/liquidtestnet/api";
-    let url = format!("http://{}", server.electrs.esplora_url.as_ref().unwrap()); // ANCHOR: ignore
+    let url = env.esplora_url(); // ANCHOR: ignore
     let mut client = EsploraClient::new(&url, network)?;
 
     if let Some(update) = client.full_scan(&wollet_c)? {
@@ -4044,13 +3855,13 @@ fn snippet_multisig() -> Result<(), Box<dyn std::error::Error>> {
     // ANCHOR_END: multisig-receive
 
     // Receive some funds
-    let txid = server.elementsd_sendtoaddress(addr.address(), 10_000, None);
+    let txid = env.elementsd_sendtoaddress(addr.address(), 10_000, None);
     wait_for_tx(&mut wollet_c, &mut client, &txid);
 
     // ANCHOR: multisig-send
     // Carol creates a transaction send few sats to a certain address
     let address = "<address>";
-    let address = server.elementsd_getnewaddress(); // ANCHOR: ingore
+    let address = env.elementsd_getnewaddress(); // ANCHOR: ingore
     let sats = 1000;
     let lbtc = network.policy_asset();
 
@@ -4104,6 +3915,164 @@ fn snippet_multisig() -> Result<(), Box<dyn std::error::Error>> {
     let tx = wollet_c.finalize(&mut pset)?;
     let txid = client.broadcast(&tx)?;
     // ANCHOR_END: multisig-send
+
+    Ok(())
+}
+
+#[test]
+fn test_add_input_rangeproofs() {
+    // Construct with and without input rangeproofs
+    let env = TestEnvBuilder::from_env().with_electrum().build();
+
+    let signer = generate_signer();
+    let view_key = generate_view_key();
+    let desc = format!("ct({view_key},elwpkh({}/*))", signer.xpub());
+    let client = test_client_electrum(&env.electrum_url());
+    let mut w = TestWollet::new(client, &desc);
+
+    w.fund_btc(&env);
+
+    let node_addr = env.elementsd_getnewaddress();
+    let pset_default = w
+        .tx_builder()
+        .add_lbtc_recipient(&node_addr, 1000)
+        .unwrap()
+        .finish()
+        .unwrap();
+    let pset_with = w
+        .tx_builder()
+        .add_input_rangeproofs(true)
+        .add_lbtc_recipient(&node_addr, 1000)
+        .unwrap()
+        .finish()
+        .unwrap();
+    let pset_without = w
+        .tx_builder()
+        .add_input_rangeproofs(false)
+        .add_lbtc_recipient(&node_addr, 1000)
+        .unwrap()
+        .finish()
+        .unwrap();
+
+    assert!(pset_default.inputs()[0].in_utxo_rangeproof.is_some());
+    assert!(pset_with.inputs()[0].in_utxo_rangeproof.is_some());
+    assert!(pset_without.inputs()[0].in_utxo_rangeproof.is_none());
+}
+
+#[test]
+fn test_issue_asset() -> Result<(), Box<dyn std::error::Error>> {
+    // Test based on Python bindings test issue_asset.py
+    let network = ElementsNetwork::default_regtest();
+    let policy_asset = network.policy_asset();
+    let env = TestEnvBuilder::from_env().with_electrum().build();
+
+    // ANCHOR: test_issue_asset
+
+    let mut client = test_client_electrum(&env.electrum_url());
+
+    // Create wallet
+    let mnemonic = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+
+    let signer = SwSigner::new(mnemonic, false)?;
+    let desc = signer.wpkh_slip77_descriptor()?;
+    assert!(desc == "ct(slip77(9c8e4f05c7711a98c838be228bcb84924d4570ca53f35fa1c793e58841d47023),elwpkh([73c5da0a/84h/1h/0h]tpubDC8msFGeGuwnKG9Upg7DM2b4DaRqg3CUZa5g8v2SRQ6K4NSkxUgd7HsL2XVWbVm39yBA4LAxysQAm397zwQSQoQgewGiYZqrA9DsP4zbQ1M/<0;1>/*))#xte2lx9x"); // ANCHOR: ignore
+
+    let mut wollet = Wollet::without_persist(network, WolletDescriptor::from_str(&desc)?)?;
+    let wollet_address = wollet.address(None)?;
+    assert!(wollet_address.index() == 0); // ANCHOR: ignore
+    let wallet_address_str = wollet_address.address().to_string();
+    assert!(wallet_address_str == "el1qq2xvpcvfup5j8zscjq05u2wxxjcyewk7979f3mmz5l7uw5pqmx6xf5xy50hsn6vhkm5euwt72x878eq6zxx2z0z676mna6kdq"); // ANCHOR: ignore
+
+    let funded_satoshi = 100_000; // ANCHOR: ignore
+    let txid =
+        env.elementsd_sendtoaddress(wollet_address.address(), funded_satoshi, Some(policy_asset)); // ANCHOR: ignore
+    wait_for_tx(&mut wollet, &mut client, &txid); // ANCHOR: ignore
+    assert!(*wollet.balance()?.get(&policy_asset).unwrap_or(&0) == funded_satoshi); // ANCHOR: ignore
+
+    // ANCHOR: contract
+    let contract_str = "{\"entity\":{\"domain\":\"ciao.it\"},\"issuer_pubkey\":\"0337cceec0beea0232ebe14cba0197a9fbd45fcf2ec946749de920e71434c2b904\",\"name\":\"name\",\"precision\":8,\"ticker\":\"TTT\",\"version\":0}";
+    let contract = Contract::from_str(contract_str)?;
+    // assert!(contract.to_string() == ("{\"entity\":{\"domain\":\"ciao.it\"},\"issuer_pubkey\":\"0337cceec0beea0232ebe14cba0197a9fbd45fcf2ec946749de920e71434c2b904\",\"name\":\"name\",\"precision\":8,\"ticker\":\"TTT\",\"version\":0}")); // ANCHOR: ignore
+    // ANCHOR_END: contract
+
+    // ANCHOR: issue_asset
+    // Issue asset
+    let issued_asset = 10_000;
+    let reissuance_tokens = 1;
+
+    // Create a transaction builder and the issuance transaction
+    let builder = wollet.tx_builder();
+    //  isue asset
+    let mut pset = builder
+        .issue_asset(
+            issued_asset,
+            None, // None -> a wallet from the address is used
+            reissuance_tokens,
+            None, // None -> a wallet from the address is used
+            Some(contract.clone()),
+        )?
+        .finish()?;
+
+    // Sign the transaction and finalize it
+    let signatures_added = signer.sign(&mut pset).expect("signing failed");
+    assert!(signatures_added == 1); // ANCHOR: ignore
+    let _ = wollet.finalize(&mut pset)?;
+    let tx = pset.extract_tx()?;
+
+    // Broadcast the transaction
+    let txid = client.broadcast(&tx)?;
+    // ANCHOR_END: issue_asset
+
+    // ANCHOR: issuance_ids
+    let asset_id = pset.inputs()[0].issuance_ids().0;
+    let token_id = pset.inputs()[0].issuance_ids().1;
+    // ANCHOR_END: issuance_ids
+    // ANCHOR_END: test_issue_asset
+    //let txin = tx.inputs()[0];
+
+    wait_for_tx(&mut wollet, &mut client, &txid);
+
+    assert!(*wollet.balance()?.get(&asset_id).unwrap_or(&0) == issued_asset);
+    assert!(*wollet.balance()?.get(&token_id).unwrap_or(&0) == reissuance_tokens);
+
+    // ANCHOR: reissue_asset
+    let reissue_asset = 100;
+    let asset_receiver = None; // Send the asset to the wollet creating the PSET
+    let issuance_tx = None; // issunce transaction is present in the same wallet
+    let builder = wollet.tx_builder();
+    let mut pset = builder
+        .reissue_asset(asset_id, reissue_asset, asset_receiver, issuance_tx)?
+        .finish()?;
+    let signatures_added = signer.sign(&mut pset).unwrap();
+    assert!(signatures_added == 2); // ANCHOR: ignore
+    let _ = wollet.finalize(&mut pset).unwrap();
+    let tx = pset.extract_tx().unwrap();
+    let txid = client.broadcast(&tx).unwrap();
+    // ANCHOR_END: reissue_asset
+
+    wait_for_tx(&mut wollet, &mut client, &txid);
+
+    assert!(
+        *wollet.balance().unwrap().get(&asset_id).unwrap_or(&0) == issued_asset + reissue_asset
+    );
+
+    // ANCHOR: burn_asset
+    let burn_asset = 50;
+    let builder = wollet.tx_builder();
+    let mut pset = builder.add_burn(burn_asset, asset_id)?.finish()?;
+    let signatures_added = signer.sign(&mut pset)?;
+    assert!(signatures_added == 2); // ANCHOR: ignore
+    let _ = wollet.finalize(&mut pset)?;
+    let tx = pset.extract_tx()?;
+    let txid = client.broadcast(&tx)?;
+    // ANCHOR_END: burn_asset
+
+    wait_for_tx(&mut wollet, &mut client, &txid);
+
+    assert!(
+        *wollet.balance()?.get(&asset_id).unwrap_or(&0)
+            == issued_asset + reissue_asset - burn_asset
+    );
 
     Ok(())
 }

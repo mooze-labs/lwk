@@ -89,7 +89,7 @@ impl JsonRpcServer {
                         }
                         Err(err) => {
                             // not much to do if recv fails
-                            log::error!("recv error: {}", err);
+                            log::error!("recv error: {err}");
                             continue;
                         }
                     };
@@ -119,7 +119,7 @@ impl JsonRpcServer {
                                 Ok(mut file) => {
                                     let mut buf = Vec::new();
                                     match file.read_to_end(&mut buf) {
-                                        Ok(n) => log::trace!("GET: read {} bytes", n),
+                                        Ok(n) => log::trace!("GET: read {n} bytes"),
                                         Err(e) => {
                                             let message = "500: Internal error";
                                             let response = HttpResponse::from_string(message)
@@ -127,7 +127,7 @@ impl JsonRpcServer {
                                             send_http_response(
                                                 http_request,
                                                 response,
-                                                format!("{}: {}", message, e).as_str(),
+                                                format!("{message}: {e}").as_str(),
                                             );
                                             continue;
                                         }
@@ -152,7 +152,7 @@ impl JsonRpcServer {
                                     send_http_response(
                                         http_request,
                                         response,
-                                        format!("{}: {}", message, e).as_str(),
+                                        format!("{message}: {e}").as_str(),
                                     );
                                 }
                             }
@@ -197,12 +197,12 @@ impl JsonRpcServer {
                             if let Err(err) =
                                 send_jsonrpc_response(http_request, response, &config.headers)
                             {
-                                log::error!("send_response error: {}", err);
+                                log::error!("send_response error: {err}");
                             }
                         }
                         other => {
                             let message =
-                                format!("500: Internal error - method {} not implemented.", other);
+                                format!("500: Internal error - method {other} not implemented.");
                             let response =
                                 HttpResponse::from_string(&message).with_status_code(500);
                             send_http_response(http_request, response, &message);
@@ -248,11 +248,9 @@ where
     let status = response.status_code();
     match http_request.respond(response) {
         Ok(()) => log::debug!(
-            "Sent response with status code: {:?} and response message: {}",
-            status,
-            message
+            "Sent response with status code: {status:?} and response message: {message}"
         ),
-        Err(e) => log::error!("Error sending response: {}", e),
+        Err(e) => log::error!("Error sending response: {e}"),
     }
 }
 
@@ -321,7 +319,7 @@ where
         Ok(response) => response,
         Err(Error::Stop) => return Err(Error::Stop),
         Err(Error::Inner(err)) => {
-            log::error!("Error processing request: {}", err);
+            log::error!("Error processing request: {err}");
             Response::from_error(id, err)
         }
         Err(Error::Implementation(err)) => Response::from_error(id, err),
@@ -416,7 +414,7 @@ pub struct RpcError {
 
 impl Display for RpcError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{:?}", self)
+        write!(f, "{self:?}")
     }
 }
 
@@ -457,7 +455,7 @@ mod test {
     fn send_http_request(stream: &mut TcpStream, request: &str) -> Vec<u8> {
         // Add Connection: close header to all requests
         let request = request.trim_end_matches("\r\n\r\n");
-        let request = format!("{}\r\nConnection: close\r\n\r\n", request);
+        let request = format!("{request}\r\nConnection: close\r\n\r\n");
         stream.write_all(request.as_bytes()).unwrap();
         let mut response = Vec::new();
         stream.read_to_end(&mut response).unwrap();
@@ -475,7 +473,7 @@ mod test {
         let state = Arc::new(Mutex::new(()));
         let mut rpc = JsonRpcServer::new(server, Config::default(), state, process);
         let port = rpc.port().unwrap();
-        let url = format!("127.0.0.1:{}", port);
+        let url = format!("127.0.0.1:{port}");
 
         let client = Client::simple_http(&url, None, None).unwrap();
         let val = "The Times 03/Jan/2009 Chancellor on brink of second bailout for banks";
@@ -502,7 +500,7 @@ mod test {
         let state = Arc::new(Mutex::new(()));
         let rpc = JsonRpcServer::new(server, Config::default(), state, process);
         let port = rpc.port().unwrap();
-        let url = format!("127.0.0.1:{}", port);
+        let url = format!("127.0.0.1:{port}");
 
         let client = Client::simple_http(&url, None, None).unwrap();
         let request = client.build_request("rpc.reserved", None);
@@ -569,7 +567,7 @@ mod test {
         let rpc = JsonRpcServer::new(server, config, state, process);
         let port = rpc.port().unwrap();
 
-        let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+        let mut stream = TcpStream::connect(format!("127.0.0.1:{port}")).unwrap();
         let request = "OPTIONS / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n";
         let response = send_http_request(&mut stream, request);
 
@@ -620,11 +618,11 @@ mod test {
         ];
 
         for (ext, data) in file_types.into_iter() {
-            let file_name = format!("file.{}", ext);
+            let file_name = format!("file.{ext}");
             make_file(dir_path.clone(), file_name.clone(), data);
 
-            let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
-            let request = format!("GET /{} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n", file_name);
+            let mut stream = TcpStream::connect(format!("127.0.0.1:{port}")).unwrap();
+            let request = format!("GET /{file_name} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n");
             let response = send_http_request(&mut stream, &request);
 
             assert_response_contains(&response, "HTTP/1.1 200");
@@ -638,7 +636,7 @@ mod test {
         }
 
         // 404
-        let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+        let mut stream = TcpStream::connect(format!("127.0.0.1:{port}")).unwrap();
         let request = "GET /missing.file HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n";
         let response = send_http_request(&mut stream, request);
 

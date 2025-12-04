@@ -5,7 +5,7 @@ variables:
   DOCKER_TLS_CERTDIR: ""
 
 .base:
-  image: xenoky/lwk-builder@sha256:b3ed5a58a179e228cc25c632ce28aaab641df247fef9c649064a3eff44773b87
+  image: xenoky/lwk-builder@sha256:5f458c1ffd1659b19c26245801c657bc85479ca2fc31138a52c2f32f00a0f70e
   tags:
     - cloud
   retry:
@@ -13,9 +13,11 @@ variables:
     when:
       - runner_system_failure
       - unknown_failure
-      - stuck_or_timeout_failure  
+      - stuck_or_timeout_failure
   services:
     - docker:20.10.12-dind
+  before_script:
+    - cp /usr/local/cargo/bin/waterfalls /bin/waterfalls_b8818e1
 
 
 fmt_clippy:
@@ -140,7 +142,7 @@ doc:
     - cargo +nightly doc --no-deps -p lwk_wasm --all-features
     - cargo +nightly doc --no-deps -p lwk_wollet --all-features
     - cargo +nightly doc --no-deps -p lwk_bindings --features foreign_bindings
-    
+
 examples:
   extends: .base
   script:
@@ -168,6 +170,25 @@ csharp:
     paths:
       - csharp
 
+cpp:
+  extends: .base
+  script:
+    - cargo build --release -p lwk_bindings
+    - mkdir cpp
+    - cp target/release/liblwk.so cpp/
+    - uniffi-bindgen-cpp --library cpp/liblwk.so --out-dir cpp
+    # this is an hack, but make it work until we understand how to properly convert default value for Option<Arc<Mnemonic>> and  Option<Arc<dyn Logging>>
+    # upstream issue: https://github.com/NordSecurity/uniffi-bindgen-cpp/issues/60
+    - sed -i -e '/std::shared_ptr<Mnemonic>/ s/std::nullopt/nullptr/g' -e '/std::shared_ptr<Logging>/ s/std::nullopt/nullptr/g' cpp/lwk.hpp
+    - cp lwk_bindings/tests/bindings/list_transactions.cpp cpp
+    - cd cpp
+    - g++ -std=c++20 -L./ -Wl,-rpath,./ -o test list_transactions.cpp lwk.cpp -llwk
+    - ./test && cd -
+    - rm -rf cpp/test cpp/list_transactions.cpp # cleanup
+  artifacts:
+    paths:
+      - cpp
+
 just:
   extends: .base
   script:
@@ -185,6 +206,7 @@ wasm:
     - cargo check --target wasm32-unknown-unknown -p lwk_signer --no-default-features
     - cargo check --target wasm32-unknown-unknown -p lwk_jade --no-default-features --features asyncr --features serial
     - cargo check --target wasm32-unknown-unknown -p lwk_ledger --no-default-features
+    - cargo check --target wasm32-unknown-unknown -p lwk_boltz --no-default-features
     # - cd lwk_wasm && WASM_BINDGEN_TEST_TIMEOUT=60 wasm-pack test --chrome --headless --features serial && cd - # TODO: restore browser tests, at the moment fail with "Cannot assign requested address"
     - cd lwk_wasm && RUSTFLAGS="--cfg=web_sys_unstable_apis" CARGO_PROFILE_RELEASE_OPT_LEVEL=z wasm-pack build --features serial && cd -
     # testing nodejs package
@@ -195,7 +217,9 @@ wasm:
     - npm install
     - node network.js
     - node list_transactions.js
-    - node amp0.js
+    - node amp0-setup.js
+    - node amp0-daily-ops.js
+    - node bip85.js
   artifacts:
     paths:
       - lwk_wasm/pkg
@@ -229,12 +253,46 @@ publish_to_maven:
   stage: deploy
   tags:
     - m4
-  when: manual
+  rules:
+    - if: '$CI_COMMIT_TAG'
+      when: manual
   needs: []
   script:
     - just kotlin-multiplatform
     - cd lwk_bindings/android_bindings
-    - ./gradlew publish --no-daemon --stacktrace --info
+    - ./gradlew publish --no-daemon
+  artifacts:
+    paths:
+      - lwk_bindings/android_bindings/lib/build/libs
+      - lwk_bindings/android_bindings/lib/build/outputs
+      - lwk_bindings/android_bindings/lib/build/publications
+    when: always
+    expire_in: 7 days
+  allow_failure: true
+
+publish_snapshot_to_maven:
+  stage: deploy
+  tags:
+    - m4
+  needs: []
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "master"'
+      when: on_success
+  script:
+    - just kotlin-multiplatform
+    - cd lwk_bindings/android_bindings
+    - RAW_VERSION=$(grep '^libraryVersion=' gradle.properties | cut -d'=' -f2)
+    - BASE_VERSION=${RAW_VERSION%-SNAPSHOT}
+    - VERSION_CORE=$(echo "$BASE_VERSION" | sed -E 's/[^0-9.].*$//')
+    - IFS='.' read -r MAJOR MINOR PATCH <<< "$VERSION_CORE"
+    - MAJOR=${MAJOR:-0}
+    - MINOR=${MINOR:-0}
+    - PATCH=${PATCH:-0}
+    - NEXT_PATCH=$((PATCH + 1))
+    - NEXT_VERSION="${MAJOR}.${MINOR}.${NEXT_PATCH}"
+    - SNAPSHOT_VERSION="${NEXT_VERSION}-SNAPSHOT"
+    - echo "Publishing snapshot version ${SNAPSHOT_VERSION} (base=${BASE_VERSION})"
+    - ./gradlew -PlibraryVersion=${SNAPSHOT_VERSION} publish --no-daemon
   artifacts:
     paths:
       - lwk_bindings/android_bindings/lib/build/libs

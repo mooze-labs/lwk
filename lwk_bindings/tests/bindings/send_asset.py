@@ -5,7 +5,7 @@ node = LwkTestEnv() # launch electrs and elementsd
 mnemonic = Mnemonic("abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about")
 network = Network.regtest_default()
 policy_asset = network.policy_asset()
-client = ElectrumClient(node.electrum_url(), tls=False, validate_domain=False)
+client = ElectrumClient.from_url(node.electrum_url())
 
 signer = Signer(mnemonic, network)
 desc = signer.wpkh_slip77_descriptor()
@@ -39,6 +39,8 @@ signed_pset = signer.sign(unsigned_pset)
 
 finalized_pset = wollet.finalize(signed_pset)
 tx = finalized_pset.extract_tx()
+fee_rate = 1000 * tx.fee(policy_asset) / tx.discount_vsize()
+assert fee_rate - 100 < 10
 txid = client.broadcast(tx)
 
 wollet.wait_for_tx(txid, client)
