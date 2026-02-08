@@ -2,10 +2,12 @@
 default:
     just --list
 
+SIMPLICITY_FEATURES := if env_var_or_default("SIMPLICITY", "") != "" { "--features simplicity" } else { "" }
+
 # build the bindings lib: liblwk.so (as specified in lwk_bindings/Cargo.toml)
 build-bindings-lib:
     # a debug build would be fine if used only to generate interfaces files but some jobs use it to package it, thus release is necessary.
-    cargo build --release -p lwk_bindings
+    cargo build --release -p lwk_bindings {{SIMPLICITY_FEATURES}}
 
 # build the python interface "lwk.py"
 python-build-bindings: build-bindings-lib
@@ -17,6 +19,21 @@ python-build-bindings: build-bindings-lib
 # smoke test the python bindings
 python-test-bindings: python-build-bindings
     PYTHONPATH=target/release/bindings/ python3 -c 'import lwk'
+
+# build the bindings lib with simplicity feature
+build-bindings-lib-simplicity:
+    cargo build --release -p lwk_bindings --features simplicity
+
+# build the python bindings with simplicity enabled
+python-build-bindings-simplicity: build-bindings-lib-simplicity
+    cargo run --release --features bindings,simplicity -- generate --library target/release/liblwk.so --language python --out-dir target/release/bindings
+    cp target/release/liblwk.so target/release/bindings
+
+# smoke test the python bindings with simplicity
+python-test-bindings-simplicity: python-build-bindings-simplicity
+    PYTHONPATH=target/release/bindings/ python3 lwk_bindings/tests/bindings/simplicity_p2pk.py
+    PYTHONPATH=target/release/bindings/ python3 lwk_bindings/tests/bindings/simplicity_p2pk_regtest.py
+    PYTHONPATH=target/release/bindings/ python3 lwk_bindings/tests/bindings/simplicity_options_regtest.py
 
 # build the python bindings and start a python env with them
 python-env-bindings: python-build-bindings
@@ -30,25 +47,33 @@ docker-build:
 docker-push: docker-build
     docker push xenoky/lwk-builder # require credentials
 
+# build the docker "xenoky/lwk-nix-builder" used in the CI
+docker-nix-build:
+    docker build -f context/Dockerfile.nix . -t xenoky/lwk-nix-builder
+
+# push the docker "xenoky/lwk-nix-builder" on docker hub
+docker-nix-push: docker-nix-build
+    docker push xenoky/lwk-nix-builder # require credentials
+
 kotlin: build-bindings-lib
     cargo run --release --features bindings -- generate --library target/release/liblwk.so --language kotlin --out-dir target/release/kotlin
     cp -a target/release/kotlin/lwk lwk_bindings/android_bindings/lib/src/androidMain/kotlin
 
 # Cross build the lib for aarch64-linux-android
 aarch64-linux-android:
-	cargo ndk -t aarch64-linux-android -o target/release/android/jniLibs build -p lwk_bindings
+	cargo ndk -t aarch64-linux-android -o target/release/android/jniLibs build -p lwk_bindings {{SIMPLICITY_FEATURES}}
 
 # Cross build the lib for armv7-linux-androideabi
 armv7-linux-androideabi:
-	cargo ndk -t armv7-linux-androideabi -o target/release/android/jniLibs build -p lwk_bindings
+	cargo ndk -t armv7-linux-androideabi -o target/release/android/jniLibs build -p lwk_bindings {{SIMPLICITY_FEATURES}}
 
 # Cross build the lib for i686-linux-android
 i686-linux-android:
-	cargo ndk -t i686-linux-android -o target/release/android/jniLibs build -p lwk_bindings
+	cargo ndk -t i686-linux-android -o target/release/android/jniLibs build -p lwk_bindings {{SIMPLICITY_FEATURES}}
 
 # Cross build the lib for x86_64-linux-android
 x86_64-linux-android:
-	cargo ndk -t x86_64-linux-android -o target/release/android/jniLibs build -p lwk_bindings
+	cargo ndk -t x86_64-linux-android -o target/release/android/jniLibs build -p lwk_bindings {{SIMPLICITY_FEATURES}}
 
 # After cross building all the lib for android put them in final dir
 android: aarch64-linux-android armv7-linux-androideabi i686-linux-android x86_64-linux-android
@@ -70,11 +95,11 @@ jvm: aarch64-apple-darwin # x86_64-unknown-linux-gnu
 
 # Build aarch64-apple-darwin
 aarch64-apple-darwin:
-    MACOSX_DEPLOYMENT_TARGET=11.0 cargo build --release --target aarch64-apple-darwin -p lwk_bindings
+    MACOSX_DEPLOYMENT_TARGET=11.0 cargo build --release --target aarch64-apple-darwin -p lwk_bindings {{SIMPLICITY_FEATURES}}
 
 # Build x86_64-unknown-linux-gnu
 x86_64-unknown-linux-gnu:
-    cargo build --release --target x86_64-unknown-linux-gnu -p lwk_bindings
+    cargo build --release --target x86_64-unknown-linux-gnu -p lwk_bindings {{SIMPLICITY_FEATURES}}
 
 # Build ios (works only on mac)
 ios: aarch64-apple-ios
@@ -86,15 +111,15 @@ ios-sim: x86_64-apple-ios aarch64-apple-ios-sim
 
 # Build x86_64-apple-ios
 x86_64-apple-ios:
-    IPHONEOS_DEPLOYMENT_TARGET=12.0 MACOSX_DEPLOYMENT_TARGET=11.0 cargo build --release --target x86_64-apple-ios -p lwk_bindings
+    IPHONEOS_DEPLOYMENT_TARGET=12.0 MACOSX_DEPLOYMENT_TARGET=11.0 cargo build --release --target x86_64-apple-ios -p lwk_bindings {{SIMPLICITY_FEATURES}}
 
 # Build aarch64-apple-ios
 aarch64-apple-ios:
-    IPHONEOS_DEPLOYMENT_TARGET=12.0 MACOSX_DEPLOYMENT_TARGET=11.0 cargo build --release --target aarch64-apple-ios -p lwk_bindings
+    IPHONEOS_DEPLOYMENT_TARGET=12.0 MACOSX_DEPLOYMENT_TARGET=11.0 cargo build --release --target aarch64-apple-ios -p lwk_bindings {{SIMPLICITY_FEATURES}}
 
 # Build aarch64-apple-ios-sim
 aarch64-apple-ios-sim:
-    IPHONEOS_DEPLOYMENT_TARGET=12.0 MACOSX_DEPLOYMENT_TARGET=11.0 cargo build --release --target aarch64-apple-ios-sim -p lwk_bindings
+    IPHONEOS_DEPLOYMENT_TARGET=12.0 MACOSX_DEPLOYMENT_TARGET=11.0 cargo build --release --target aarch64-apple-ios-sim -p lwk_bindings {{SIMPLICITY_FEATURES}}
 
 # Build the swift framework (works only on mac)
 swift: ios ios-sim

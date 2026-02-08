@@ -20,6 +20,14 @@
         rust-overlay.follows = "rust-overlay";
       };
     };
+    waterfalls-flake = {
+      url = "github:RCasatta/waterfalls";
+      inputs.nixpkgs.follows = "nixpkgs";
+      inputs.flake-utils.follows = "flake-utils";
+      inputs.rust-overlay.follows = "rust-overlay";
+      inputs.crane.follows = "crane";
+    };
+
     registry-flake = {
       url = "github:blockstream/asset_registry/flake";
       inputs = {
@@ -37,7 +45,7 @@
       };
     };
   };
-  outputs = { self, nixpkgs, flake-utils, rust-overlay, crane, electrs-flake, registry-flake, nexus_relay }:
+  outputs = { self, nixpkgs, flake-utils, rust-overlay, crane, electrs-flake, waterfalls-flake, registry-flake, nexus_relay }:
     flake-utils.lib.eachDefaultSystem
       (system:
         let
@@ -53,6 +61,7 @@
 
           electrs = electrs-flake.apps.${system}.blockstream-electrs-liquid;
           registry = registry-flake.packages.${system};
+          waterfalls = waterfalls-flake.packages.${system}.default;
 
           # When filtering sources, we want to allow assets other than .rs files
           src = lib.cleanSourceWith {
@@ -81,7 +90,7 @@
             # craneLib.crateNameFromCargoToml { cargoToml = ./path/to/Cargo.toml; }
             # but I can't make it work
             pname = "lwk_cli";
-            version = "0.12.0";
+            version = "0.14.0";
           };
           cargoArtifacts = craneLib.buildDepsOnly commonArgs;
           # remember, `set1 // set2` does a shallow merge:
@@ -125,6 +134,8 @@
             ELEMENTSD_EXEC = "${pkgs.elementsd}/bin/elementsd";
             BITCOIND_EXEC = "${pkgs.bitcoind}/bin/bitcoind";
             ELECTRS_LIQUID_EXEC = electrs.program;
+            WATERFALLS_EXEC = "${waterfalls}/bin/waterfalls";
+            ASSET_REGISTRY_EXEC = "${registry.default}/bin/server";
             NEXUS_RELAY_EXEC = "${nexus_relay.packages.${system}.default}/bin/nexus_relay";
             WEBSOCAT_EXEC = "${pkgs.websocat}/bin/websocat";
             SKIP_VERIFY_DOMAIN_LINK = "1"; # the registry server skips validation

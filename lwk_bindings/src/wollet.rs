@@ -78,6 +78,12 @@ impl Wollet {
         Ok(Arc::new(address.into()))
     }
 
+    /// Return the [ELIP152](https://github.com/ElementsProject/ELIPs/blob/main/elip-0152.mediawiki) deterministic wallet identifier.
+    pub fn dwid(&self) -> Result<String, LwkError> {
+        let wollet = self.inner.lock()?;
+        Ok(wollet.wollet_descriptor().dwid(wollet.network().into())?)
+    }
+
     /// Apply an update containing blockchain data
     ///
     /// To update the wallet you need to first obtain the blockchain data relevant for the wallet.
@@ -152,6 +158,20 @@ impl Wollet {
             .map(Into::into)
             .map(Arc::new)
             .collect())
+    }
+
+    /// Get all the wallet transaction
+    pub fn transaction(&self, txid: &Txid) -> Result<Arc<WalletTx>, LwkError> {
+        let err = || LwkError::Generic {
+            msg: "tx not found".to_string(),
+        };
+        Ok(Arc::new(
+            self.inner
+                .lock()?
+                .transaction(&txid.into())?
+                .ok_or_else(err)?
+                .into(),
+        ))
     }
 
     /// Get the unspent transaction outputs of the wallet

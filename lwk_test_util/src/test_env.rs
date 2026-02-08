@@ -1,4 +1,5 @@
 use crate::init_logging;
+use crate::registry::RegistryD;
 use crate::waterfalls::WaterfallsD;
 
 use electrsd::bitcoind;
@@ -12,7 +13,7 @@ use elements::bitcoin;
 use elements_miniscript::elements;
 
 use elements::hex::FromHex;
-use elements::{Address, AssetId, Txid};
+use elements::{Address, AssetId, BlockHash, Txid};
 
 use serde_json::Value;
 use std::str::FromStr;
@@ -24,10 +25,12 @@ pub struct TestEnvBuilder {
     electrs_exec: String,
     bitcoind_exec: String,
     waterfalls_exec: String,
+    registry_exec: String,
     with_electrum: bool,
     with_esplora: bool,
     with_bitcoind: bool,
     with_waterfalls: bool,
+    with_registry: bool,
 }
 
 impl TestEnvBuilder {
@@ -37,21 +40,25 @@ impl TestEnvBuilder {
     /// * ELECTRS_LIQUID_EXEC
     /// * BITCOIND_EXEC
     /// * WATERFALLS_EXEC
+    /// * ASSET_REGISTRY_EXEC
     pub fn from_env() -> Self {
         let elementsd_exec = std::env::var("ELEMENTSD_EXEC").unwrap_or_default();
         let electrs_exec = std::env::var("ELECTRS_LIQUID_EXEC").unwrap_or_default();
         let bitcoind_exec = std::env::var("BITCOIND_EXEC").unwrap_or_default();
         let waterfalls_exec = std::env::var("WATERFALLS_EXEC").unwrap_or_default();
+        let registry_exec = std::env::var("ASSET_REGISTRY_EXEC").unwrap_or_default();
 
         Self {
             elementsd_exec,
             electrs_exec,
             bitcoind_exec,
             waterfalls_exec,
+            registry_exec,
             with_electrum: false,
             with_esplora: false,
             with_bitcoind: false,
             with_waterfalls: false,
+            with_registry: false,
         }
     }
 
@@ -79,6 +86,12 @@ impl TestEnvBuilder {
         self
     }
 
+    /// Start a Asset Registry server
+    pub fn with_registry(mut self) -> Self {
+        self.with_registry = true;
+        self
+    }
+
     /// Start the test environment
     pub fn build(self) -> TestEnv {
         if self.elementsd_exec.is_empty() {
@@ -92,6 +105,14 @@ impl TestEnvBuilder {
         }
         if self.waterfalls_exec.is_empty() && self.with_waterfalls {
             panic!("WATERFALLS_EXEC must be set");
+        }
+        if self.with_registry {
+            if self.registry_exec.is_empty() {
+                panic!("ASSET_REGISTRY_EXEC must be set");
+            }
+            if !self.with_esplora {
+                panic!("asset registry requires esplora, call 'with_esplora()'");
+            }
         }
 
         init_logging();
@@ -113,6 +134,9 @@ impl TestEnvBuilder {
             "-acceptdiscountct=1",
             "-rest",
             "-txindex=1",
+            "-evbparams=simplicity:-1:::", // Enable Simplicity from block 0
+            "-minrelaytxfee=0",            // test tx with no fees/asset fees
+            "-blockmintxfee=0",            // test tx with no fees/asset fees
         ];
         if let Some(bitcoind) = bitcoind.as_ref() {
             //TODO remove this bad code once Conf::args is not Vec<&str>
@@ -198,11 +222,22 @@ impl TestEnvBuilder {
             None
         };
 
+        let registryd = if self.with_registry {
+            let esplora_url = electrsd.as_ref().unwrap().esplora_url.as_ref().unwrap();
+            Some(RegistryD::new(
+                &self.registry_exec,
+                &format!("http://{esplora_url}"),
+            ))
+        } else {
+            None
+        };
+
         TestEnv {
             elementsd,
             bitcoind,
             electrsd,
             waterfallsd,
+            registryd,
         }
     }
 }
@@ -215,6 +250,7 @@ pub struct TestEnv {
     bitcoind: Option<BitcoinD>,
     electrsd: Option<ElectrsD>,
     waterfallsd: Option<WaterfallsD>,
+    registryd: Option<RegistryD>,
 }
 
 impl TestEnv {
@@ -240,6 +276,13 @@ impl TestEnv {
             .unwrap()
             .waterfalls_url()
             .to_string()
+    }
+
+    pub fn registry_url(&self) -> String {
+        self.registryd
+            .as_ref()
+            .map(|r| r.url().to_string())
+            .unwrap_or_default()
     }
 
     // Functions for Elements RPC client
@@ -280,6 +323,11 @@ impl TestEnv {
 
     pub fn elementsd_generate(&self, blocks: u32) {
         Self::elementsd_generate_(&self.elementsd.client, blocks);
+
+        // After we generate blocks, trigger an electrs update
+        if let Some(electrsd) = &self.electrsd {
+            electrsd.trigger().unwrap();
+        }
     }
 
     fn elementsd_sweep_initialfreecoins_(client: &Client) {
@@ -352,6 +400,19 @@ impl TestEnv {
             .call("getblockchaininfo", &[])
             .unwrap();
         raw.get("blocks").unwrap().as_u64().unwrap()
+    }
+
+    /// Get the genesis block hash from the running elementsd node.
+    ///
+    /// Could differ from the hardcoded one because parameters like `-initialfreecoins`
+    /// change the genesis hash.
+    pub fn elementsd_genesis_block_hash(&self) -> BlockHash {
+        let raw: Value = self
+            .elementsd
+            .client
+            .call("getblockhash", &[0.into()])
+            .unwrap();
+        BlockHash::from_str(raw.as_str().unwrap()).unwrap()
     }
 
     pub fn elementsd_getpeginaddress(&self) -> (bitcoin::Address, String) {

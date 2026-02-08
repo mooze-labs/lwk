@@ -1,22 +1,33 @@
 use std::ops::ControlFlow;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use aes_gcm_siv::Aes256GcmSiv;
+use bip39::Mnemonic;
 use boltz_client::boltz::{
-    BoltzApiClientV2, ChainSwapStates, CreateChainRequest, Side, SwapStatus, Webhook,
+    BoltzApiClientV2, ChainSwapDetails, ChainSwapStates, CreateChainRequest, CreateChainResponse,
+    Side, SwapRestoreResponse, SwapRestoreType, SwapStatus, Webhook,
 };
 use boltz_client::fees::Fee;
 use boltz_client::network::Chain;
 use boltz_client::swaps::{ChainClient, SwapScript, SwapTransactionParams, TransactionOptions};
 use boltz_client::util::sleep;
 use boltz_client::PublicKey;
+use lwk_wollet::bitcoin::PublicKey as BitcoinPublicKey;
 use lwk_wollet::elements;
 use lwk_wollet::elements::bitcoin;
 
-use crate::chain_data::{to_chain_data, ChainSwapData, ChainSwapDataSerializable};
+use crate::chain_data::{chain_from_str, to_chain_data, ChainSwapData, ChainSwapDataSerializable};
 use crate::error::Error;
 use crate::swap_state::SwapStateTrait;
-use crate::{broadcast_tx_with_retry, mnemonic_identifier, next_status, WAIT_TIME};
+use crate::DynStore;
+use crate::SwapPersistence;
+use crate::LIQUID_UNCOOPERATIVE_EXTRA;
+use crate::{
+    broadcast_tx_with_retry, derive_keypair, mnemonic_identifier, next_status,
+    preimage_from_keypair, WAIT_TIME,
+};
 use crate::{BoltzSession, SwapState, SwapType};
 
 pub struct LockupResponse {
@@ -30,6 +41,26 @@ pub struct LockupResponse {
     chain_client: Arc<ChainClient>,
     polling: bool,
     timeout_advance: Duration,
+    store: Option<Arc<dyn DynStore>>,
+    cipher: Option<Aes256GcmSiv>,
+}
+
+impl SwapPersistence for LockupResponse {
+    fn serialize(&self) -> Result<String, Error> {
+        let s: ChainSwapDataSerializable = self.data.clone().into();
+        Ok(serde_json::to_string(&s)?)
+    }
+
+    fn swap_id(&self) -> &str {
+        &self.data.create_chain_response.id
+    }
+
+    fn store_and_cipher(&self) -> Option<(Arc<dyn DynStore>, Aes256GcmSiv)> {
+        match (self.store.as_ref(), self.cipher.as_ref()) {
+            (Some(store), Some(cipher)) => Some((Arc::clone(store), cipher.clone())),
+            _ => None,
+        }
+    }
 }
 
 impl BoltzSession {
@@ -132,13 +163,47 @@ impl BoltzSession {
 
         let lockup_address = create_chain_response.lockup_details.lockup_address.clone();
         let expected_lockup_amount = create_chain_response.lockup_details.amount;
-        let fee = amount.saturating_sub(expected_lockup_amount);
+        // Fee is what you lock up minus what you receive on the claim side
+        let fee = expected_lockup_amount.saturating_sub(create_chain_response.claim_details.amount);
 
-        Ok(LockupResponse {
+        let (boltz_fee, claim_fee) = {
+            let swap_info = self.swap_info.lock().await;
+            match (from, to) {
+                (Chain::Bitcoin(_), Chain::Liquid(_)) => {
+                    match swap_info.chain_pairs.get_btc_to_lbtc_pair() {
+                        Some(pair) => (
+                            Some(pair.fees.boltz(amount)),
+                            Some(pair.fees.claim_estimate()),
+                        ),
+                        None => (None, None),
+                    }
+                }
+                (Chain::Liquid(_), Chain::Bitcoin(_)) => {
+                    match swap_info.chain_pairs.get_lbtc_to_btc_pair() {
+                        Some(pair) => (
+                            Some(pair.fees.boltz(amount)),
+                            Some(pair.fees.claim_estimate()),
+                        ),
+                        None => (None, None),
+                    }
+                }
+                _ => (None, None),
+            }
+        };
+
+        let store = self.clone_store();
+        let cipher = if store.is_some() {
+            Some(self.clone_cipher())
+        } else {
+            None
+        };
+        let response = LockupResponse {
             data: ChainSwapData {
                 last_state,
                 swap_type: SwapType::Chain,
                 fee: Some(fee),
+                boltz_fee,
+                claim_fee,
                 create_chain_response,
                 claim_keys,
                 refund_keys,
@@ -161,7 +226,14 @@ impl BoltzSession {
             chain_client: self.chain_client.clone(),
             polling: self.polling,
             timeout_advance: self.timeout_advance,
-        })
+            store,
+            cipher,
+        };
+
+        // Persist swap data and add to pending list
+        response.persist_and_add_to_pending()?;
+
+        Ok(response)
     }
 
     pub async fn restore_lockup(
@@ -195,7 +267,13 @@ impl BoltzSession {
         let rx = self.ws.updates();
         self.ws.subscribe_swap(&swap_id).await?;
 
-        Ok(LockupResponse {
+        let store = self.clone_store();
+        let cipher = if store.is_some() {
+            Some(self.clone_cipher())
+        } else {
+            None
+        };
+        let response = LockupResponse {
             data,
             lockup_script,
             claim_script,
@@ -204,18 +282,223 @@ impl BoltzSession {
             chain_client: self.chain_client.clone(),
             polling: self.polling,
             timeout_advance: self.timeout_advance,
-        })
+            store,
+            cipher,
+        };
+
+        // If the swap was already in a terminal state, move it to completed
+        if response.data.last_state.is_terminal() {
+            response.move_to_completed()?;
+        }
+
+        Ok(response)
     }
+
+    /// From the swaps returned by the boltz api via [`BoltzSession::swap_restore`]:
+    ///
+    /// - filter the BTC to LBTC swaps that can be restored
+    /// - Add the private information from the session needed to restore the swap
+    ///
+    /// The claim and refund addresses don't need to be the same used when creating the swap.
+    pub async fn restorable_btc_to_lbtc_swaps(
+        &self,
+        swaps: &[SwapRestoreResponse],
+        claim_address: &elements::Address,
+        refund_address: &bitcoin::Address,
+    ) -> Result<Vec<ChainSwapData>, Error> {
+        let claim_address = claim_address.to_string();
+        let refund_address = refund_address.to_string();
+        swaps
+            .iter()
+            .filter(|e| matches!(e.swap_type, SwapRestoreType::Chain))
+            .filter(|e| e.to == "L-BTC" && e.from == "BTC")
+            .filter(|e| {
+                e.status != "swap.expired"
+                    && e.status != "transaction.claimed"
+                    && e.status != "swap.created"
+            })
+            .map(|e| {
+                convert_swap_restore_response_to_chain_swap_data(
+                    e,
+                    &self.mnemonic,
+                    &claim_address,
+                    &refund_address,
+                )
+            })
+            .collect()
+    }
+
+    /// From the swaps returned by the boltz api via [`BoltzSession::swap_restore`]:
+    ///
+    /// - filter the LBTC to BTC swaps that can be restored
+    /// - Add the private information from the session needed to restore the swap
+    ///
+    /// The claim and refund addresses don't need to be the same used when creating the swap.
+    pub async fn restorable_lbtc_to_btc_swaps(
+        &self,
+        swaps: &[SwapRestoreResponse],
+        claim_address: &bitcoin::Address,
+        refund_address: &elements::Address,
+    ) -> Result<Vec<ChainSwapData>, Error> {
+        let claim_address = claim_address.to_string();
+        let refund_address = refund_address.to_string();
+        swaps
+            .iter()
+            .filter(|e| matches!(e.swap_type, SwapRestoreType::Chain))
+            .filter(|e| e.to == "BTC" && e.from == "L-BTC")
+            .filter(|e| {
+                e.status != "swap.expired"
+                    && e.status != "transaction.claimed"
+                    && e.status != "swap.created"
+            })
+            .map(|e| {
+                convert_swap_restore_response_to_chain_swap_data(
+                    e,
+                    &self.mnemonic,
+                    &claim_address,
+                    &refund_address,
+                )
+            })
+            .collect()
+    }
+}
+
+/// Convert a swap restore response from Boltz API to a ChainSwapData.
+///
+/// Note: This function uses `&str` for addresses instead of typed `bitcoin::Address` or
+/// `elements::Address` because it handles both swap directions (BTC→LBTC and LBTC→BTC).
+/// The address types are swapped depending on the direction, so type safety is enforced
+/// at the public API level via `restorable_btc_to_lbtc_swaps` and `restorable_lbtc_to_btc_swaps`.
+pub(crate) fn convert_swap_restore_response_to_chain_swap_data(
+    e: &SwapRestoreResponse,
+    mnemonic: &Mnemonic,
+    claim_address: &str,
+    refund_address: &str,
+) -> Result<ChainSwapData, Error> {
+    // Only handle chain swaps
+    match e.swap_type {
+        SwapRestoreType::Chain => {}
+        _ => {
+            return Err(Error::SwapRestoration(format!(
+                "Only chain swaps are supported for restoration, got: {:?}",
+                e.swap_type
+            )))
+        }
+    }
+
+    // Extract claim details (required for chain swaps - this is boltz's lockup that we claim from)
+    let claim_details = e.claim_details.as_ref().ok_or_else(|| {
+        Error::SwapRestoration(format!("Chain swap {} is missing claim_details", e.id))
+    })?;
+
+    // Extract refund details (required for chain swaps - this is our lockup)
+    let refund_details = e.refund_details.as_ref().ok_or_else(|| {
+        Error::SwapRestoration(format!("Chain swap {} is missing refund_details", e.id))
+    })?;
+
+    // Derive the keypairs from the mnemonic at the key indices
+    let claim_keys = derive_keypair(claim_details.key_index, mnemonic)?;
+    let refund_keys = derive_keypair(refund_details.key_index, mnemonic)?;
+
+    // Derive preimage from claim keys (deterministic)
+    let preimage = preimage_from_keypair(&claim_keys);
+
+    // Parse chains from the response
+    let from_chain = chain_from_str(&e.from)?;
+    let to_chain = chain_from_str(&e.to)?;
+
+    // Parse server public keys
+    let claim_server_pubkey_bitcoin = BitcoinPublicKey::from_str(&claim_details.server_public_key)
+        .map_err(|err| {
+            Error::SwapRestoration(format!("Failed to parse claim server public key: {err}"))
+        })?;
+    let claim_server_pubkey = PublicKey {
+        inner: claim_server_pubkey_bitcoin.inner,
+        compressed: claim_server_pubkey_bitcoin.compressed,
+    };
+
+    let refund_server_pubkey_bitcoin =
+        BitcoinPublicKey::from_str(&refund_details.server_public_key).map_err(|err| {
+            Error::SwapRestoration(format!("Failed to parse refund server public key: {err}"))
+        })?;
+    let refund_server_pubkey = PublicKey {
+        inner: refund_server_pubkey_bitcoin.inner,
+        compressed: refund_server_pubkey_bitcoin.compressed,
+    };
+
+    // Convert ClaimDetails to ChainSwapDetails for claim side
+    let chain_claim_details = ChainSwapDetails {
+        swap_tree: claim_details.tree.clone(),
+        lockup_address: claim_details.lockup_address.clone(),
+        server_public_key: claim_server_pubkey,
+        timeout_block_height: claim_details.timeout_block_height,
+        amount: claim_details.amount.unwrap_or(0),
+        blinding_key: claim_details.blinding_key.clone(),
+        refund_address: None,
+        claim_address: None,
+        bip21: None,
+    };
+
+    // Convert RefundDetails to ChainSwapDetails for lockup side
+    // Note: RefundDetails doesn't have an amount field in the boltz_client type,
+    // so we use 0 as default (the actual amount was already sent to the lockup address)
+    let chain_lockup_details = ChainSwapDetails {
+        swap_tree: refund_details.tree.clone(),
+        lockup_address: refund_details.lockup_address.clone(),
+        server_public_key: refund_server_pubkey,
+        timeout_block_height: refund_details.timeout_block_height,
+        amount: 0, // Not available in RefundDetails type
+        blinding_key: refund_details.blinding_key.clone(),
+        refund_address: None,
+        claim_address: None,
+        bip21: None,
+    };
+
+    // Reconstruct CreateChainResponse
+    let create_chain_response = CreateChainResponse {
+        id: e.id.clone(),
+        claim_details: chain_claim_details,
+        lockup_details: chain_lockup_details,
+    };
+
+    let lockup_address = create_chain_response.lockup_details.lockup_address.clone();
+    let expected_lockup_amount = create_chain_response.lockup_details.amount;
+
+    // Parse the status to SwapState
+    let last_state = e.status.parse::<SwapState>().map_err(|err| {
+        Error::SwapRestoration(format!(
+            "Failed to parse status '{}' as SwapState: {}",
+            e.status, err
+        ))
+    })?;
+
+    Ok(ChainSwapData {
+        last_state,
+        swap_type: SwapType::Chain,
+        fee: None, // Fee information not available in restore response
+        boltz_fee: None,
+        claim_fee: None, // Not available in restore response, will use fallback fee rate
+        create_chain_response,
+        claim_keys,
+        refund_keys,
+        preimage,
+        lockup_address,
+        expected_lockup_amount,
+        claim_address: claim_address.to_string(),
+        refund_address: refund_address.to_string(),
+        claim_key_index: claim_details.key_index,
+        refund_key_index: refund_details.key_index,
+        mnemonic_identifier: mnemonic_identifier(mnemonic)?,
+        from_chain,
+        to_chain,
+        random_preimage: false, // when trying to restore from boltz only deterministic preimage are supported
+    })
 }
 
 impl LockupResponse {
     async fn next_status(&mut self) -> Result<SwapStatus, Error> {
-        let swap_id = self.swap_id();
+        let swap_id = self.swap_id().to_string();
         next_status(&mut self.rx, self.timeout_advance, &swap_id, self.polling).await
-    }
-
-    pub fn swap_id(&self) -> String {
-        self.data.create_chain_response.id.clone()
     }
 
     pub fn lockup_address(&self) -> &str {
@@ -232,6 +515,20 @@ impl LockupResponse {
 
     pub fn chain_to(&self) -> Chain {
         self.data.to_chain
+    }
+
+    /// The fee of the swap provider and the network fee
+    ///
+    /// It is equal to the amount requested minus the amount sent to the claim address.
+    pub fn fee(&self) -> Option<u64> {
+        self.data.fee
+    }
+
+    /// The fee of the swap provider
+    ///
+    /// It is equal to the swap amount multiplied by the boltz fee rate.
+    pub fn boltz_fee(&self) -> Option<u64> {
+        self.data.boltz_fee
     }
 
     pub async fn advance(&mut self) -> Result<ControlFlow<bool, SwapStatus>, Error> {
@@ -257,7 +554,58 @@ impl LockupResponse {
                     "Server lockup confirmed, claiming on {} chain",
                     self.chain_to()
                 );
-                sleep(WAIT_TIME).await; //TODO can we do better?
+
+                // Parse the server's lockup transaction from the status update if available.
+                // This avoids waiting for the transaction to propagate to the chain client's mempool,
+                // significantly improving claim speed.
+                let lockup_tx = if let Some(tx_info) = &update.transaction {
+                    match self.claim_script.parse_lockup_transaction(tx_info).await {
+                        Ok(tx) => {
+                            log::debug!("Parsed server lockup tx from status update");
+                            Some(tx)
+                        }
+                        Err(e) => {
+                            log::warn!("Failed to parse server lockup tx from status update: {e}, will fetch from chain client");
+                            None
+                        }
+                    }
+                } else {
+                    log::debug!(
+                        "No transaction info in status update, will fetch from chain client"
+                    );
+                    None
+                };
+
+                // If we don't have the lockup tx, fall back to waiting for propagation
+                if lockup_tx.is_none() {
+                    sleep(WAIT_TIME).await;
+                }
+
+                // Build options with lockup_tx if available for faster claiming
+                let options = match lockup_tx {
+                    Some(tx) => TransactionOptions::default()
+                        .with_chain_claim(self.data.refund_keys, self.lockup_script.clone())
+                        .with_lockup_tx(tx),
+                    None => TransactionOptions::default()
+                        .with_chain_claim(self.data.refund_keys, self.lockup_script.clone()),
+                };
+
+                // Use the claim fee from Boltz API to match the quoted amount exactly.
+                // For Liquid claims (BTC→L-BTC), add LIQUID_UNCOOPERATIVE_EXTRA as buffer.
+                // Fall back to Fee::Relative if claim_fee is not available (e.g., restored swaps).
+                let fee = match self.data.claim_fee {
+                    Some(claim_fee) => {
+                        // Add extra for Liquid claims only (to_chain is Liquid)
+                        let extra = if matches!(self.data.to_chain, Chain::Liquid(_)) {
+                            LIQUID_UNCOOPERATIVE_EXTRA
+                        } else {
+                            0
+                        };
+                        Fee::Absolute(claim_fee + extra)
+                    }
+                    None => Fee::Relative(1.0),
+                };
+
                 let tx = self
                     .claim_script
                     .construct_claim(
@@ -265,14 +613,11 @@ impl LockupResponse {
                         SwapTransactionParams {
                             keys: self.data.claim_keys,
                             output_address: self.data.claim_address.clone(),
-                            fee: Fee::Relative(1.0),
-                            swap_id: self.swap_id(),
+                            fee,
+                            swap_id: self.swap_id().to_string(),
                             chain_client: &self.chain_client,
                             boltz_client: &self.api,
-                            options: Some(TransactionOptions::default().with_chain_claim(
-                                self.data.refund_keys,
-                                self.lockup_script.clone(),
-                            )),
+                            options: Some(options),
                         },
                     )
                     .await?;
@@ -293,7 +638,7 @@ impl LockupResponse {
                         keys: self.data.refund_keys,
                         output_address: self.data.refund_address.clone(),
                         fee: Fee::Relative(1.0),
-                        swap_id: self.swap_id(),
+                        swap_id: self.swap_id().to_string(),
                         chain_client: &self.chain_client,
                         boltz_client: &self.api,
                         options: None,
@@ -309,25 +654,35 @@ impl LockupResponse {
                 Ok(ControlFlow::Break(false))
             }
             ref e => Err(Error::UnexpectedUpdate {
-                swap_id: self.swap_id(),
+                swap_id: self.swap_id().to_string(),
                 status: e.to_string(),
                 last_state: self.data.last_state,
             }),
         };
 
-        if let Ok(ControlFlow::Break(_)) = flow.as_ref() {
+        let is_completed = matches!(flow.as_ref(), Ok(ControlFlow::Break(_)));
+
+        if is_completed {
             // if the swap is terminated, but the caller call advance() again we don't
             // want to error for timeout (it will trigger NoBoltzUpdate)
             self.polling = true;
         }
 
         self.data.last_state = update_status;
-        flow
-    }
 
-    pub fn serialize(&self) -> Result<String, Error> {
-        let s: ChainSwapDataSerializable = self.data.clone().into();
-        Ok(serde_json::to_string(&s)?)
+        // Persist state changes
+        if flow.is_ok() {
+            if is_completed {
+                // Final persist and move to completed list
+                self.persist()?;
+                self.move_to_completed()?;
+            } else {
+                // Persist intermediate state
+                self.persist()?;
+            }
+        }
+
+        flow
     }
 
     pub async fn complete(mut self) -> Result<bool, Error> {

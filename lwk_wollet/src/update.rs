@@ -6,9 +6,6 @@ use crate::error::Error;
 use crate::wollet::WolletState;
 use crate::EC;
 use crate::{BlindingPublicKey, Wollet, WolletDescriptor};
-#[allow(deprecated)]
-use aes_gcm_siv::aead::generic_array::GenericArray;
-use aes_gcm_siv::aead::AeadMutInPlace;
 use base64::prelude::*;
 use elements::bitcoin::bip32::ChildNumber;
 use elements::bitcoin::hashes::Hash;
@@ -17,7 +14,7 @@ use elements::encode::{Decodable, Encodable};
 use elements::hash_types::TxMerkleNode;
 use elements::{BlockExtData, BlockHash, BlockHeader, TxInWitness, TxOutWitness};
 use lwk_common::SignedBalance;
-use rand::{thread_rng, Rng};
+use lwk_common::{decrypt_with_nonce_prefix, encrypt_with_random_nonce};
 use std::collections::HashMap;
 use std::sync::atomic;
 
@@ -96,8 +93,39 @@ impl Update {
     }
 
     /// Prune the update, removing unneeded data from transactions.
+    ///
+    /// Note: this function removes less data than
+    /// [`Update::prune_witnesses()`] since it keeps the rangeproofs
+    /// of the outputs the [`Wollet`] owns.
     pub fn prune(&mut self, wallet: &Wollet) {
         self.new_txs.prune(&wallet.cache.paths);
+    }
+
+    /// Prune witnesses from transactions
+    ///
+    /// Remove all input and output witnesses from transcations downloaded in
+    /// this update. This reduces memory and storage usage significantly.
+    ///
+    /// However pruning witnesses has effects on functions that use those
+    /// rangeproofs (which are part of output witness):
+    /// * When building transactions, it's possible to ask for the addition of
+    ///   input rangeproofs, using [`crate::TxBuilder::add_input_rangeproofs()`]
+    ///   or [`crate::WolletTxBuilder::add_input_rangeproofs()`]; however if the
+    ///   rangeproofs have been removed, they cannot be added to the created
+    ///   PSET.
+    /// * [`Wollet::unblind_utxos_with()`] cannot unblind utxos without
+    ///   witnesses.
+    /// * [`Wollet::reunblind()`] cannot unblind transactions without
+    ///   witnesses.
+    pub fn prune_witnesses(&mut self) {
+        for (_, tx) in self.new_txs.txs.iter_mut() {
+            for input in tx.input.iter_mut() {
+                input.witness = TxInWitness::empty();
+            }
+            for output in tx.output.iter_mut() {
+                output.witness = TxOutWitness::empty();
+            }
+        }
     }
 
     /// Serialize an [`Update`] to a byte array
@@ -115,20 +143,10 @@ impl Update {
     /// Serialize an update to a byte array, encrypted with a key derived from the descriptor. Decrypt using [`Self::deserialize_decrypted()`]
     #[allow(deprecated)]
     pub fn serialize_encrypted(&self, desc: &WolletDescriptor) -> Result<Vec<u8>, Error> {
-        let mut plaintext = self.serialize()?;
-
-        let mut nonce_bytes = [0u8; 12];
-        thread_rng().fill(&mut nonce_bytes);
-        let nonce = GenericArray::from_slice(&nonce_bytes);
-
-        desc.cipher().encrypt_in_place(nonce, b"", &mut plaintext)?;
-        let ciphertext = plaintext;
-
-        let mut result = Vec::with_capacity(ciphertext.len() + 12);
-        result.extend(nonce.as_slice());
-        result.extend(&ciphertext);
-
-        Ok(result)
+        let plaintext = self.serialize()?;
+        let mut cipher = desc.cipher();
+        let ciphertext = encrypt_with_random_nonce(&mut cipher, &plaintext)?;
+        Ok(ciphertext)
     }
 
     /// Serialize an update to a base64 encoded string, encrypted with a key derived from the descriptor. Decrypt using [`Self::deserialize_decrypted_base64()`]
@@ -140,17 +158,8 @@ impl Update {
     /// Deserialize an update from a byte array, decrypted with a key derived from the descriptor. Create the byte array using [`Self::serialize_encrypted()`]
     #[allow(deprecated)]
     pub fn deserialize_decrypted(bytes: &[u8], desc: &WolletDescriptor) -> Result<Update, Error> {
-        let nonce_bytes = &bytes
-            .get(..12)
-            .ok_or_else(|| Error::Generic("Missing nonce in encrypted bytes".to_string()))?;
-        let mut ciphertext = bytes[12..].to_vec();
-
-        let nonce = GenericArray::from_slice(nonce_bytes);
-
-        desc.cipher()
-            .decrypt_in_place(nonce, b"", &mut ciphertext)?;
-        let plaintext = ciphertext;
-
+        let mut cipher = desc.cipher();
+        let plaintext = decrypt_with_nonce_prefix(&mut cipher, bytes)?;
         Ok(Update::deserialize(&plaintext)?)
     }
 
@@ -377,6 +386,7 @@ impl Wollet {
     }
 }
 
+#[allow(clippy::type_complexity)]
 fn compute_blinding_pubkey_if_missing(
     scripts_with_blinding_pubkey: Vec<(
         Chain,
@@ -385,22 +395,29 @@ fn compute_blinding_pubkey_if_missing(
         Option<elements::secp256k1_zkp::PublicKey>,
     )>,
     wollet_descriptor: WolletDescriptor,
-) -> Result<Vec<(Chain, ChildNumber, Script, BlindingPublicKey)>, Error> {
+) -> Result<Vec<(Chain, ChildNumber, Script, Option<BlindingPublicKey>)>, Error> {
     let mut result = Vec::with_capacity(scripts_with_blinding_pubkey.len());
 
     for (chain, child_number, script_pubkey, maybe_blinding_pubkey) in scripts_with_blinding_pubkey
     {
         let blinding_pubkey = match maybe_blinding_pubkey {
-            Some(pubkey) => pubkey,
+            Some(pubkey) => Some(pubkey),
             None => {
-                let desc = wollet_descriptor.ct_definite_descriptor(chain, child_number.into())?;
-                // TODO: derive the blinding pubkey from the descriptor blinding key and scriptpubkey
-                //       (needs function in elements-miniscript)
+                match wollet_descriptor.ct_definite_descriptor(chain, child_number.into()) {
+                    Ok(desc) => {
+                        // TODO: derive the blinding pubkey from the descriptor blinding key and scriptpubkey
+                        //       (needs function in elements-miniscript)
 
-                let address = desc.address(&EC, &elements::AddressParams::ELEMENTS)?; // we don't need the address, we need only the blinding pubkey, thus we can use any params
-                address
-                    .blinding_pubkey
-                    .expect("blinding pubkey is present when using ct descriptors")
+                        let address = desc.address(&EC, &elements::AddressParams::ELEMENTS)?; // we don't need the address, we need only the blinding pubkey, thus we can use any params
+                        Some(
+                            address
+                                .blinding_pubkey
+                                .expect("blinding pubkey is present when using ct descriptors"),
+                        )
+                    }
+                    Err(Error::UnsupportedWithoutDescriptor) => None,
+                    Err(e) => return Err(e),
+                }
             }
         };
         result.push((chain, child_number, script_pubkey, blinding_pubkey));
@@ -567,9 +584,7 @@ impl Encodable for Update {
                         bytes_written += blinding_pubkey.serialize().consensus_encode(&mut w)?
                     }
                     None => {
-                        return Err(elements::encode::Error::ParseFailed(
-                            "Version 2 update with missing blinding pubkey",
-                        ))
+                        bytes_written += [0u8; 33].consensus_encode(&mut w)?;
                     }
                 }
             }
@@ -645,7 +660,12 @@ impl Decodable for Update {
                 };
                 let child_number: ChildNumber = u32::consensus_decode(&mut d)?.into();
                 let blinding_pubkey = if version == 2 {
-                    Some(BlindingPublicKey::consensus_decode(&mut d)?)
+                    let bytes: [u8; 33] = Decodable::consensus_decode(&mut d)?;
+                    if bytes == [0u8; 33] {
+                        None
+                    } else {
+                        Some(BlindingPublicKey::from_slice(&bytes)?)
+                    }
                 } else {
                     None
                 };

@@ -33,6 +33,12 @@ pub enum Error {
     #[error(transparent)]
     PsetParse(#[from] lwk_wollet::elements::pset::ParseError),
 
+    #[error("{0:?}")]
+    PsetBlind(#[from] lwk_wollet::elements::pset::PsetBlindError),
+
+    #[error("{0:?}")]
+    PsetFinalize(#[from] lwk_wollet::elements_miniscript::psbt::Error),
+
     #[error(transparent)]
     ParseOutPoint(#[from] lwk_wollet::elements::bitcoin::transaction::ParseOutPointError),
 
@@ -66,8 +72,34 @@ pub enum Error {
     #[error(transparent)]
     Prices(#[from] lwk_wollet::prices::Error),
 
+    #[error(transparent)]
+    Secp256k1(#[from] lwk_wollet::elements::bitcoin::secp256k1::Error),
+
+    #[error(transparent)]
+    KeyFromSlice(#[from] lwk_wollet::elements::bitcoin::key::FromSliceError),
+
+    #[error(transparent)]
+    FromWif(#[from] lwk_wollet::elements::bitcoin::key::FromWifError),
+
+    #[error(transparent)]
+    Secp256k1Zkp(#[from] lwk_wollet::elements::secp256k1_zkp::Error),
+
+    #[error(transparent)]
+    Taproot(#[from] lwk_wollet::elements::bitcoin::taproot::TaprootError),
+
+    #[error("{0:?}")]
+    Unblind(#[from] lwk_wollet::elements::UnblindError),
+
     #[error("{0}")]
     Generic(String),
+
+    #[cfg(feature = "simplicity")]
+    #[error(transparent)]
+    SimplicityProgram(#[from] lwk_simplicity::error::ProgramError),
+
+    #[cfg(feature = "simplicity")]
+    #[error("{0}")]
+    SimplicityHlRich(String),
 
     #[error("{0:?}")]
     JsVal(JsValue),
@@ -79,6 +111,7 @@ impl Error {
         match self {
             Error::JsVal(_) => "JsVal",
             Error::Boltz(inner) => match inner {
+                lwk_boltz::Error::Encryption(_) => "Boltz::Encryption",
                 lwk_boltz::Error::MagicRoutingHint { .. } => "Boltz::MagicRoutingHint",
                 lwk_boltz::Error::InvalidElectrumUrl(_) => "Boltz::InvalidElectrumUrl",
                 lwk_boltz::Error::InvalidSwapState(_) => "Boltz::InvalidSwapState",
@@ -105,10 +138,20 @@ impl Error {
                 lwk_boltz::Error::SwapRestoration(_) => "Boltz::SwapRestoration",
                 lwk_boltz::Error::RetryBroadcastFailed => "Boltz::RetryBroadcastFailed",
                 lwk_boltz::Error::Bolt12Unsupported => "Boltz::Bolt12Unsupported",
+                lwk_boltz::Error::LnUrlUnsupported => "Boltz::LnUrlUnsupported",
                 lwk_boltz::Error::MnemonicIdentifierMismatch(_, _) => {
                     "Boltz::MnemonicIdentifierMismatch"
                 }
                 lwk_boltz::Error::NoBoltzUpdate => "Boltz::NoBoltzUpdate",
+                lwk_boltz::Error::FailBuildingRefundTransaction => {
+                    "Boltz::FailBuildingRefundTransaction"
+                }
+                lwk_boltz::Error::InvalidSwapPair { .. } => "Boltz::InvalidSwapPair",
+                lwk_boltz::Error::MissingQuoteParam(_) => "Boltz::MissingQuoteParam",
+                lwk_boltz::Error::PairNotAvailable => "Boltz::PairNotAvailable",
+                lwk_boltz::Error::LockPoisoned(_) => "Boltz::LockPoisoned",
+                lwk_boltz::Error::Store(_) => "Boltz::Store",
+                lwk_boltz::Error::StoreNotConfigured => "Boltz::StoreNotConfigured",
             },
             Error::HexToArray(_) => "HexToArray",
             Error::Wollet(_) => "Wollet",
@@ -119,6 +162,8 @@ impl Error {
             Error::HexToBytes(_) => "HexToBytes",
             Error::Pset(_) => "Pset",
             Error::PsetParse(_) => "PsetParse",
+            Error::PsetBlind(_) => "PsetBlind",
+            Error::PsetFinalize(_) => "PsetFinalize",
             Error::ParseOutPoint(_) => "ParseOutPoint",
             Error::Bip39(_) => "Bip39",
             Error::Bip32(_) => "Bip32",
@@ -137,7 +182,17 @@ impl Error {
                 lwk_wollet::prices::Error::NotEnoughSources(_) => "Prices::NotEnoughSources",
                 lwk_wollet::prices::Error::Http(_) => "Prices::Http",
             },
+            Error::Secp256k1(_) => "Secp256k1",
+            Error::KeyFromSlice(_) => "KeyFromSlice",
+            Error::FromWif(_) => "FromWif",
+            Error::Secp256k1Zkp(_) => "Secp256k1Zkp",
+            Error::Taproot(_) => "Taproot",
+            Error::Unblind(_) => "Unblind",
             Error::Generic(_) => "Generic",
+            #[cfg(feature = "simplicity")]
+            Error::SimplicityProgram(_) => "SimplicityProgram",
+            #[cfg(feature = "simplicity")]
+            Error::SimplicityHlRich(_) => "SimplicityRich",
         }
     }
 }
@@ -213,5 +268,12 @@ impl TryFrom<lwk_boltz::Error> for MagicRoutingHint {
             }),
             _ => Err(()),
         }
+    }
+}
+
+#[cfg(feature = "simplicity")]
+impl From<lwk_simplicity::simplicityhl::error::RichError> for Error {
+    fn from(value: lwk_simplicity::simplicityhl::error::RichError) -> Self {
+        Error::SimplicityHlRich(format!("{value}"))
     }
 }

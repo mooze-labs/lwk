@@ -20,9 +20,10 @@ mod tests {
     use boltz_client::Keypair;
     use boltz_client::PublicKey;
     use boltz_client::Secp256k1;
+    use lwk_boltz::SwapPersistence;
     use lwk_boltz::{
         clients::{AnyClient, ElectrumClient},
-        BoltzSession,
+        BoltzSession, SwapAsset, LIQUID_UNCOOPERATIVE_EXTRA,
     };
     use lwk_wollet::bitcoin;
     use lwk_wollet::elements;
@@ -343,6 +344,114 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires regtest environment"]
+    async fn test_session_restore_chain_swaps_from_swap_list() {
+        let _ = env_logger::try_init();
+
+        // Start concurrent block mining task
+        let mining_handle = crate::utils::start_block_mining();
+
+        let network = ElementsNetwork::default_regtest();
+        let client =
+            Arc::new(ElectrumClient::new(DEFAULT_REGTEST_NODE, false, false, network).unwrap());
+
+        let mnemonic = Mnemonic::from_str(
+            "damp cart merit asset obvious idea chef traffic absent armed road link",
+        )
+        .unwrap();
+
+        let session = BoltzSession::builder(network, AnyClient::Electrum(client.clone()))
+            .create_swap_timeout(TIMEOUT)
+            .mnemonic(mnemonic.clone())
+            .build()
+            .await
+            .unwrap();
+
+        // Test BTC to LBTC swap with restore from swap list
+        let refund_address_str = crate::utils::generate_address(BTC_CHAIN.into())
+            .await
+            .unwrap();
+        let claim_address_str = crate::utils::generate_address(LBTC_CHAIN.into())
+            .await
+            .unwrap();
+        let refund_address = bitcoin::Address::from_str(&refund_address_str)
+            .unwrap()
+            .assume_checked();
+        let claim_address = elements::Address::from_str(&claim_address_str).unwrap();
+
+        let response = session
+            .btc_to_lbtc(50_000, &refund_address, &claim_address, None)
+            .await
+            .unwrap();
+
+        let swap_list = session.swap_restore().await.unwrap();
+        let restorable = session
+            .restorable_btc_to_lbtc_swaps(&swap_list, &claim_address, &refund_address)
+            .await
+            .unwrap();
+        let swaps: Vec<_> = restorable
+            .iter()
+            .filter(|data| data.create_chain_response.id == response.swap_id())
+            .collect();
+        log::info!("Found {swaps:?} restorable chain swaps");
+        assert_eq!(swaps.len(), 0); // the just created swap is not restorable.
+
+        let swap_id = response.swap_id().to_string();
+        let lockup_address = response.lockup_address().to_string();
+        let expected_amount = response.expected_amount();
+
+        utils::send_to_address(BTC_CHAIN.into(), &lockup_address, expected_amount)
+            .await
+            .unwrap();
+        utils::mine_blocks(1).await.unwrap();
+
+        // Drop the response and session (simulating app crash/restart without serializing)
+        drop(response);
+        drop(session);
+
+        // Create a new session with the same mnemonic
+        let session = BoltzSession::builder(network, AnyClient::Electrum(client.clone()))
+            .create_swap_timeout(TIMEOUT)
+            .mnemonic(mnemonic)
+            .build()
+            .await
+            .unwrap();
+
+        // Get all swaps from Boltz API
+        let swap_list = session.swap_restore().await.unwrap();
+        log::info!("Found {} swaps in swap_restore", swap_list.len());
+
+        // Filter to get restorable chain swaps
+        let restorable = session
+            .restorable_btc_to_lbtc_swaps(&swap_list, &claim_address, &refund_address)
+            .await
+            .unwrap();
+        log::info!("Found {} restorable chain swaps", restorable.len());
+
+        // Find our swap in the restorable list
+        let our_swap: lwk_boltz::ChainSwapDataSerializable = restorable
+            .into_iter()
+            .map(|data| data.into())
+            .find(|data: &lwk_boltz::ChainSwapDataSerializable| {
+                data.create_chain_response.id == *swap_id
+            })
+            .expect("Our swap should be in the restorable list");
+
+        // Restore and complete the swap
+        let response = session.restore_lockup(our_swap).await.unwrap();
+
+        let success = response.complete().await.unwrap();
+        assert!(
+            success,
+            "Restored BTC to LBTC swap from swap list should succeed"
+        );
+        log::info!("Chain swap completed successfully");
+
+        // Stop the mining task
+        mining_handle.abort();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires regtest environment"]
     async fn test_session_restore_chain_swaps_with_random_preimages() {
         let _ = env_logger::try_init();
 
@@ -430,6 +539,171 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires regtest environment"]
+    async fn test_session_restore_chain_swaps_with_store() {
+        let _ = env_logger::try_init();
+
+        // Start concurrent block mining task
+        let mining_handle = crate::utils::start_block_mining();
+
+        let network = ElementsNetwork::default_regtest();
+        let client =
+            Arc::new(ElectrumClient::new(DEFAULT_REGTEST_NODE, false, false, network).unwrap());
+
+        let mnemonic = Mnemonic::from_str(
+            "damp cart merit asset obvious idea chef traffic absent armed road link",
+        )
+        .unwrap();
+
+        // Create a shared store that persists across sessions
+        let store = Arc::new(lwk_common::MemoryStore::new());
+
+        let session = BoltzSession::builder(network, AnyClient::Electrum(client.clone()))
+            .create_swap_timeout(TIMEOUT)
+            .mnemonic(mnemonic.clone())
+            .store(store.clone())
+            .build()
+            .await
+            .unwrap();
+
+        // Initially no pending swaps
+        let pending = session.pending_swap_ids().unwrap();
+        assert!(pending.is_empty(), "Should start with no pending swaps");
+
+        // Create a second session with a DIFFERENT mnemonic but the SAME store
+        // This tests that encrypted keys don't collide between sessions
+        let mnemonic2 = Mnemonic::from_str(
+            "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+        )
+        .unwrap();
+        let session2 = BoltzSession::builder(network, AnyClient::Electrum(client.clone()))
+            .create_swap_timeout(TIMEOUT)
+            .mnemonic(mnemonic2.clone())
+            .store(store.clone())
+            .build()
+            .await
+            .unwrap();
+
+        // Session 2 should also see no pending swaps (different mnemonic = different encrypted keys)
+        let pending2 = session2.pending_swap_ids().unwrap();
+        assert!(
+            pending2.is_empty(),
+            "Session 2 should start with no pending swaps"
+        );
+
+        // Test BTC to LBTC swap with store-based persistence
+        let refund_address_str = crate::utils::generate_address(BTC_CHAIN.into())
+            .await
+            .unwrap();
+        let claim_address_str = crate::utils::generate_address(LBTC_CHAIN.into())
+            .await
+            .unwrap();
+        let refund_address = bitcoin::Address::from_str(&refund_address_str)
+            .unwrap()
+            .assume_checked();
+        let claim_address = elements::Address::from_str(&claim_address_str).unwrap();
+
+        let response = session
+            .btc_to_lbtc(50_000, &refund_address, &claim_address, None)
+            .await
+            .unwrap();
+
+        let swap_id = response.swap_id().to_string();
+        let lockup_address = response.lockup_address().to_string();
+        let expected_amount = response.expected_amount();
+
+        // Verify swap is in pending list
+        let pending = session.pending_swap_ids().unwrap();
+        assert!(
+            pending.contains(&swap_id),
+            "Swap should be in pending list after creation"
+        );
+
+        // Verify swap data is stored
+        let swap_data = session.get_swap_data(&swap_id).unwrap();
+        assert!(swap_data.is_some(), "Swap data should be stored");
+
+        // IMPORTANT: Verify session2 cannot see session1's swap (key isolation test)
+        let pending2 = session2.pending_swap_ids().unwrap();
+        assert!(!pending2.contains(&swap_id));
+        assert!(session2.get_swap_data(&swap_id).unwrap().is_none());
+
+        // Drop the sessions and response
+        drop(response);
+        drop(session);
+        drop(session2);
+
+        // Create a new session with the same store
+        let session = BoltzSession::builder(network, AnyClient::Electrum(client.clone()))
+            .create_swap_timeout(TIMEOUT)
+            .mnemonic(mnemonic)
+            .store(store.clone())
+            .build()
+            .await
+            .unwrap();
+
+        // Verify swap is still in pending list
+        let pending = session.pending_swap_ids().unwrap();
+        assert!(
+            pending.contains(&swap_id),
+            "Swap should still be in pending list after session restart"
+        );
+
+        // Restore the swap from store data
+        let swap_data_json = session.get_swap_data(&swap_id).unwrap().unwrap();
+        let data = lwk_boltz::ChainSwapDataSerializable::deserialize(&swap_data_json).unwrap();
+        let response = session.restore_lockup(data).await.unwrap();
+
+        log::info!(
+            "Restored BTC to LBTC swap with store - Lockup address: {}",
+            response.lockup_address()
+        );
+
+        // Send funds and complete the swap
+        crate::utils::send_to_address(BTC_CHAIN.into(), &lockup_address, expected_amount)
+            .await
+            .unwrap();
+
+        let success = response.complete().await.unwrap();
+        assert!(
+            success,
+            "Restored BTC to LBTC swap with store should succeed"
+        );
+
+        // Verify swap moved from pending to completed
+        let pending = session.pending_swap_ids().unwrap();
+        let completed = session.completed_swap_ids().unwrap();
+        assert!(
+            !pending.contains(&swap_id),
+            "Swap should not be in pending list after completion"
+        );
+        assert!(
+            completed.contains(&swap_id),
+            "Swap should be in completed list after completion"
+        );
+
+        // Test remove_swap
+        session.remove_swap(&swap_id).unwrap();
+        let pending = session.pending_swap_ids().unwrap();
+        let completed = session.completed_swap_ids().unwrap();
+        assert!(
+            !pending.contains(&swap_id),
+            "Swap should be removed from pending"
+        );
+        assert!(
+            !completed.contains(&swap_id),
+            "Swap should be removed from completed"
+        );
+        assert!(
+            session.get_swap_data(&swap_id).unwrap().is_none(),
+            "Swap data should be removed"
+        );
+
+        // Stop the mining task
+        mining_handle.abort();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires regtest environment"]
     async fn test_session_onchain() {
         let _ = env_logger::try_init();
 
@@ -446,7 +720,25 @@ mod tests {
             .await
             .unwrap();
 
-        // Test BTC to LBTC swap
+        // Test BTC to LBTC swap with quote verification
+        let send_amount = 50_000u64;
+
+        // Get quote before creating the swap
+        let quote = session
+            .quote(send_amount)
+            .await
+            .send(SwapAsset::Onchain)
+            .receive(SwapAsset::Liquid)
+            .build()
+            .unwrap();
+        log::info!(
+            "BTC->LBTC Quote: send={}, receive={}, network_fee={}, boltz_fee={}",
+            quote.send_amount,
+            quote.receive_amount,
+            quote.network_fee,
+            quote.boltz_fee
+        );
+
         let refund_address_str = crate::utils::generate_address(BTC_CHAIN.into())
             .await
             .unwrap();
@@ -458,9 +750,38 @@ mod tests {
             .assume_checked();
         let claim_address = elements::Address::from_str(&claim_address_str).unwrap();
         let response = session
-            .btc_to_lbtc(50_000, &refund_address, &claim_address, None)
+            .btc_to_lbtc(send_amount, &refund_address, &claim_address, None)
             .await
             .unwrap();
+
+        // Verify quote matches swap response
+        // For chain swaps: user sends lockup_amount, receives claim_details.amount - claim_fee
+        let claim_fee = response.data.claim_fee.expect("claim_fee should be set");
+        let claim_amount = response.data.create_chain_response.claim_details.amount;
+        // For BTC→L-BTC, claim is on Liquid so we add LIQUID_UNCOOPERATIVE_EXTRA
+        let expected_receive = claim_amount - claim_fee - LIQUID_UNCOOPERATIVE_EXTRA;
+        assert_eq!(
+            expected_receive, quote.receive_amount,
+            "Quote receive_amount ({}) should match claim_amount ({}) - claim_fee ({}) - extra (3) = {}",
+            quote.receive_amount, claim_amount, claim_fee, expected_receive
+        );
+        log::info!(
+            "BTC->LBTC Quote verification passed: claim_amount={claim_amount}, claim_fee={claim_fee}, expected_receive={expected_receive}",
+        );
+
+        // Assert fees are present and reasonable
+        let fee = response.fee().expect("fee should be present");
+        let boltz_fee = response.boltz_fee().expect("boltz_fee should be present");
+        log::info!("BTC to LBTC swap - fee: {fee}, boltz_fee: {boltz_fee}");
+        assert!(fee > 0, "fee should be greater than 0");
+        assert!(boltz_fee > 0, "boltz_fee should be greater than 0");
+        assert!(fee > boltz_fee, "fee should be greater than boltz_fee");
+        // Boltz fee is typically a percentage of the amount (e.g., 0.1-0.5%)
+        // For 50,000 sats, expect boltz_fee to be roughly 50-250 sats
+        assert!(
+            boltz_fee < 500,
+            "boltz_fee should be less than 1% of amount"
+        );
 
         log::info!(
             "BTC to LBTC swap - Lockup address: {}",
@@ -476,7 +797,38 @@ mod tests {
         let success = response.complete().await.unwrap();
         assert!(success, "BTC to LBTC swap should succeed");
 
-        // Test LBTC to BTC swap
+        // Verify actual received balance matches quote
+        let actual_balance =
+            crate::utils::get_address_balance(LBTC_CHAIN.into(), &claim_address_str)
+                .await
+                .expect("Failed to get address balance");
+        assert_eq!(
+            actual_balance, quote.receive_amount,
+            "BTC->LBTC: Actual received balance ({}) should match quote.receive_amount ({})",
+            actual_balance, quote.receive_amount
+        );
+        log::info!(
+            "BTC->LBTC Balance verification passed: actual_balance={}, quote.receive_amount={}",
+            actual_balance,
+            quote.receive_amount
+        );
+
+        // Test LBTC to BTC swap with quote verification
+        let quote = session
+            .quote(send_amount)
+            .await
+            .send(SwapAsset::Liquid)
+            .receive(SwapAsset::Onchain)
+            .build()
+            .unwrap();
+        log::info!(
+            "LBTC->BTC Quote: send={}, receive={}, network_fee={}, boltz_fee={}",
+            quote.send_amount,
+            quote.receive_amount,
+            quote.network_fee,
+            quote.boltz_fee
+        );
+
         let refund_address_str = crate::utils::generate_address(LBTC_CHAIN.into())
             .await
             .unwrap();
@@ -488,9 +840,37 @@ mod tests {
             .unwrap()
             .assume_checked();
         let response = session
-            .lbtc_to_btc(50_000, &refund_address, &claim_address, None)
+            .lbtc_to_btc(send_amount, &refund_address, &claim_address, None)
             .await
             .unwrap();
+
+        // Verify quote matches swap response
+        // For LBTC→BTC, claim is on Bitcoin so NO LIQUID_UNCOOPERATIVE_EXTRA
+        let claim_fee = response.data.claim_fee.expect("claim_fee should be set");
+        let claim_amount = response.data.create_chain_response.claim_details.amount;
+        let expected_receive = claim_amount - claim_fee;
+        assert_eq!(
+            expected_receive, quote.receive_amount,
+            "Quote receive_amount ({}) should match claim_amount ({}) - claim_fee ({}) = {}",
+            quote.receive_amount, claim_amount, claim_fee, expected_receive
+        );
+        log::info!(
+            "LBTC->BTC Quote verification passed: claim_amount={claim_amount}, claim_fee={claim_fee}, expected_receive={expected_receive}",
+        );
+
+        // Assert fees are present and reasonable
+        let fee = response.fee().expect("fee should be present");
+        let boltz_fee = response.boltz_fee().expect("boltz_fee should be present");
+        log::info!("LBTC to BTC swap - fee: {fee}, boltz_fee: {boltz_fee}");
+        assert!(fee > 0, "fee should be greater than 0");
+        assert!(boltz_fee > 0, "boltz_fee should be greater than 0");
+        assert!(fee > boltz_fee, "fee should be greater than boltz_fee");
+        // Boltz fee is typically a percentage of the amount (e.g., 0.1-0.5%)
+        // For 50,000 sats, expect boltz_fee to be roughly 50-250 sats
+        assert!(
+            boltz_fee < 500,
+            "boltz_fee should be less than 1% of amount"
+        );
 
         log::info!(
             "LBTC to BTC swap - Lockup address: {}",
@@ -505,6 +885,22 @@ mod tests {
         .unwrap();
         let success = response.complete().await.unwrap();
         assert!(success, "LBTC to BTC swap should succeed");
+
+        // Verify actual received balance matches quote
+        let actual_balance =
+            crate::utils::get_address_balance(BTC_CHAIN.into(), &claim_address_str)
+                .await
+                .expect("Failed to get address balance");
+        assert_eq!(
+            actual_balance, quote.receive_amount,
+            "LBTC->BTC: Actual received balance ({}) should match quote.receive_amount ({})",
+            actual_balance, quote.receive_amount
+        );
+        log::info!(
+            "LBTC->BTC Balance verification passed: actual_balance={}, quote.receive_amount={}",
+            actual_balance,
+            quote.receive_amount
+        );
 
         // Test LBTC to BTC swap using advance()
         let refund_address_str = crate::utils::generate_address(LBTC_CHAIN.into())

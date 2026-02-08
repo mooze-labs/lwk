@@ -1,7 +1,12 @@
 //! Liquid address
 
-use crate::{LwkError, Script};
-use std::{fmt::Display, sync::Arc};
+use elements::{
+    bitcoin::{self, address::NetworkUnchecked},
+    AddressParams,
+};
+
+use crate::{LwkError, Network, Script};
+use std::{fmt::Display, str::FromStr, sync::Arc};
 
 /// A Liquid address
 #[derive(uniffi::Object)]
@@ -78,6 +83,73 @@ impl Address {
     /// Returns a string of the QR code printable in a terminal environment
     pub fn qr_code_text(&self) -> Result<String, LwkError> {
         Ok(lwk_common::address_to_text_qr(&self.inner)?)
+    }
+
+    /// Returns the network of the address
+    pub fn network(&self) -> Network {
+        if self.inner.params == &AddressParams::LIQUID {
+            lwk_wollet::ElementsNetwork::Liquid.into()
+        } else if self.inner.params == &AddressParams::LIQUID_TESTNET {
+            lwk_wollet::ElementsNetwork::LiquidTestnet.into()
+        } else {
+            lwk_wollet::ElementsNetwork::default_regtest().into()
+        }
+    }
+}
+
+/// A valid Bitcoin address
+#[derive(uniffi::Object)]
+#[uniffi::export(Display)]
+pub struct BitcoinAddress {
+    inner: bitcoin::Address,
+}
+
+impl From<bitcoin::Address> for BitcoinAddress {
+    fn from(inner: bitcoin::Address) -> Self {
+        Self { inner }
+    }
+}
+
+impl From<bitcoin::Address<NetworkUnchecked>> for BitcoinAddress {
+    fn from(inner: bitcoin::Address<NetworkUnchecked>) -> Self {
+        Self {
+            inner: inner.assume_checked(),
+        }
+    }
+}
+
+impl AsRef<bitcoin::Address> for BitcoinAddress {
+    fn as_ref(&self) -> &bitcoin::Address {
+        &self.inner
+    }
+}
+
+impl From<BitcoinAddress> for bitcoin::Address {
+    fn from(addr: BitcoinAddress) -> Self {
+        addr.inner
+    }
+}
+
+impl Display for BitcoinAddress {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.inner)
+    }
+}
+
+#[uniffi::export]
+impl BitcoinAddress {
+    /// Construct an Address object
+    #[uniffi::constructor]
+    pub fn new(s: &str) -> Result<Arc<Self>, LwkError> {
+        let inner = bitcoin::Address::from_str(s)?.assume_checked();
+        Ok(Arc::new(Self { inner }))
+    }
+
+    /// Returns the network of the address
+    pub fn is_mainnet(&self) -> bool {
+        self.inner
+            .as_unchecked()
+            .is_valid_for_network(bitcoin::Network::Bitcoin)
     }
 }
 

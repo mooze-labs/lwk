@@ -1,16 +1,14 @@
 use std::{
     collections::HashMap,
     ops::ControlFlow,
-    str::FromStr,
     sync::{Arc, Mutex},
     time::Duration,
 };
 
 use crate::{
-    Address, Bolt11Invoice, ElectrumClient, EsploraClient, LightningPayment, LwkError, Mnemonic,
-    Network,
+    blockdata::address::BitcoinAddress, store::ForeignStoreLink, Address, Bolt11Invoice,
+    ElectrumClient, EsploraClient, LightningPayment, LwkError, Mnemonic, Network,
 };
-use elements::bitcoin;
 use log::{Level, Metadata, Record};
 use lwk_boltz::{
     ChainSwapDataSerializable, ChainSwapStates, InvoiceDataSerializable,
@@ -105,6 +103,12 @@ pub struct BoltzSessionBuilder {
     bitcoin_electrum_client_url: Option<String>,
     #[uniffi(default = false)]
     random_preimages: bool,
+    /// Optional store for persisting swap data
+    ///
+    /// When set, swap data will be automatically persisted to the store after creation
+    /// and on each state change. This enables automatic restoration of pending swaps.
+    #[uniffi(default = None)]
+    store: Option<Arc<ForeignStoreLink>>,
 }
 
 /// A session to pay and receive lightning payments.
@@ -162,6 +166,94 @@ pub enum PaymentState {
     Failed,
 }
 
+/// Asset type for swap quotes
+#[derive(uniffi::Enum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SwapAsset {
+    /// Lightning Bitcoin (for reverse/submarine swaps)
+    Lightning,
+    /// Onchain Bitcoin (for chain swaps)
+    Onchain,
+    /// Liquid Bitcoin (onchain)
+    Liquid,
+}
+
+impl From<SwapAsset> for lwk_boltz::SwapAsset {
+    fn from(asset: SwapAsset) -> Self {
+        match asset {
+            SwapAsset::Lightning => lwk_boltz::SwapAsset::Lightning,
+            SwapAsset::Onchain => lwk_boltz::SwapAsset::Onchain,
+            SwapAsset::Liquid => lwk_boltz::SwapAsset::Liquid,
+        }
+    }
+}
+
+/// Quote result containing fee breakdown for a swap
+#[derive(uniffi::Record)]
+pub struct Quote {
+    /// Amount the user sends (before fees)
+    pub send_amount: u64,
+    /// Amount the user will receive after fees
+    pub receive_amount: u64,
+    /// Network/miner fee in satoshis
+    pub network_fee: u64,
+    /// Boltz service fee in satoshis
+    pub boltz_fee: u64,
+    /// Minimum amount for this swap pair
+    pub min: u64,
+    /// Maximum amount for this swap pair
+    pub max: u64,
+}
+
+impl From<lwk_boltz::Quote> for Quote {
+    fn from(quote: lwk_boltz::Quote) -> Self {
+        Self {
+            send_amount: quote.send_amount,
+            receive_amount: quote.receive_amount,
+            network_fee: quote.network_fee,
+            boltz_fee: quote.boltz_fee,
+            min: quote.min,
+            max: quote.max,
+        }
+    }
+}
+
+/// Builder for creating swap quotes
+#[derive(uniffi::Object)]
+pub struct QuoteBuilder {
+    inner: Mutex<Option<lwk_boltz::QuoteBuilder>>,
+}
+
+fn quote_builder_consumed() -> LwkError {
+    "This quote builder has already been consumed".into()
+}
+
+#[uniffi::export]
+impl QuoteBuilder {
+    /// Set the source asset for the swap
+    pub fn send(&self, asset: SwapAsset) -> Result<(), LwkError> {
+        let mut lock = self.inner.lock()?;
+        let builder = lock.take().ok_or_else(quote_builder_consumed)?;
+        *lock = Some(builder.send(asset.into()));
+        Ok(())
+    }
+
+    /// Set the destination asset for the swap
+    pub fn receive(&self, asset: SwapAsset) -> Result<(), LwkError> {
+        let mut lock = self.inner.lock()?;
+        let builder = lock.take().ok_or_else(quote_builder_consumed)?;
+        *lock = Some(builder.receive(asset.into()));
+        Ok(())
+    }
+
+    /// Build the quote, calculating fees and receive amount
+    pub fn build(&self) -> Result<Quote, LwkError> {
+        let mut lock = self.inner.lock()?;
+        let builder = lock.take().ok_or_else(quote_builder_consumed)?;
+        let quote = builder.build()?;
+        Ok(quote.into())
+    }
+}
+
 #[derive(uniffi::Object)]
 pub enum AnyClient {
     Electrum(Arc<ElectrumClient>),
@@ -205,6 +297,7 @@ impl BoltzSession {
             referral_id: None,
             bitcoin_electrum_client_url: None,
             random_preimages: false,
+            store: None,
         };
         Self::from_builder(builder)
     }
@@ -271,6 +364,10 @@ impl BoltzSession {
             lwk_builder = lwk_builder.referral_id(referral_id);
         }
         lwk_builder = lwk_builder.random_preimages(builder.random_preimages);
+
+        if let Some(store) = builder.store.clone() {
+            lwk_builder = lwk_builder.store(store);
+        }
 
         let inner = lwk_builder
             .build_blocking()
@@ -381,7 +478,7 @@ impl BoltzSession {
     pub fn btc_to_lbtc(
         &self,
         amount: u64,
-        refund_address: &str, // TODO: convert to BitcoinAddress?
+        refund_address: &BitcoinAddress,
         claim_address: &Address,
         webhook: Option<Arc<WebHook>>,
     ) -> Result<LockupResponse, LwkError> {
@@ -392,12 +489,12 @@ impl BoltzSession {
                 hash_swap_id: None,
                 status: None,
             });
-        let refund_address = bitcoin::Address::from_str(refund_address)
-            .expect("TODO")
-            .assume_checked();
-        let response =
-            self.inner
-                .btc_to_lbtc(amount, &refund_address, claim_address.as_ref(), webhook)?;
+        let response = self.inner.btc_to_lbtc(
+            amount,
+            refund_address.as_ref(),
+            claim_address.as_ref(),
+            webhook,
+        )?;
         Ok(LockupResponse {
             inner: Mutex::new(Some(response)),
         })
@@ -408,7 +505,7 @@ impl BoltzSession {
         &self,
         amount: u64,
         refund_address: &Address,
-        claim_address: &str,
+        claim_address: &BitcoinAddress,
         webhook: Option<Arc<WebHook>>,
     ) -> Result<LockupResponse, LwkError> {
         let webhook = webhook
@@ -419,12 +516,12 @@ impl BoltzSession {
                 status: None,
             });
 
-        let claim_address = bitcoin::Address::from_str(claim_address)
-            .expect("TODO")
-            .assume_checked();
-        let response =
-            self.inner
-                .lbtc_to_btc(amount, refund_address.as_ref(), &claim_address, webhook)?;
+        let response = self.inner.lbtc_to_btc(
+            amount,
+            refund_address.as_ref(),
+            claim_address.as_ref(),
+            webhook,
+        )?;
         Ok(LockupResponse {
             inner: Mutex::new(Some(response)),
         })
@@ -455,6 +552,34 @@ impl BoltzSession {
     pub fn swap_restore(&self) -> Result<SwapList, LwkError> {
         let response = self.inner.swap_restore()?;
         Ok(SwapList { inner: response })
+    }
+
+    /// Get the list of pending swap IDs from the store
+    ///
+    /// Returns an error if no store is configured.
+    pub fn pending_swap_ids(&self) -> Result<Vec<String>, LwkError> {
+        Ok(self.inner.pending_swap_ids()?)
+    }
+
+    /// Get the list of completed swap IDs from the store
+    ///
+    /// Returns an error if no store is configured.
+    pub fn completed_swap_ids(&self) -> Result<Vec<String>, LwkError> {
+        Ok(self.inner.completed_swap_ids()?)
+    }
+
+    /// Get the raw swap data (JSON) for a specific swap ID from the store
+    ///
+    /// Returns `None` if no store is configured or the swap doesn't exist.
+    pub fn get_swap_data(&self, swap_id: String) -> Result<Option<String>, LwkError> {
+        Ok(self.inner.get_swap_data(&swap_id)?)
+    }
+
+    /// Remove a swap from the store
+    ///
+    /// Returns an error if no store is configured.
+    pub fn remove_swap(&self, swap_id: String) -> Result<(), LwkError> {
+        Ok(self.inner.remove_swap(&swap_id)?)
     }
 
     /// Filter the swap list to only include restorable reverse swaps
@@ -492,16 +617,67 @@ impl BoltzSession {
         Ok(data)
     }
 
+    /// Filter the swap list to only include restorable BTC to LBTC swaps
+    pub fn restorable_btc_to_lbtc_swaps(
+        &self,
+        swap_list: &SwapList,
+        claim_address: &Address,
+        refund_address: &BitcoinAddress,
+    ) -> Result<Vec<String>, LwkError> {
+        let response = self.inner.restorable_btc_to_lbtc_swaps(
+            &swap_list.inner,
+            claim_address.as_ref(),
+            refund_address.as_ref(),
+        )?;
+        let data = response
+            .into_iter()
+            .map(|e| self.inner.restore_lockup(e.into()))
+            .map(|e| e.and_then(|e| e.serialize()))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(data)
+    }
+
+    /// Filter the swap list to only include restorable LBTC to BTC swaps
+    pub fn restorable_lbtc_to_btc_swaps(
+        &self,
+        swap_list: &SwapList,
+        claim_address: &BitcoinAddress,
+        refund_address: &Address,
+    ) -> Result<Vec<String>, LwkError> {
+        let response = self.inner.restorable_lbtc_to_btc_swaps(
+            &swap_list.inner,
+            claim_address.as_ref(),
+            refund_address.as_ref(),
+        )?;
+        let data = response
+            .into_iter()
+            .map(|e| self.inner.restore_lockup(e.into()))
+            .map(|e| e.and_then(|e| e.serialize()))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(data)
+    }
+
     /// Fetch informations, such as min and max amounts, about the reverse and submarine pairs from the boltz api.
     pub fn fetch_swaps_info(&self) -> Result<String, LwkError> {
-        let (reverse, submarine) = self.inner.fetch_swaps_info()?;
+        let (reverse, submarine, chain) = self.inner.fetch_swaps_info()?;
         let reverse_json = serde_json::to_value(&reverse)?;
         let submarine_json = serde_json::to_value(&submarine)?;
+        let chain_json = serde_json::to_value(&chain)?;
         let mut result = HashMap::new();
         result.insert("reverse".to_string(), reverse_json);
         result.insert("submarine".to_string(), submarine_json);
+        result.insert("chain".to_string(), chain_json);
         let result_json = serde_json::to_string(&result)?;
         Ok(result_json)
+    }
+
+    /// Refresh the cached pairs data from the Boltz API
+    ///
+    /// This updates the internal cache used by [`BoltzSession::quote()`].
+    /// Call this if you need up-to-date fee information after the session was created.
+    pub fn refresh_swap_info(&self) -> Result<(), LwkError> {
+        self.inner.refresh_swap_info()?;
+        Ok(())
     }
 
     /// Get the next index to use for deriving keypairs
@@ -514,6 +690,42 @@ impl BoltzSession {
     /// This may be necessary to handle multiple sessions with the same mnemonic.
     pub fn set_next_index_to_use(&self, next_index_to_use: u32) {
         self.inner.set_next_index_to_use(next_index_to_use);
+    }
+
+    /// Create a quote builder for calculating swap fees
+    ///
+    /// This uses the cached pairs data from session initialization.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let builder = session.quote(25000);
+    /// builder.send(SwapAsset::Lightning);
+    /// builder.receive(SwapAsset::Liquid);
+    /// let quote = builder.build()?;
+    /// ```
+    pub fn quote(&self, send_amount: u64) -> Arc<QuoteBuilder> {
+        Arc::new(QuoteBuilder {
+            inner: Mutex::new(Some(self.inner.quote(send_amount))),
+        })
+    }
+
+    /// Create a quote builder for calculating send amount from desired receive amount
+    ///
+    /// This is the inverse of [`BoltzSession::quote()`] - given the amount you want
+    /// to receive, it calculates how much you need to send.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let builder = session.quote_receive(24887);
+    /// builder.send(SwapAsset::Lightning);
+    /// builder.receive(SwapAsset::Liquid);
+    /// let quote = builder.build()?;
+    /// // quote.send_amount will be 25000
+    /// ```
+    pub fn quote_receive(&self, receive_amount: u64) -> Arc<QuoteBuilder> {
+        Arc::new(QuoteBuilder {
+            inner: Mutex::new(Some(self.inner.quote_receive(receive_amount))),
+        })
     }
 }
 
@@ -531,7 +743,8 @@ impl PreparePayResponse {
             .lock()?
             .as_ref()
             .ok_or(LwkError::ObjectConsumed)?
-            .swap_id())
+            .swap_id()
+            .to_string())
     }
 
     /// Serialize the prepare pay response data to a json string
@@ -573,10 +786,9 @@ impl PreparePayResponse {
             .uri_amount())
     }
 
-    /// The fee of the swap provider
+    /// The fee of the swap provider and the network fee
     ///
     /// It is equal to the amount requested onchain minus the amount of the bolt11 invoice
-    /// Does not include the fee of the onchain transaction.
     pub fn fee(&self) -> Result<Option<u64>, LwkError> {
         Ok(self
             .inner
@@ -584,6 +796,19 @@ impl PreparePayResponse {
             .as_ref()
             .ok_or(LwkError::ObjectConsumed)?
             .fee())
+    }
+
+    /// The fee of the swap provider
+    ///
+    /// It is equal to the invoice amount multiplied by the boltz fee rate.
+    /// For example for paying an invoice of 1000 satoshi with a 0.1% rate would be 1 satoshi.
+    pub fn boltz_fee(&self) -> Result<Option<u64>, LwkError> {
+        Ok(self
+            .inner
+            .lock()?
+            .as_ref()
+            .ok_or(LwkError::ObjectConsumed)?
+            .boltz_fee())
     }
 
     pub fn advance(&self) -> Result<PaymentState, LwkError> {
@@ -629,13 +854,13 @@ impl InvoiceResponse {
             .lock()?
             .as_ref()
             .ok_or(LwkError::ObjectConsumed)?
-            .swap_id())
+            .swap_id()
+            .to_string())
     }
 
-    /// The fee of the swap provider
+    /// The fee of the swap provider and the network fee
     ///
     /// It is equal to the amount of the invoice minus the amount of the onchain transaction.
-    /// Does not include the fee of the onchain transaction.
     pub fn fee(&self) -> Result<Option<u64>, LwkError> {
         Ok(self
             .inner
@@ -643,6 +868,30 @@ impl InvoiceResponse {
             .as_ref()
             .ok_or(LwkError::ObjectConsumed)?
             .fee())
+    }
+
+    /// The fee of the swap provider
+    ///
+    /// It is equal to the invoice amount multiplied by the boltz fee rate.
+    /// For example for receiving an invoice of 10000 satoshi with a 0.25% rate would be 25 satoshi.
+    pub fn boltz_fee(&self) -> Result<Option<u64>, LwkError> {
+        Ok(self
+            .inner
+            .lock()?
+            .as_ref()
+            .ok_or(LwkError::ObjectConsumed)?
+            .boltz_fee())
+    }
+
+    /// The txid of the claim transaction of the swap
+    pub fn claim_txid(&self) -> Result<Option<String>, LwkError> {
+        Ok(self
+            .inner
+            .lock()?
+            .as_ref()
+            .ok_or(LwkError::ObjectConsumed)?
+            .claim_txid()
+            .map(|txid| txid.to_string()))
     }
 
     /// Serialize the prepare pay response data to a json string
@@ -696,7 +945,8 @@ impl LockupResponse {
             .lock()?
             .as_ref()
             .ok_or(LwkError::ObjectConsumed)?
-            .swap_id())
+            .swap_id()
+            .to_string())
     }
 
     pub fn lockup_address(&self) -> Result<String, LwkError> {
@@ -736,6 +986,30 @@ impl LockupResponse {
             .ok_or(LwkError::ObjectConsumed)?
             .chain_to()
             .to_string())
+    }
+
+    /// The fee of the swap provider and the network fee
+    ///
+    /// It is equal to the amount requested minus the amount sent to the claim address.
+    pub fn fee(&self) -> Result<Option<u64>, LwkError> {
+        Ok(self
+            .inner
+            .lock()?
+            .as_ref()
+            .ok_or(LwkError::ObjectConsumed)?
+            .fee())
+    }
+
+    /// The fee of the swap provider
+    ///
+    /// It is equal to the swap amount multiplied by the boltz fee rate.
+    pub fn boltz_fee(&self) -> Result<Option<u64>, LwkError> {
+        Ok(self
+            .inner
+            .lock()?
+            .as_ref()
+            .ok_or(LwkError::ObjectConsumed)?
+            .boltz_fee())
     }
 
     pub fn advance(&self) -> Result<PaymentState, LwkError> {

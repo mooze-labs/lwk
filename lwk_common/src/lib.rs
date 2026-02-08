@@ -13,7 +13,9 @@
 mod address;
 mod balance;
 mod descriptor;
+mod encrypt;
 mod error;
+mod fee;
 mod keyorigin_xpub;
 mod model;
 mod network;
@@ -21,6 +23,7 @@ pub mod precision;
 mod qr;
 mod segwit;
 mod signer;
+mod store;
 
 pub use crate::address::{Address, AddressParseError};
 pub use crate::balance::{Balance, SignedBalance};
@@ -28,6 +31,10 @@ pub use crate::descriptor::{
     multisig_desc, singlesig_desc, Bip, DescriptorBlindingKey, InvalidBipVariant,
     InvalidBlindingKeyVariant, InvalidMultisigVariant, InvalidSinglesigVariant, Multisig,
     Singlesig,
+};
+pub use crate::encrypt::{
+    cipher_from_key_bytes, decrypt_with_nonce_prefix, encrypt_with_deterministic_nonce,
+    encrypt_with_random_nonce, EncryptError,
 };
 pub use crate::error::Error;
 pub use crate::keyorigin_xpub::{keyorigin_xpub_from_str, InvalidKeyOriginXpub};
@@ -39,6 +46,8 @@ pub use crate::segwit::is_provably_segwit;
 #[cfg(feature = "amp0")]
 pub use crate::signer::amp0::{Amp0Signer, Amp0SignerData};
 pub use crate::signer::Signer;
+pub use crate::store::{BoxError, DynStore, MemoryStore, Store};
+pub use fee::*;
 
 /// A trait for async read/write operations used by hardware wallet connections
 pub trait Stream {

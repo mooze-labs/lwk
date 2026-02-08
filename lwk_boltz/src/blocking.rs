@@ -2,8 +2,8 @@ use std::{ops::ControlFlow, sync::Arc};
 
 use boltz_client::{
     boltz::{
-        ChainSwapStates, GetReversePairsResponse, GetSubmarinePairsResponse, RevSwapStates,
-        SubSwapStates, SwapRestoreResponse, Webhook,
+        ChainSwapStates, GetChainPairsResponse, GetReversePairsResponse, GetSubmarinePairsResponse,
+        RevSwapStates, SubSwapStates, SwapRestoreResponse, Webhook,
     },
     network::Chain,
     Bolt11Invoice,
@@ -12,8 +12,9 @@ use elements::bitcoin;
 use lwk_wollet::elements;
 
 use crate::{
-    prepare_pay_data::PreparePayDataSerializable, ChainSwapDataSerializable, Error, InvoiceData,
-    InvoiceDataSerializable, LightningPayment, PreparePayData, RescueFile, SwapStatus,
+    prepare_pay_data::PreparePayDataSerializable, ChainSwapData, ChainSwapDataSerializable, Error,
+    InvoiceData, InvoiceDataSerializable, LightningPayment, PreparePayData, QuoteBuilder,
+    RescueFile, SwapPersistence, SwapStatus,
 };
 
 pub struct BoltzSession {
@@ -174,9 +175,69 @@ impl BoltzSession {
         Ok(inner)
     }
 
+    pub fn restorable_btc_to_lbtc_swaps(
+        &self,
+        swaps: &[SwapRestoreResponse],
+        claim_address: &elements::Address,
+        refund_address: &bitcoin::Address,
+    ) -> Result<Vec<ChainSwapData>, Error> {
+        let inner = self
+            .runtime
+            .block_on(self.inner.restorable_btc_to_lbtc_swaps(
+                swaps,
+                claim_address,
+                refund_address,
+            ))?;
+        Ok(inner)
+    }
+
+    pub fn restorable_lbtc_to_btc_swaps(
+        &self,
+        swaps: &[SwapRestoreResponse],
+        claim_address: &bitcoin::Address,
+        refund_address: &elements::Address,
+    ) -> Result<Vec<ChainSwapData>, Error> {
+        let inner = self
+            .runtime
+            .block_on(self.inner.restorable_lbtc_to_btc_swaps(
+                swaps,
+                claim_address,
+                refund_address,
+            ))?;
+        Ok(inner)
+    }
+
     pub fn swap_restore(&self) -> Result<Vec<SwapRestoreResponse>, Error> {
         let inner = self.runtime.block_on(self.inner.swap_restore())?;
         Ok(inner)
+    }
+
+    /// Get the list of pending swap IDs from the store
+    ///
+    /// See [`crate::BoltzSession::pending_swap_ids()`]
+    pub fn pending_swap_ids(&self) -> Result<Vec<String>, Error> {
+        self.inner.pending_swap_ids()
+    }
+
+    /// Get the list of completed swap IDs from the store
+    ///
+    /// See [`crate::BoltzSession::completed_swap_ids()`]
+    pub fn completed_swap_ids(&self) -> Result<Vec<String>, Error> {
+        self.inner.completed_swap_ids()
+    }
+
+    /// Get the raw swap data for a specific swap ID from the store
+    ///
+    /// See [`crate::BoltzSession::get_swap_data()`]
+    pub fn get_swap_data(&self, swap_id: &str) -> Result<Option<String>, Error> {
+        self.inner.get_swap_data(swap_id)
+    }
+
+    /// Remove a swap from the store
+    ///
+    /// See [`crate::BoltzSession::remove_swap()`]
+    pub fn remove_swap(&self, swap_id: &str) -> Result<(), Error> {
+        self.inner.remove_swap(swap_id)
     }
 
     pub fn next_index_to_use(&self) -> u32 {
@@ -189,9 +250,42 @@ impl BoltzSession {
 
     pub fn fetch_swaps_info(
         &self,
-    ) -> Result<(GetReversePairsResponse, GetSubmarinePairsResponse), Error> {
-        let inner = self.runtime.block_on(self.inner.fetch_swaps_info())?;
-        Ok(inner)
+    ) -> Result<
+        (
+            GetReversePairsResponse,
+            GetSubmarinePairsResponse,
+            GetChainPairsResponse,
+        ),
+        Error,
+    > {
+        let swap_info = self.runtime.block_on(self.inner.fetch_swaps_info())?;
+        Ok((
+            swap_info.reverse_pairs,
+            swap_info.submarine_pairs,
+            swap_info.chain_pairs,
+        ))
+    }
+
+    /// Refresh the cached pairs data from the Boltz API
+    ///
+    /// This updates the internal cache used by [`BoltzSession::quote()`].
+    pub fn refresh_swap_info(&self) -> Result<(), Error> {
+        self.runtime.block_on(self.inner.refresh_swap_info())
+    }
+
+    /// Create a quote builder for calculating swap fees
+    ///
+    /// This uses the cached pairs data from session initialization.
+    pub fn quote(&self, send_amount: u64) -> QuoteBuilder {
+        self.runtime.block_on(self.inner.quote(send_amount))
+    }
+
+    /// Create a quote builder for calculating send amount from desired receive amount
+    ///
+    /// This is the inverse of [`BoltzSession::quote()`].
+    pub fn quote_receive(&self, receive_amount: u64) -> QuoteBuilder {
+        self.runtime
+            .block_on(self.inner.quote_receive(receive_amount))
     }
 }
 
@@ -201,7 +295,7 @@ impl PreparePayResponse {
         Ok(inner)
     }
 
-    pub fn swap_id(&self) -> String {
+    pub fn swap_id(&self) -> &str {
         self.inner.swap_id()
     }
 
@@ -222,6 +316,11 @@ impl PreparePayResponse {
         self.inner.fee()
     }
 
+    /// See [`crate::PreparePayResponse::boltz_fee()`]
+    pub fn boltz_fee(&self) -> Option<u64> {
+        self.inner.boltz_fee()
+    }
+
     pub fn serialize(&self) -> Result<String, Error> {
         self.inner.serialize()
     }
@@ -238,8 +337,8 @@ impl InvoiceResponse {
         Ok(inner)
     }
 
-    pub fn swap_id(&self) -> String {
-        self.inner.swap_id().to_string()
+    pub fn swap_id(&self) -> &str {
+        self.inner.swap_id()
     }
 
     pub fn bolt11_invoice(&self) -> Bolt11Invoice {
@@ -249,6 +348,16 @@ impl InvoiceResponse {
     /// See [`crate::InvoiceResponse::fee()`]
     pub fn fee(&self) -> Option<u64> {
         self.inner.fee()
+    }
+
+    /// See [`crate::InvoiceResponse::boltz_fee()`]
+    pub fn boltz_fee(&self) -> Option<u64> {
+        self.inner.boltz_fee()
+    }
+
+    /// See [`crate::InvoiceResponse::claim_txid()`]
+    pub fn claim_txid(&self) -> Option<&str> {
+        self.inner.claim_txid()
     }
 
     pub fn advance(&mut self) -> Result<ControlFlow<bool, SwapStatus>, Error> {
@@ -262,7 +371,7 @@ impl InvoiceResponse {
 }
 
 impl LockupResponse {
-    pub fn swap_id(&self) -> String {
+    pub fn swap_id(&self) -> &str {
         self.inner.swap_id()
     }
 
@@ -280,6 +389,16 @@ impl LockupResponse {
 
     pub fn chain_to(&self) -> Chain {
         self.inner.chain_to()
+    }
+
+    /// See [`crate::LockupResponse::fee()`]
+    pub fn fee(&self) -> Option<u64> {
+        self.inner.fee()
+    }
+
+    /// See [`crate::LockupResponse::boltz_fee()`]
+    pub fn boltz_fee(&self) -> Option<u64> {
+        self.inner.boltz_fee()
     }
 
     pub fn advance(&mut self) -> Result<ControlFlow<bool, SwapStatus>, Error> {

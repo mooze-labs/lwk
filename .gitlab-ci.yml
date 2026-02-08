@@ -5,7 +5,7 @@ variables:
   DOCKER_TLS_CERTDIR: ""
 
 .base:
-  image: xenoky/lwk-builder@sha256:5f458c1ffd1659b19c26245801c657bc85479ca2fc31138a52c2f32f00a0f70e
+  image: xenoky/lwk-builder@sha256:ccc64ed4333a28fe4e882fcb024d3732d98b0e6621641665aba6fe8c726eaafd
   tags:
     - cloud
   retry:
@@ -15,7 +15,7 @@ variables:
       - unknown_failure
       - stuck_or_timeout_failure
   services:
-    - docker:20.10.12-dind
+    - docker:27-dind
   before_script:
     - cp /usr/local/cargo/bin/waterfalls /bin/waterfalls_b8818e1
 
@@ -72,6 +72,12 @@ test_cli:
     - cp ./context/env.sh / && cd / && . ./env.sh && cd -
     - cargo test -p lwk_cli
 
+test_simplicity:
+  extends: .base
+  script:
+    - cp ./context/env.sh / && cd / && . ./env.sh && cd -
+    - cargo test -p lwk_simplicity
+
 unit_tests:
   extends: .base
   script:
@@ -83,6 +89,7 @@ test_coverage:
     RUSTFLAGS: "-C instrument-coverage"
     LLVM_PROFILE_FILE: "coverage-%p-%m.profraw"
     TMPDIR: ${CI_PROJECT_DIR}  # otherwise issue with the docker
+    JAVA_OPTS: "-Xmx2g"
 
   script:
     - docker pull tulipan81/blind_pin_server:v0.0.7
@@ -150,6 +157,8 @@ examples:
 
 bindings:
   extends: .base
+  variables:
+    JAVA_OPTS: "-Xmx2g"
   script:
     - cp ./context/env.sh / && cd / && . ./env.sh && cd -
     - cargo test -p lwk_bindings --features foreign_bindings
@@ -179,7 +188,7 @@ cpp:
     - uniffi-bindgen-cpp --library cpp/liblwk.so --out-dir cpp
     # this is an hack, but make it work until we understand how to properly convert default value for Option<Arc<Mnemonic>> and  Option<Arc<dyn Logging>>
     # upstream issue: https://github.com/NordSecurity/uniffi-bindgen-cpp/issues/60
-    - sed -i -e '/std::shared_ptr<Mnemonic>/ s/std::nullopt/nullptr/g' -e '/std::shared_ptr<Logging>/ s/std::nullopt/nullptr/g' cpp/lwk.hpp
+    - sed -i -e '/std::shared_ptr<ForeignStoreLink>/ s/std::nullopt/nullptr/g' -e '/std::shared_ptr<Mnemonic>/ s/std::nullopt/nullptr/g' -e '/std::shared_ptr<Logging>/ s/std::nullopt/nullptr/g' cpp/lwk.hpp
     - cp lwk_bindings/tests/bindings/list_transactions.cpp cpp
     - cd cpp
     - g++ -std=c++20 -L./ -Wl,-rpath,./ -o test list_transactions.cpp lwk.cpp -llwk
@@ -191,8 +200,12 @@ cpp:
 
 just:
   extends: .base
+  variables:
+    JAVA_OPTS: "-Xmx2g"
   script:
+    - cp ./context/env.sh / && cd / && . ./env.sh && cd -
     - just python-test-bindings
+    - just python-test-bindings-simplicity
     - just kotlin # kotlin-android would require cargo-ndk and various targets, tested on github which produce the kotlin package
 
 wasm:
@@ -211,27 +224,22 @@ wasm:
     - cd lwk_wasm && RUSTFLAGS="--cfg=web_sys_unstable_apis" CARGO_PROFILE_RELEASE_OPT_LEVEL=z wasm-pack build --features serial && cd -
     # testing nodejs package
     - cd lwk_wasm
-    - RUSTFLAGS="--cfg=web_sys_unstable_apis" CARGO_PROFILE_RELEASE_OPT_LEVEL=z wasm-pack build --target nodejs --out-dir pkg_node -- --features serial
+    - RUSTFLAGS="--cfg=web_sys_unstable_apis" CARGO_PROFILE_RELEASE_OPT_LEVEL=z wasm-pack build --target nodejs --out-dir pkg_node -- --features serial,simplicity
     - sed -i 's/"lwk_wasm"/"lwk_node"/g' pkg_node/package.json
     - cd tests/node
     - npm install
-    - node network.js
-    - node list_transactions.js
-    - node amp0-setup.js
-    - node amp0-daily-ops.js
-    - node bip85.js
+    - npm run test
   artifacts:
     paths:
       - lwk_wasm/pkg
 
 nix:
-  image: nixos/nix:latest
+  image: xenoky/lwk-nix-builder@sha256:65e7e1999ec3eba96f804a30fd8d1ef6d9842d99a61fb02bf4147dee7d53b9dc
   variables:
       EXP_FEAT: --extra-experimental-features nix-command --extra-experimental-features flakes
       CACHE: --extra-trusted-public-keys nix.casatta.it:HseKZh7436/vKXfZDBHbhr7wwAkzjLwY5BIq+OOrITg= --extra-substituters https://nix.casatta.it
   script:
     - nix $EXP_FEAT $CACHE build .
-    - nix $EXP_FEAT $CACHE develop . -c cargo test -p lwk_cli --features registry -- registry_publish
     - nix $EXP_FEAT $CACHE develop . -c rust-analyzer analysis-stats . 2>log # prints ERROR if there are cyclic deps with dev-deps
     - (! grep ERROR log)
 
@@ -240,7 +248,10 @@ boltz:
   script:
     - cd lwk_boltz
     - git submodule update --init --recursive
+    - just regtest-env-start && sleep 15 # explicitly start the env to give more time to bitcoind to start
+    - just test-chain-restore
     - just test-mrh
+    - just test-onchain-swaps
     - just test-reverse
     - just test-reverse-concurrent
     - just test-reverse-restore
@@ -275,6 +286,8 @@ publish_snapshot_to_maven:
   tags:
     - m4
   needs: []
+  variables:
+    SIMPLICITY: "1"
   rules:
     - if: '$CI_COMMIT_BRANCH == "master"'
       when: on_success

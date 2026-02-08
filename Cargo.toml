@@ -16,6 +16,8 @@ members = [
     "lwk_test_util",
     "lwk_wasm",
     "lwk_boltz",
+    "lwk_payment_instructions",
+    "lwk_simplicity",
 ]
 resolver = "2"
 
@@ -31,6 +33,8 @@ lwk_test_util = { path = "lwk_test_util" }
 lwk_tiny_jrpc = { path = "lwk_tiny_jrpc" }
 lwk_wollet = { path = "lwk_wollet" }
 lwk_boltz = { path = "lwk_boltz" }
+lwk_payment_instructions = { path = "lwk_payment_instructions" }
+lwk_simplicity = { path = "lwk_simplicity" }
 
 [profile.release-smaller]
 inherits = "release"
@@ -45,5 +49,6 @@ inherits = "release"
 debug = true         # Include debug symbols for profiling
 strip = "none"       # Don't strip any symbols
 
-# [workspace.dependencies] # This cause issues in publishing single crates with our current flow
-# log = "0.4.22"
+[workspace.dependencies]
+elements = { version = "0.25.0", features = ["base64", "serde"] }
+elements-miniscript = { version = "0.4", features = ["base64", "serde"] }

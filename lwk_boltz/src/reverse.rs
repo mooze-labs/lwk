@@ -4,6 +4,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use aes_gcm_siv::Aes256GcmSiv;
 use bip39::Mnemonic;
 use boltz_client::boltz::BoltzApiClientV2;
 use boltz_client::boltz::CreateReverseRequest;
@@ -14,7 +15,7 @@ use boltz_client::boltz::SwapStatus;
 use boltz_client::boltz::Webhook;
 use boltz_client::boltz::{ClaimDetails, CreateReverseResponse};
 use boltz_client::fees::Fee;
-use boltz_client::swaps::magic_routing::check_for_mrh;
+use boltz_client::swaps::magic_routing::find_magic_routing_hint;
 use boltz_client::swaps::magic_routing::sign_address;
 use boltz_client::swaps::ChainClient;
 use boltz_client::swaps::SwapScript;
@@ -32,7 +33,10 @@ use crate::mnemonic_identifier;
 use crate::preimage_from_keypair;
 use crate::swap_state::SwapStateTrait;
 use crate::to_invoice_data;
+use crate::DynStore;
+use crate::SwapPersistence;
 use crate::SwapType;
+use crate::LIQUID_UNCOOPERATIVE_EXTRA;
 use crate::{broadcast_tx_with_retry, next_status, BoltzSession, SwapState};
 
 pub struct InvoiceResponse {
@@ -45,11 +49,31 @@ pub struct InvoiceResponse {
     chain_client: Arc<ChainClient>,
     polling: bool,
     timeout_advance: Duration,
+    store: Option<Arc<dyn DynStore>>,
+    cipher: Option<Aes256GcmSiv>,
 }
 
 impl fmt::Debug for InvoiceResponse {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "InvoiceResponse {{ data: {:?}, rx: {:?}, swap_script: {:?}, api: {:?}, polling: {:?}, timeout_advance: {:?} }}", self.data, self.rx, self.swap_script, self.api, self.polling, self.timeout_advance)
+        write!(f, "InvoiceResponse {{ data: {:?}, rx: {:?}, swap_script: {:?}, api: {:?}, polling: {:?}, timeout_advance: {:?}, store: {:?} }}", self.data, self.rx, self.swap_script, self.api, self.polling, self.timeout_advance, self.store)
+    }
+}
+
+impl SwapPersistence for InvoiceResponse {
+    fn serialize(&self) -> Result<String, Error> {
+        let x = InvoiceDataSerializable::from(self.data.clone());
+        Ok(serde_json::to_string(&x)?)
+    }
+
+    fn swap_id(&self) -> &str {
+        &self.data.create_reverse_response.id
+    }
+
+    fn store_and_cipher(&self) -> Option<(Arc<dyn DynStore>, Aes256GcmSiv)> {
+        match (self.store.as_ref(), self.cipher.as_ref()) {
+            (Some(store), Some(cipher)) => Some((Arc::clone(store), cipher.clone())),
+            _ => None,
+        }
     }
 }
 
@@ -98,7 +122,21 @@ impl BoltzSession {
             Error::ExpectedAmountLowerThanInvoice(amount, reverse_resp.id.clone()),
         )?;
 
-        let _ = check_for_mrh(&self.api, &invoice_str, chain).await?.ok_or(
+        let (boltz_fee, claim_fee) = {
+            let swap_info = self.swap_info.lock().await;
+            match swap_info.reverse_pairs.get_btc_to_lbtc_pair() {
+                Some(pair) => (
+                    Some(pair.fees.boltz(amount)),
+                    Some(pair.fees.claim_estimate()),
+                ),
+                None => (None, None),
+            }
+        };
+
+        // Sanity check: Boltz-created invoices should always have the magic routing hint.
+        // We use find_magic_routing_hint (local parsing) instead of check_for_mrh
+        // to avoid an unnecessary network call to get_mrh_bip21.
+        let _ = find_magic_routing_hint(&invoice_str)?.ok_or(
             Error::InvoiceWithoutMagicRoutingHint(reverse_resp.id.clone()),
         )?;
 
@@ -115,13 +153,22 @@ impl BoltzSession {
         let last_state = update.swap_state()?;
         log::debug!("Waiting for Invoice to be paid: {}", &invoice);
 
-        Ok(InvoiceResponse {
+        let store = self.clone_store();
+        let cipher = if store.is_some() {
+            Some(self.clone_cipher())
+        } else {
+            None
+        };
+        let response = InvoiceResponse {
             polling: self.polling,
             timeout_advance: self.timeout_advance,
             data: InvoiceData {
                 last_state,
                 swap_type: SwapType::Reverse,
                 fee: Some(fee),
+                boltz_fee,
+                claim_fee,
+                claim_txid: None,
                 create_reverse_response: reverse_resp.clone(),
                 our_keys,
                 preimage,
@@ -135,7 +182,14 @@ impl BoltzSession {
             swap_script,
             api: self.api.clone(),
             chain_client: self.chain_client.clone(),
-        })
+            store,
+            cipher,
+        };
+
+        // Persist swap data and add to pending list
+        response.persist_and_add_to_pending()?;
+
+        Ok(response)
     }
 
     pub async fn restore_invoice(
@@ -156,7 +210,13 @@ impl BoltzSession {
         let rx = self.ws.updates();
         self.ws.subscribe_swap(&swap_id).await?;
 
-        Ok(InvoiceResponse {
+        let store = self.clone_store();
+        let cipher = if store.is_some() {
+            Some(self.clone_cipher())
+        } else {
+            None
+        };
+        let response = InvoiceResponse {
             polling: self.polling,
             timeout_advance: self.timeout_advance,
             data,
@@ -164,7 +224,16 @@ impl BoltzSession {
             swap_script,
             api: self.api.clone(),
             chain_client: self.chain_client.clone(),
-        })
+            store,
+            cipher,
+        };
+
+        // If the swap was already in a terminal state, move it to completed
+        if response.data.last_state.is_terminal() {
+            response.move_to_completed()?;
+        }
+
+        Ok(response)
     }
 
     /// From the swaps returned by the boltz api via [`BoltzSession::swap_restore`]:
@@ -181,7 +250,11 @@ impl BoltzSession {
         swaps
             .iter()
             .filter(|e| matches!(e.swap_type, SwapRestoreType::Reverse))
-            .filter(|e| e.status != "swap.expired" && e.status != "invoice.settled")
+            .filter(|e| {
+                e.status != "swap.expired"
+                    && e.status != "invoice.settled"
+                    && e.status != "swap.created"
+            })
             .map(|e| {
                 convert_swap_restore_response_to_invoice_data(e, &self.mnemonic, claim_address)
             })
@@ -249,6 +322,9 @@ pub(crate) fn convert_swap_restore_response_to_invoice_data(
         last_state,
         swap_type: SwapType::Reverse,
         fee: None, // Fee information not available in restore response
+        boltz_fee: None,
+        claim_fee: None, // Not available in restore response, will use fallback fee rate
+        claim_txid: None,
         create_reverse_response,
         our_keys,
         preimage,
@@ -275,6 +351,42 @@ impl InvoiceResponse {
         }
 
         log::info!("transaction.mempool/confirmed Boltz broadcasted funding tx");
+
+        // Parse the lockup transaction from the status update if available.
+        // This avoids waiting for the transaction to propagate to the chain client's mempool,
+        // significantly improving claim speed.
+        let lockup_tx = if let Some(tx_info) = &update.transaction {
+            match self.swap_script.parse_lockup_transaction(tx_info).await {
+                Ok(tx) => {
+                    log::debug!("Parsed lockup tx from status update");
+                    Some(tx)
+                }
+                Err(e) => {
+                    log::warn!("Failed to parse lockup tx from status update: {e}, will fetch from chain client");
+                    None
+                }
+            }
+        } else {
+            log::debug!("No transaction info in status update, will fetch from chain client");
+            None
+        };
+
+        // Build options with lockup_tx if available for faster claiming
+        let options = match lockup_tx {
+            Some(tx) => TransactionOptions::default()
+                .with_cooperative(true)
+                .with_lockup_tx(tx),
+            None => TransactionOptions::default().with_cooperative(true),
+        };
+
+        // Use the claim fee from Boltz API to match the quoted amount exactly.
+        // Add LIQUID_UNCOOPERATIVE_EXTRA as buffer for script-path claims.
+        // Fall back to Fee::Relative if claim_fee is not available (e.g., restored swaps).
+        let fee = match self.data.claim_fee {
+            Some(claim_fee) => Fee::Absolute(claim_fee + LIQUID_UNCOOPERATIVE_EXTRA),
+            None => Fee::Relative(0.12),
+        };
+
         let tx = self
             .swap_script
             .construct_claim(
@@ -282,30 +394,22 @@ impl InvoiceResponse {
                 SwapTransactionParams {
                     keys: self.data.our_keys,
                     output_address: self.data.claim_address.to_string(),
-                    fee: Fee::Relative(0.12), // TODO make it configurable
+                    fee,
                     swap_id: self.swap_id().to_string(),
-                    options: Some(TransactionOptions::default().with_cooperative(true)),
+                    options: Some(options),
                     chain_client: &self.chain_client,
                     boltz_client: &self.api,
                 },
             )
             .await?;
 
-        broadcast_tx_with_retry(&self.chain_client, &tx).await?;
+        let txid = broadcast_tx_with_retry(&self.chain_client, &tx).await?;
+        self.data.claim_txid = Some(txid);
         self.data.claim_broadcasted = true;
 
         log::info!("Successfully broadcasted claim tx!");
         log::debug!("Claim Tx {tx:?}");
         Ok(ControlFlow::Continue(update))
-    }
-
-    pub fn swap_id(&self) -> &str {
-        &self.data.create_reverse_response.id
-    }
-
-    pub fn serialize(&self) -> Result<String, Error> {
-        let x = InvoiceDataSerializable::from(self.data.clone());
-        Ok(serde_json::to_string(&x)?)
     }
 
     pub fn bolt11_invoice(&self) -> Bolt11Invoice {
@@ -315,12 +419,34 @@ impl InvoiceResponse {
         .expect("Invoice must be parsable or we would have errored on the BoltzSession::invoice")
     }
 
-    /// The fee of the swap provider
+    /// The fee of the swap provider and the network fee
     ///
     /// It is equal to the amount of the invoice minus the amount of the onchain transaction.
-    /// Does not include the fee of the onchain transaction.
     pub fn fee(&self) -> Option<u64> {
         self.data.fee
+    }
+
+    /// The fee of the swap provider
+    ///
+    /// It is equal to the invoice amount multiplied by the boltz fee rate.
+    /// For example for receiving an invoice of 10000 satoshi with a 0.25% rate would be 25 satoshi.
+    pub fn boltz_fee(&self) -> Option<u64> {
+        self.data.boltz_fee
+    }
+
+    /// The txid of the claim transaction of the swap
+    pub fn claim_txid(&self) -> Option<&str> {
+        self.data.claim_txid.as_deref()
+    }
+
+    /// The claim transaction fee estimate from Boltz API (in satoshis)
+    pub fn claim_fee(&self) -> Option<u64> {
+        self.data.claim_fee
+    }
+
+    /// The onchain amount that Boltz locks up for the swap
+    pub fn onchain_amount(&self) -> u64 {
+        self.data.create_reverse_response.onchain_amount
     }
 
     pub async fn advance(&mut self) -> Result<ControlFlow<bool, SwapStatus>, Error> {
@@ -334,9 +460,11 @@ impl InvoiceResponse {
                 Ok(ControlFlow::Break(true))
             }
             SwapState::TransactionMempool => {
+                log::info!("transaction.mempool Boltz funding tx");
                 self.handle_claim_transaction_if_necessary(update).await
             }
             SwapState::TransactionConfirmed => {
+                log::info!("transaction.confirmed Boltz funding tx");
                 self.handle_claim_transaction_if_necessary(update).await
             }
             SwapState::InvoiceSettled => {
@@ -358,13 +486,27 @@ impl InvoiceResponse {
             }),
         };
 
-        if let Ok(ControlFlow::Break(_)) = flow.as_ref() {
+        let is_completed = matches!(flow.as_ref(), Ok(ControlFlow::Break(_)));
+
+        if is_completed {
             // if the swap is terminated, but the caller call advance() again we don't
             // want to error for timeout (it will trigger NoBoltzUpdate)
             self.polling = true;
         }
 
         self.data.last_state = update_status;
+
+        // Persist state changes
+        if flow.is_ok() {
+            if is_completed {
+                // Final persist and move to completed list
+                self.persist()?;
+                self.move_to_completed()?;
+            } else {
+                // Persist intermediate state
+                self.persist()?;
+            }
+        }
 
         flow
     }

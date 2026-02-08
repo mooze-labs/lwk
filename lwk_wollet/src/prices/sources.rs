@@ -27,6 +27,7 @@ pub(super) enum Source {
     CoinGecko,
     Binance,
     CoinPaprika,
+    BlockchainInfo,
 }
 
 impl Source {
@@ -126,12 +127,13 @@ impl Source {
                 })
             }
             Source::Binance => {
-                let symbol = format!("BTC{}", currency.alpha3);
-                let (base_url, source_name) = if currency.alpha3 == "USD" {
-                    ("https://api.binance.us", "Binance US")
-                } else {
-                    ("https://api.binance.com", "Binance")
+                // Binance only supports a limited set of fiat currencies with accurate pricing
+                let (base_url, source_name) = match currency.alpha3 {
+                    "USD" => ("https://api.binance.us", "Binance US"),
+                    "EUR" | "BRL" | "ARS" => ("https://api.binance.com", "Binance"),
+                    _ => return Err(Error::Http("Currency not supported by Binance".to_string())),
                 };
+                let symbol = format!("BTC{}", currency.alpha3);
                 let url = format!("{base_url}/api/v3/ticker/price?symbol={symbol}");
                 let response: BinanceResponse = client
                     .get(&url)
@@ -176,6 +178,32 @@ impl Source {
                     rate,
                     currency: currency.clone(),
                     source: "CoinPaprika".to_string(),
+                    timestamp,
+                })
+            }
+            Source::BlockchainInfo => {
+                // Blockchain.info ticker returns prices for multiple currencies
+                // https://blockchain.info/ticker
+                let url = "https://blockchain.info/ticker";
+                let response: Value = client
+                    .get(url)
+                    .send()
+                    .await
+                    .map_err(|e| Error::Http(e.to_string()))?
+                    .json()
+                    .await
+                    .map_err(|e| Error::Http(e.to_string()))?;
+
+                let rate = response
+                    .get(currency.alpha3)
+                    .and_then(|c| c.get("last"))
+                    .and_then(|v| v.as_f64())
+                    .ok_or_else(|| Error::Http("Invalid Blockchain.info response".to_string()))?;
+
+                Ok(ExchangeRate {
+                    rate,
+                    currency: currency.clone(),
+                    source: "Blockchain.info".to_string(),
                     timestamp,
                 })
             }

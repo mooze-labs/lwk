@@ -17,7 +17,7 @@
   * [Issuance](issuance.md) ✅
   * [Reissuance](reissuance.md) ✅
   * [Burn](burn.md) ✅
-  * [Manual Coin Selection]() #(manual.md) ❌
+  * [Manual Coin Selection](manual.md) ✅
   * [Add External Inputs]() #(external.md) ❌
   * [Send All Funds](sendall.md) ✅
   * [Explicit Input and Outputs]() #(explicit.md) ❌
@@ -25,7 +25,7 @@
   * [AMP2]() #(amp2.md) ❌
   * [Jade]() #(jade.md) ❌
   * [Ledger]() #(ledger.md) ❌
-  * [LiquiDEX]() #(liquidex.md) ❌
+  * [LiquiDEX](liquidex.md) ✅
   * [Pegin]() #(pegin.md) ❌
   * [Bip85](bip85.md) ✅
   * [CLI]() #(cli.md) 🚧

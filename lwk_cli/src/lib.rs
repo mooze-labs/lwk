@@ -1,6 +1,6 @@
 #![doc = include_str!("../README.md")]
 #![cfg_attr(not(test), deny(clippy::unwrap_used))]
-#![cfg_attr(docsrs, feature(doc_auto_cfg))]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
@@ -76,7 +76,6 @@ pub fn inner_main(args: args::Cli) -> anyhow::Result<Value> {
                 ServerCommand::Start {
                     server_url,
                     server_type,
-                    #[cfg(feature = "registry")]
                     registry_url,
                     datadir,
                     timeout,
@@ -109,7 +108,6 @@ pub fn inner_main(args: args::Cli) -> anyhow::Result<Value> {
                     };
                     config.server_type = server_type.to_string();
 
-                    #[cfg(feature = "registry")]
                     if let Some(url) = registry_url {
                         config.registry_url = url;
                     };

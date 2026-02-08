@@ -20,7 +20,7 @@ mod tests {
     };
     use lwk_boltz::{
         clients::{AnyClient, ElectrumClient},
-        BoltzSession, InvoiceDataSerializable,
+        BoltzSession, InvoiceDataSerializable, SwapAsset, SwapPersistence,
     };
     use lwk_wollet::{elements, secp256k1::rand::thread_rng, ElementsNetwork};
 
@@ -144,13 +144,68 @@ mod tests {
             .await
             .unwrap();
         let claim_address = elements::Address::from_str(&claim_address).unwrap();
+
+        // Get quote before creating the swap
+        let invoice_amount = 100000u64;
+        let quote = session
+            .quote(invoice_amount)
+            .await
+            .send(SwapAsset::Lightning)
+            .receive(SwapAsset::Liquid)
+            .build()
+            .unwrap();
+        log::info!(
+            "Quote: send={}, receive={}, network_fee={}, boltz_fee={}",
+            quote.send_amount,
+            quote.receive_amount,
+            quote.network_fee,
+            quote.boltz_fee
+        );
+
         let invoice = session
-            .invoice(100000, None, &claim_address, None)
+            .invoice(invoice_amount, None, &claim_address, None)
             .await
             .unwrap();
+
+        // Verify that the swap response matches the quote
+        // The onchain_amount from Boltz minus the claim fee should equal the quoted receive amount
+        let claim_fee = invoice.claim_fee().expect("claim_fee should be set");
+        let onchain_amount = invoice.onchain_amount();
+        let expected_receive = onchain_amount - claim_fee - lwk_boltz::LIQUID_UNCOOPERATIVE_EXTRA;
+        assert_eq!(
+            expected_receive, quote.receive_amount,
+            "Quote receive_amount ({}) should match onchain_amount ({}) - claim_fee ({}) - extra (3) = {}",
+            quote.receive_amount, onchain_amount, claim_fee, expected_receive
+        );
+        log::info!(
+            "Quote verification passed: onchain_amount={}, claim_fee={}, expected_receive={}, quote.receive_amount={}",
+            onchain_amount,
+            claim_fee,
+            expected_receive,
+            quote.receive_amount
+        );
+
         log::info!("Invoice: {}", invoice.bolt11_invoice());
         utils::start_pay_invoice_lnd(invoice.bolt11_invoice().to_string());
         invoice.complete_pay().await.unwrap();
+
+        // Verify actual received balance matches quote
+        let actual_balance = utils::get_address_balance(
+            Chain::Liquid(LiquidChain::LiquidRegtest),
+            &claim_address.to_string(),
+        )
+        .await
+        .expect("Failed to get address balance");
+        assert_eq!(
+            actual_balance, quote.receive_amount,
+            "Actual received balance ({}) should match quote.receive_amount ({})",
+            actual_balance, quote.receive_amount
+        );
+        log::info!(
+            "Balance verification passed: actual_balance={}, quote.receive_amount={}",
+            actual_balance,
+            quote.receive_amount
+        );
 
         // complete a pay using advance
         let claim_address = utils::generate_address(Chain::Liquid(LiquidChain::LiquidRegtest))
@@ -353,6 +408,170 @@ mod tests {
         let invoice_response = session.restore_invoice(data).await.unwrap();
         utils::start_pay_invoice_lnd(invoice_response.bolt11_invoice().to_string());
         invoice_response.complete_pay().await.unwrap();
+
+        // Stop the mining task
+        mining_handle.abort();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires regtest environment"]
+    async fn test_session_restore_reverse_with_store() {
+        let _ = env_logger::try_init();
+
+        // Start concurrent block mining task
+        let mining_handle = utils::start_block_mining();
+
+        let claim_address = utils::generate_address(Chain::Liquid(LiquidChain::LiquidRegtest))
+            .await
+            .unwrap();
+        let claim_address = elements::Address::from_str(&claim_address).unwrap();
+        let client = Arc::new(
+            ElectrumClient::new(
+                DEFAULT_REGTEST_NODE,
+                false,
+                false,
+                ElementsNetwork::default_regtest(),
+            )
+            .unwrap(),
+        );
+        let mnemonic = Mnemonic::from_str(
+            "damp cart merit asset obvious idea chef traffic absent armed road link",
+        )
+        .unwrap();
+
+        // Create a shared store that persists across sessions
+        let store = Arc::new(lwk_common::MemoryStore::new());
+
+        let session = BoltzSession::builder(
+            ElementsNetwork::default_regtest(),
+            AnyClient::Electrum(client.clone()),
+        )
+        .create_swap_timeout(TIMEOUT)
+        .mnemonic(mnemonic.clone())
+        .store(store.clone())
+        .build()
+        .await
+        .unwrap();
+
+        // Initially no pending swaps
+        let pending = session.pending_swap_ids().unwrap();
+        assert!(pending.is_empty(), "Should start with no pending swaps");
+
+        // Create a second session with a DIFFERENT mnemonic but the SAME store
+        // This tests that encrypted keys don't collide between sessions
+        let mnemonic2 = Mnemonic::from_str(
+            "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+        )
+        .unwrap();
+        let session2 = BoltzSession::builder(
+            ElementsNetwork::default_regtest(),
+            AnyClient::Electrum(client.clone()),
+        )
+        .create_swap_timeout(TIMEOUT)
+        .mnemonic(mnemonic2.clone())
+        .store(store.clone())
+        .build()
+        .await
+        .unwrap();
+
+        // Session 2 should also see no pending swaps (different mnemonic = different encrypted keys)
+        let pending2 = session2.pending_swap_ids().unwrap();
+        assert!(
+            pending2.is_empty(),
+            "Session 2 should start with no pending swaps"
+        );
+
+        // Create a swap - it should be automatically persisted
+        let invoice_response = session
+            .invoice(100000, None, &claim_address, None)
+            .await
+            .unwrap();
+
+        let swap_id = invoice_response.swap_id().to_string();
+
+        // Verify swap is in pending list
+        let pending = session.pending_swap_ids().unwrap();
+        assert!(
+            pending.contains(&swap_id),
+            "Swap should be in pending list after creation"
+        );
+
+        // Verify swap data is stored
+        let swap_data = session.get_swap_data(&swap_id).unwrap();
+        assert!(swap_data.is_some(), "Swap data should be stored");
+
+        // IMPORTANT: Verify session2 cannot see session1's swap (key isolation test)
+        let pending2 = session2.pending_swap_ids().unwrap();
+        assert!(
+            !pending2.contains(&swap_id),
+            "Session 2 should NOT see session 1's swap - keys should be isolated"
+        );
+        assert!(
+            session2.get_swap_data(&swap_id).unwrap().is_none(),
+            "Session 2 should NOT be able to read session 1's swap data"
+        );
+
+        // Drop the sessions and response
+        drop(invoice_response);
+        drop(session);
+        drop(session2);
+
+        // Create a new session with the same store
+        let session = BoltzSession::builder(
+            ElementsNetwork::default_regtest(),
+            AnyClient::Electrum(client.clone()),
+        )
+        .create_swap_timeout(TIMEOUT)
+        .mnemonic(mnemonic)
+        .store(store.clone())
+        .build()
+        .await
+        .unwrap();
+
+        // Verify swap is still in pending list
+        let pending = session.pending_swap_ids().unwrap();
+        assert!(
+            pending.contains(&swap_id),
+            "Swap should still be in pending list after session restart"
+        );
+
+        // Restore the swap from store data
+        let swap_data_json = session.get_swap_data(&swap_id).unwrap().unwrap();
+        let data: InvoiceDataSerializable = serde_json::from_str(&swap_data_json).unwrap();
+        let invoice_response = session.restore_invoice(data).await.unwrap();
+
+        // Complete the swap
+        utils::start_pay_invoice_lnd(invoice_response.bolt11_invoice().to_string());
+        invoice_response.complete_pay().await.unwrap();
+
+        // Verify swap moved from pending to completed
+        let pending = session.pending_swap_ids().unwrap();
+        let completed = session.completed_swap_ids().unwrap();
+        assert!(
+            !pending.contains(&swap_id),
+            "Swap should not be in pending list after completion"
+        );
+        assert!(
+            completed.contains(&swap_id),
+            "Swap should be in completed list after completion"
+        );
+
+        // Test remove_swap
+        session.remove_swap(&swap_id).unwrap();
+        let pending = session.pending_swap_ids().unwrap();
+        let completed = session.completed_swap_ids().unwrap();
+        assert!(
+            !pending.contains(&swap_id),
+            "Swap should be removed from pending"
+        );
+        assert!(
+            !completed.contains(&swap_id),
+            "Swap should be removed from completed"
+        );
+        assert!(
+            session.get_swap_data(&swap_id).unwrap().is_none(),
+            "Swap data should be removed"
+        );
 
         // Stop the mining task
         mining_handle.abort();

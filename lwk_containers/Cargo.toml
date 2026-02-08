@@ -1,6 +1,6 @@
 [package]
 name = "lwk_containers"
-version = "0.10.0"
+version = "0.14.0"
 edition = "2021"
 description = "Liquid Wallet Kit - Docker containers for tests environment"
 license = "MIT OR BSD-2-Clause"
@@ -10,7 +10,7 @@ documentation = "https://docs.rs/lwk_containers"
 test = false
 
 [dependencies]
-elements = "0.25.0"
+elements.workspace = true
 rand = "0.8.5"
 tempfile = "3.8.0"
 testcontainers = "0.14.0"

@@ -171,8 +171,14 @@ pub enum Error {
     )]
     UnsupportedMultipathDescriptor,
 
-    #[error("Descriptor with segwit not v0 is not supported")]
-    UnsupportedDescriptorNonV0, // TODO add non supported descriptor type as field or split it further: UnsupportedDescriptorPreSegwit, UnsupportedDescriptorTaproot, UnsupportedDescriptorUnknownSegwitVersion
+    #[error("Unsupported pre-segwit descriptor")]
+    UnsupportedDescriptorPreSegwit,
+
+    #[error("Unsupported taproot descriptor")]
+    UnsupportedDescriptorTaproot,
+
+    #[error("Descriptor not supported: unknown segwit version")]
+    UnsupportedDescriptorSegwitUnknownVersion,
 
     #[error("Missing PSET")]
     MissingPset,
@@ -271,12 +277,32 @@ pub enum Error {
     #[cfg(feature = "amp0")]
     #[error("Cannot generate address for AMP0 wallets using this call, use Amp0::address()")]
     Amp0AddressError,
+
+    #[error("Unsupported (wollet does not have CT descriptor)")]
+    UnsupportedWithoutDescriptor,
+
+    #[error("Invalid SPK format: expected 'blinding_key_hex:script_pubkey_hex'")]
+    InvalidSpkFormat,
+
+    #[error("Index out of range")]
+    IndexOutOfRange,
 }
 
 // cannot derive automatically with this error because of trait bound
 impl From<aes_gcm_siv::aead::Error> for Error {
     fn from(err: aes_gcm_siv::aead::Error) -> Self {
         Self::Aes(err.to_string())
+    }
+}
+
+impl From<lwk_common::EncryptError> for Error {
+    fn from(err: lwk_common::EncryptError) -> Self {
+        match err {
+            lwk_common::EncryptError::MissingNonce => {
+                Self::Generic("Missing nonce in encrypted bytes".to_string())
+            }
+            lwk_common::EncryptError::Aead(err) => Self::Aes(err),
+        }
     }
 }
 

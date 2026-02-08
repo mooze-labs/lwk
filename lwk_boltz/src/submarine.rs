@@ -4,6 +4,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use aes_gcm_siv::Aes256GcmSiv;
 use bip39::Mnemonic;
 use boltz_client::boltz::{
     BoltzApiClientV2, CreateSubmarineRequest, CreateSubmarineResponse, RefundDetails,
@@ -20,9 +21,11 @@ use lwk_wollet::elements;
 use crate::error::Error;
 use crate::prepare_pay_data::{to_prepare_pay_data, PreparePayData, PreparePayDataSerializable};
 use crate::swap_state::SwapStateTrait;
+use crate::DynStore;
+use crate::SwapPersistence;
 use crate::{
     broadcast_tx_with_retry, mnemonic_identifier, next_status, BoltzSession, LightningPayment,
-    SwapState, SwapType, WAIT_TIME,
+    SwapState, SwapType,
 };
 
 pub struct PreparePayResponse {
@@ -35,11 +38,31 @@ pub struct PreparePayResponse {
     rx: tokio::sync::broadcast::Receiver<boltz_client::boltz::SwapStatus>,
     polling: bool,
     timeout_advance: Duration,
+    store: Option<Arc<dyn DynStore>>,
+    cipher: Option<Aes256GcmSiv>,
 }
 
 impl fmt::Debug for PreparePayResponse {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "PreparePayResponse {{ data: {:?}, swap_script: {:?},  api: {:?}, rx: {:?}, polling: {:?}, timeout_advance: {:?} }}", self.data, self.swap_script, self.api, self.rx, self.polling, self.timeout_advance)
+        write!(f, "PreparePayResponse {{ data: {:?}, swap_script: {:?}, api: {:?}, rx: {:?}, polling: {:?}, timeout_advance: {:?}, store: {:?} }}", self.data, self.swap_script, self.api, self.rx, self.polling, self.timeout_advance, self.store)
+    }
+}
+
+impl SwapPersistence for PreparePayResponse {
+    fn serialize(&self) -> Result<String, Error> {
+        let s: PreparePayDataSerializable = self.data.clone().into();
+        Ok(serde_json::to_string(&s)?)
+    }
+
+    fn swap_id(&self) -> &str {
+        &self.data.create_swap_response.id
+    }
+
+    fn store_and_cipher(&self) -> Option<(Arc<dyn DynStore>, Aes256GcmSiv)> {
+        match (self.store.as_ref(), self.cipher.as_ref()) {
+            (Some(store), Some(cipher)) => Some((Arc::clone(store), cipher.clone())),
+            _ => None,
+        }
     }
 }
 
@@ -56,6 +79,9 @@ impl BoltzSession {
             LightningPayment::Bolt11(invoice) => (invoice.to_string(), invoice),
             LightningPayment::Bolt12(_) => {
                 return Err(Error::Bolt12Unsupported);
+            }
+            LightningPayment::LnUrl(_) => {
+                return Err(Error::LnUrlUnsupported);
             }
         };
         let webhook_str = format!("{webhook:?}");
@@ -109,6 +135,14 @@ impl BoltzSession {
                 bolt11_invoice_str.clone(),
             ))?;
 
+        let boltz_fee = self
+            .swap_info
+            .lock()
+            .await
+            .submarine_pairs
+            .get_lbtc_to_btc_pair()
+            .map(|pair| pair.fees.boltz(bolt11_amount));
+
         log::info!("Got Swap Response from Boltz server {create_swap_response:?}");
 
         create_swap_response.validate(&bolt11_invoice_str, &refund_public_key, chain)?;
@@ -133,13 +167,21 @@ impl BoltzSession {
             create_swap_response.address,
             create_swap_response.bip21
         );
-        Ok(PreparePayResponse {
+
+        let store = self.clone_store();
+        let cipher = if store.is_some() {
+            Some(self.clone_cipher())
+        } else {
+            None
+        };
+        let response = PreparePayResponse {
             polling: self.polling,
             timeout_advance: self.timeout_advance,
             data: PreparePayData {
                 last_state: SwapState::InvoiceSet,
                 swap_type: SwapType::Submarine,
                 fee: Some(fee),
+                boltz_fee,
                 bolt11_invoice: Some((**bolt11_invoice).clone()),
                 our_keys,
                 refund_address: refund_address.to_string(),
@@ -151,7 +193,14 @@ impl BoltzSession {
             rx,
             api: self.api.clone(),
             chain_client: self.chain_client.clone(),
-        })
+            store,
+            cipher,
+        };
+
+        // Persist swap data and add to pending list
+        response.persist_and_add_to_pending()?;
+
+        Ok(response)
     }
 
     pub async fn restore_prepare_pay(
@@ -172,7 +221,13 @@ impl BoltzSession {
         let rx = self.ws.updates();
         self.ws.subscribe_swap(&swap_id).await?;
 
-        Ok(PreparePayResponse {
+        let store = self.clone_store();
+        let cipher = if store.is_some() {
+            Some(self.clone_cipher())
+        } else {
+            None
+        };
+        let response = PreparePayResponse {
             polling: self.polling,
             timeout_advance: self.timeout_advance,
             data,
@@ -180,7 +235,16 @@ impl BoltzSession {
             rx,
             api: self.api.clone(),
             chain_client: self.chain_client.clone(),
-        })
+            store,
+            cipher,
+        };
+
+        // If the swap was already in a terminal state, move it to completed
+        if response.data.last_state.is_terminal() {
+            response.move_to_completed()?;
+        }
+
+        Ok(response)
     }
 
     /// From the swaps returned by the boltz api via [`BoltzSession::swap_restore`]:
@@ -197,7 +261,13 @@ impl BoltzSession {
         swaps
             .iter()
             .filter(|e| matches!(e.swap_type, SwapRestoreType::Submarine))
-            .filter(|e| e.status != "swap.expired" && e.status != "transaction.claimed")
+            .filter(|e| {
+                e.status != "swap.expired"
+                    && e.status != "transaction.claimed"
+                    && e.status != "swap.created"
+                    && e.status != "invoice.set"
+                    && e.status != "transaction.refunded"
+            })
             .map(|e| {
                 convert_swap_restore_response_to_prepare_pay_data(
                     e,
@@ -242,12 +312,15 @@ pub(crate) fn convert_swap_restore_response_to_prepare_pay_data(
     };
 
     // Reconstruct CreateSubmarineResponse from RefundDetails
+    // Note: expected_amount is not available from the Boltz API restore response,
+    // so we set it to 0. Callers should track the amount separately or recover it
+    // from on-chain transaction data.
     let create_swap_response = CreateSubmarineResponse {
         accept_zero_conf: false, // Default for restored swaps
         address: refund_details.lockup_address.clone(),
         bip21: String::new(), // Not available in restore response
         claim_public_key,
-        expected_amount: 0, // Not available in restore response
+        expected_amount: 0,
         id: e.id.clone(),
         referral_id: None, // This is important only at creation time
         swap_tree: refund_details.tree.clone(),
@@ -273,12 +346,13 @@ pub(crate) fn convert_swap_restore_response_to_prepare_pay_data(
         create_swap_response,
         key_index: refund_details.key_index,
         mnemonic_identifier: mnemonic_identifier(mnemonic)?,
+        boltz_fee: None, // TODO
     })
 }
 
 impl PreparePayResponse {
     async fn next_status(&mut self) -> Result<SwapStatus, Error> {
-        let swap_id = self.swap_id();
+        let swap_id = self.swap_id().to_string();
         next_status(&mut self.rx, self.timeout_advance, &swap_id, self.polling).await
     }
 
@@ -288,10 +362,11 @@ impl PreparePayResponse {
     ) -> Result<ControlFlow<bool, SwapStatus>, Error> {
         log::info!("submarine_cooperative_claim");
         if let Some(bolt_11_invoice) = &self.data.bolt11_invoice {
+            let swap_id = self.swap_id().to_string();
             let response = self
                 .swap_script
                 .submarine_cooperative_claim(
-                    &self.swap_id(),
+                    &swap_id,
                     &self.data.our_keys,
                     &bolt_11_invoice.to_string(),
                     &self.api,
@@ -333,19 +408,7 @@ impl PreparePayResponse {
             }
             SwapState::TransactionLockupFailed | SwapState::InvoiceFailedToPay => {
                 log::warn!("transaction.lockupFailed Boltz failed to lockup funding tx");
-                sleep(WAIT_TIME).await;
-                let tx = self
-                    .swap_script
-                    .construct_refund(SwapTransactionParams {
-                        keys: self.data.our_keys,
-                        output_address: self.data.refund_address.to_string(),
-                        fee: Fee::Relative(0.12), // TODO make it configurable
-                        swap_id: self.swap_id(),
-                        chain_client: &self.chain_client,
-                        boltz_client: &self.api,
-                        options: None,
-                    })
-                    .await?;
+                let tx = self.make_refund_tx_with_retry().await?;
 
                 let txid = broadcast_tx_with_retry(&self.chain_client, &tx).await?;
                 log::info!("Cooperative Refund Successfully broadcasted: {txid}");
@@ -368,13 +431,15 @@ impl PreparePayResponse {
                 Ok(ControlFlow::Break(false))
             }
             ref e => Err(Error::UnexpectedUpdate {
-                swap_id: self.swap_id(),
+                swap_id: self.swap_id().to_string(),
                 status: e.to_string(),
                 last_state: self.data.last_state,
             }),
         };
 
-        if let Ok(ControlFlow::Break(_)) = flow.as_ref() {
+        let is_completed = matches!(flow.as_ref(), Ok(ControlFlow::Break(_)));
+
+        if is_completed {
             // if the swap is terminated, but the caller call advance() again we don't
             // want to error for timeout (it will trigger NoBoltzUpdate)
             self.polling = true;
@@ -382,12 +447,51 @@ impl PreparePayResponse {
 
         self.data.last_state = update_status;
 
+        // Persist state changes
+        if flow.is_ok() {
+            if is_completed {
+                // Final persist and move to completed list
+                self.persist()?;
+                self.move_to_completed()?;
+            } else {
+                // Persist intermediate state
+                self.persist()?;
+            }
+        }
+
         flow
     }
 
-    pub fn serialize(&self) -> Result<String, Error> {
-        let s: PreparePayDataSerializable = self.data.clone().into();
-        Ok(serde_json::to_string(&s)?)
+    async fn make_refund_tx_with_retry(
+        &mut self,
+    ) -> Result<boltz_client::swaps::BtcLikeTransaction, Error> {
+        for _ in 0..5 {
+            match self.make_refund_tx().await {
+                Ok(tx) => {
+                    return Ok(tx);
+                }
+                Err(e) => {
+                    log::warn!("Failed to make refund tx {e:?}, retrying...");
+                    sleep(Duration::from_secs(1)).await;
+                }
+            }
+        }
+        Err(Error::FailBuildingRefundTransaction)
+    }
+
+    async fn make_refund_tx(&mut self) -> Result<boltz_client::swaps::BtcLikeTransaction, Error> {
+        Ok(self
+            .swap_script
+            .construct_refund(SwapTransactionParams {
+                keys: self.data.our_keys,
+                output_address: self.data.refund_address.to_string(),
+                fee: Fee::Relative(0.12), // TODO make it configurable
+                swap_id: self.swap_id().to_string(),
+                chain_client: &self.chain_client,
+                boltz_client: &self.api,
+                options: None,
+            })
+            .await?)
     }
 
     pub async fn complete_pay(mut self) -> Result<bool, Error> {
@@ -403,10 +507,6 @@ impl PreparePayResponse {
         }
     }
 
-    pub fn swap_id(&self) -> String {
-        self.data.create_swap_response.id.clone()
-    }
-
     pub fn uri_address(&self) -> Result<elements::Address, Error> {
         Ok(elements::Address::from_str(
             &self.data.create_swap_response.address,
@@ -420,11 +520,18 @@ impl PreparePayResponse {
         self.data.create_swap_response.bip21.clone()
     }
 
-    /// The fee of the swap provider
+    /// The fee of the swap provider and the network fee
     ///
     /// It is equal to the amount requested onchain minus the amount of the bolt11 invoice.
-    /// Does not include the fee of the onchain transaction.
     pub fn fee(&self) -> Option<u64> {
         self.data.fee
+    }
+
+    /// The fee of the swap provider
+    ///
+    /// It is equal to the invoice amount multiplied by the boltz fee rate.
+    /// For example for paying an invoice of 1000 satoshi with a 0.1% rate would be 1 satoshi.
+    pub fn boltz_fee(&self) -> Option<u64> {
+        self.data.boltz_fee
     }
 }

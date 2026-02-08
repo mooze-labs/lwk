@@ -1,5 +1,12 @@
 use std::collections::{HashMap, HashSet};
 
+use crate::{
+    hashes::Hash,
+    liquidex::{self, LiquidexError, Validated},
+    model::{ExternalUtxo, IssuanceDetails, Recipient},
+    pset_create::{validate_address, IssuanceRequest, SECP256K1_SURJECTIONPROOF_MAX_N_INPUTS},
+    Contract, ElementsNetwork, Error, LiquidexProposal, UnvalidatedRecipient, Wollet, EC,
+};
 use elements::{
     confidential::{AssetBlindingFactor, Nonce, Value, ValueBlindingFactor},
     issuance::ContractHash,
@@ -8,6 +15,7 @@ use elements::{
     Address, AssetId, BlindAssetProofs, BlindValueProofs, EcdsaSighashType, OutPoint, Script,
     Transaction, TxOut, TxOutSecrets,
 };
+use lwk_common::calculate_fee;
 use rand::thread_rng;
 
 use crate::{
@@ -834,8 +842,7 @@ impl TxBuilder {
             inp_weight + tx_weight
         };
 
-        let vsize = weight.div_ceil(4);
-        let fee = (vsize as f32 * self.fee_rate / 1000.0).ceil() as u64;
+        let fee = calculate_fee(weight, self.fee_rate);
         if satoshi_in <= (satoshi_out + fee) {
             return Err(Error::InsufficientFunds {
                 missing_sats: (satoshi_out + fee + 1) - satoshi_in, // +1 to ensure we have more than just equal
@@ -1213,8 +1220,7 @@ impl TxBuilder {
             inp_weight + tx_weight
         };
 
-        let vsize = weight.div_ceil(4);
-        let fee = (vsize as f32 * self.fee_rate / 1000.0).ceil() as u64;
+        let fee = calculate_fee(weight, self.fee_rate);
         if satoshi_in <= (satoshi_out + fee) {
             return Err(Error::InsufficientFunds {
                 missing_sats: (satoshi_out + fee + 1) - satoshi_in, // +1 to ensure we have more than just equal

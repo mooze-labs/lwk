@@ -19,7 +19,7 @@ use elements::{
     encode::Decodable, hashes::hex::FromHex, hex::ToHex, pset::serialize::Serialize, BlockHash,
     Script, Txid,
 };
-use elements_miniscript::{ConfidentialDescriptor, DescriptorPublicKey};
+use elements_miniscript::DescriptorPublicKey;
 
 #[cfg(target_arch = "wasm32")]
 use futures::lock::Mutex;
@@ -388,7 +388,7 @@ impl EsploraClient {
             let scripts_with_blinding_pubkey: Vec<(_, _, _, _)> = scripts
                 .iter()
                 .map(|(script, (chain, child, blinding_pubkey))| {
-                    (*chain, *child, script.clone(), Some(*blinding_pubkey))
+                    (*chain, *child, script.clone(), *blinding_pubkey)
                 })
                 .collect();
 
@@ -423,7 +423,7 @@ impl EsploraClient {
             let chain: Chain = (&descriptor).try_into().unwrap_or(Chain::External);
             let index = index.max(last_unused[chain]);
             loop {
-                let batch = cache.get_script_batch(batch_count, &descriptor)?;
+                let batch = cache.get_script_batch(batch_count, &descriptor, chain)?;
 
                 let s: Vec<_> = batch.value.iter().map(|e| &e.0).collect();
                 let result: Vec<Vec<History>> = self.get_scripts_history(&s).await?;
@@ -470,6 +470,11 @@ impl EsploraClient {
                 }
 
                 batch_count += 1;
+
+                if !descriptor.has_wildcard() {
+                    // No wildcard, 1 loop is enough
+                    return Ok(data);
+                }
             }
         }
         Ok(data)
@@ -494,6 +499,25 @@ impl EsploraClient {
         }
     }
 
+    /// Returns a descriptor, potentially encrypted if encryption is enabled.
+    ///
+    /// Uses cached encrypted descriptors when available to enable HTTP caching.
+    async fn get_or_encrypt_descriptor(&mut self, base_desc: &str) -> Result<String, Error> {
+        if self.waterfalls_avoid_encryption {
+            return Ok(base_desc.to_string());
+        }
+
+        if let Some(encrypted_descriptor) = self.waterfalls_encrypted_descriptors.get(base_desc) {
+            return Ok(encrypted_descriptor.clone());
+        }
+
+        let recipient = self.waterfalls_server_recipient().await?;
+        let encrypted_descriptor = encrypt(base_desc, recipient)?;
+        self.waterfalls_encrypted_descriptors
+            .insert(base_desc.to_string(), encrypted_descriptor.clone());
+        Ok(encrypted_descriptor)
+    }
+
     pub(crate) async fn get_history_waterfalls<S: WolletState>(
         &mut self,
         descriptor: &WolletDescriptor,
@@ -504,7 +528,7 @@ impl EsploraClient {
         if descriptor.is_elip151() {
             return Err(Error::UsingWaterfallsWithElip151);
         }
-        let base_desc = descriptor.bitcoin_descriptor_without_key_origin();
+        let base_desc = descriptor.bitcoin_descriptor_without_key_origin()?;
 
         let mut page = 0;
         let mut data = Data::default();
@@ -525,21 +549,7 @@ impl EsploraClient {
                 self.utxo_only
             );
 
-            let desc = base_desc.clone();
-            let desc = if self.waterfalls_avoid_encryption {
-                desc
-            } else {
-                match self.waterfalls_encrypted_descriptors.get(&desc) {
-                    Some(encrypted_descriptor) => encrypted_descriptor.clone(),
-                    None => {
-                        let recipient = self.waterfalls_server_recipient().await?;
-                        let encrypted_descriptor = encrypt(&desc, recipient)?;
-                        self.waterfalls_encrypted_descriptors
-                            .insert(desc, encrypted_descriptor.clone());
-                        encrypted_descriptor
-                    }
-                }
-            };
+            let desc = self.get_or_encrypt_descriptor(&base_desc).await?;
 
             let full_url = format!(
                 "{}?descriptor={}&page={}&to_index={}&utxo_only={}",
@@ -598,12 +608,7 @@ impl EsploraClient {
                     let child = ChildNumber::from(
                         waterfalls_result.page as u32 * WATERFALLS_MAX_ADDRESSES as u32 + i as u32,
                     );
-                    let ct_desc = ConfidentialDescriptor {
-                        key: descriptor.as_ref().key.clone(),
-                        descriptor: desc.clone(),
-                    };
-                    let (script, blinding_pubkey, cached) =
-                        cache.get_or_derive(chain, child, &ct_desc)?;
+                    let (script, blinding_pubkey, cached) = cache.get_or_derive(chain, child)?;
                     if !cached {
                         data.scripts.insert(script, (chain, child, blinding_pubkey));
                     }
@@ -645,6 +650,47 @@ impl EsploraClient {
         Ok(data)
     }
 
+    /// Query the last used derivation index for a descriptor from the waterfalls server.
+    ///
+    /// This method queries the waterfalls `/v1/last_used_index` endpoint to get the last used
+    /// derivation index for both external and internal chains of the given descriptor.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::WaterfallsUnimplemented` if this client was not configured with waterfalls support.
+    /// Returns `Error::UsingWaterfallsWithElip151` if the descriptor uses ELIP151 blinding.
+    pub async fn last_used_index(
+        &mut self,
+        descriptor: &WolletDescriptor,
+    ) -> Result<LastUsedIndexResponse, Error> {
+        if !self.waterfalls {
+            return Err(Error::WaterfallsUnimplemented);
+        }
+        if descriptor.is_elip151() {
+            return Err(Error::UsingWaterfallsWithElip151);
+        }
+
+        let base_desc = descriptor.bitcoin_descriptor_without_key_origin()?;
+        let desc = self.get_or_encrypt_descriptor(&base_desc).await?;
+
+        let url = format!(
+            "{}/v1/last_used_index?descriptor={}",
+            self.base_url,
+            url_encode_descriptor(&desc)
+        );
+
+        let response = self.get_with_retry(&url).await?;
+        let status = response.status();
+        let body = response.text().await?;
+
+        if status != StatusCode::OK {
+            return Err(Error::Generic(body));
+        }
+
+        let result: LastUsedIndexResponse = serde_json::from_str(&body)?;
+        Ok(result)
+    }
+
     /// Avoid encrypting the descriptor when calling the waterfalls endpoint.
     pub fn avoid_encryption(&mut self) {
         self.waterfalls_avoid_encryption = true;
@@ -658,7 +704,7 @@ impl EsploraClient {
     async fn download_txs(
         &self,
         history_txs_id: &HashSet<Txid>,
-        scripts: &HashMap<Script, (Chain, ChildNumber, BlindingPublicKey)>,
+        scripts: &HashMap<Script, (Chain, ChildNumber, Option<BlindingPublicKey>)>,
         cache: &Cache,
         descriptor: &WolletDescriptor,
     ) -> Result<DownloadTxResult, Error> {
@@ -958,7 +1004,10 @@ pub async fn async_sleep(millis: u64) {
 #[cfg(not(target_arch = "wasm32"))]
 /// Get the current time in milliseconds since the UNIX epoch
 pub async fn async_now() -> u64 {
-    tokio::time::Instant::now().elapsed().as_millis() as u64
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("Failed to get current time")
+        .as_millis() as u64
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -998,6 +1047,21 @@ struct Status {
 struct WaterfallsResult {
     pub txs_seen: HashMap<String, Vec<Vec<History>>>,
     pub page: u16,
+    pub tip: Option<BlockHash>,
+}
+
+/// Response from the last_used_index endpoint
+///
+/// Returns the highest derivation index that has been used (has transaction history)
+/// for both external and internal chains. This is useful for quickly determining
+/// the next unused address without downloading full transaction history.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct LastUsedIndexResponse {
+    /// Last used index on the external (receive) chain, or None if no addresses have been used.
+    pub external: Option<u32>,
+    /// Last used index on the internal (change) chain, or None if no addresses have been used.
+    pub internal: Option<u32>,
+    /// Current blockchain tip hash for reference.
     pub tip: Option<BlockHash>,
 }
 

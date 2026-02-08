@@ -6,11 +6,10 @@ use crate::{
 };
 use elements::{
     bitcoin::bip32::ChildNumber,
-    confidential::{Asset, Nonce, Value},
+    confidential::{Asset, AssetBlindingFactor, Nonce, Value, ValueBlindingFactor},
     AssetIssuance, LockTime, Script, Sequence, TxInWitness, TxOut, TxOutSecrets,
 };
 use elements::{BlockHash, OutPoint, Txid};
-use lwk_common::derive_blinding_key;
 use serde::Deserialize;
 use std::{
     collections::{HashMap, HashSet},
@@ -158,7 +157,7 @@ pub struct Data {
     pub txid_height: HashMap<Txid, Option<Height>>,
 
     /// The new scripts that are involved in the update.
-    pub scripts: HashMap<Script, (Chain, ChildNumber, BlindingPublicKey)>,
+    pub scripts: HashMap<Script, (Chain, ChildNumber, Option<BlindingPublicKey>)>,
 
     /// The last unused index for each chain.
     pub last_unused: LastUnused,
@@ -210,12 +209,19 @@ pub struct History {
 pub fn try_unblind(output: &TxOut, descriptor: &WolletDescriptor) -> Result<TxOutSecrets, Error> {
     match (output.asset, output.value, output.nonce) {
         (Asset::Confidential(_), Value::Confidential(_), Nonce::Confidential(_)) => {
-            let receiver_sk = derive_blinding_key(descriptor.as_ref(), &output.script_pubkey)
-                .ok_or_else(|| Error::MissingPrivateBlindingKey)?;
+            let receiver_sk = descriptor
+                .blinding_key_for_script(&output.script_pubkey)
+                .ok_or(Error::MissingPrivateBlindingKey)?;
             let txout_secrets = output.unblind(&EC, receiver_sk)?;
 
             Ok(txout_secrets)
         }
+        (Asset::Explicit(asset), Value::Explicit(value), _) => Ok(TxOutSecrets::new(
+            asset,
+            AssetBlindingFactor::zero(),
+            value,
+            ValueBlindingFactor::zero(),
+        )),
         _ => Err(Error::Generic(
             "received unconfidential or null asset/value/nonce".into(),
         )),

@@ -4,13 +4,17 @@ use elements::{
     hex::ToHex,
     pset::serialize::{Deserialize, Serialize},
 };
-use lwk_wollet::WalletTx;
+use lwk_wollet::{WalletTx, EC};
 
 use crate::{
+    blockdata::tx_in_witness::TxInWitness,
     types::{AssetId, Hex},
     LwkError, TxIn, TxOut, Txid,
 };
-use std::{fmt::Display, sync::Arc};
+use std::{
+    fmt::Display,
+    sync::{Arc, Mutex},
+};
 
 /// A Liquid transaction
 #[derive(uniffi::Object, PartialEq, Eq, Debug, Clone)]
@@ -102,6 +106,67 @@ impl Transaction {
             .iter()
             .map(|i| Arc::new(i.clone().into()))
             .collect()
+    }
+
+    /// Verify transaction amount proofs against UTXOs.
+    ///
+    /// See [`elements::Transaction::verify_tx_amt_proofs`].
+    pub fn verify_tx_amt_proofs(&self, utxos: Vec<Arc<TxOut>>) -> Result<(), LwkError> {
+        let utxos_inner: Vec<elements::TxOut> = utxos.iter().map(|u| u.as_ref().into()).collect();
+        self.inner.verify_tx_amt_proofs(&EC, &utxos_inner)?;
+        Ok(())
+    }
+}
+
+/// Editor for modifying transactions.
+///
+/// See [`elements::Transaction`] for more details.
+#[derive(uniffi::Object, Debug)]
+pub struct TransactionEditor {
+    inner: Mutex<Option<elements::Transaction>>,
+}
+
+fn editor_consumed() -> LwkError {
+    LwkError::ObjectConsumed
+}
+
+#[uniffi::export]
+impl TransactionEditor {
+    /// Create an editor from an existing transaction.
+    #[uniffi::constructor]
+    pub fn from_transaction(tx: &Transaction) -> Arc<Self> {
+        Arc::new(Self {
+            inner: Mutex::new(Some(tx.inner.clone())),
+        })
+    }
+
+    /// Set the witness for a specific input.
+    pub fn set_input_witness(
+        &self,
+        input_index: u32,
+        witness: &TxInWitness,
+    ) -> Result<(), LwkError> {
+        let idx = input_index as usize;
+        let mut lock = self.inner.lock()?;
+        let inner = lock.as_mut().ok_or_else(editor_consumed)?;
+        if idx >= inner.input.len() {
+            return Err(LwkError::Generic {
+                msg: format!(
+                    "Input index {} out of bounds (transaction has {} inputs)",
+                    input_index,
+                    inner.input.len()
+                ),
+            });
+        }
+        inner.input[idx].witness = witness.as_ref().clone();
+        Ok(())
+    }
+
+    /// Build the transaction, consuming the editor.
+    pub fn build(&self) -> Result<Arc<Transaction>, LwkError> {
+        let mut lock = self.inner.lock()?;
+        let inner = lock.take().ok_or_else(editor_consumed)?;
+        Ok(Arc::new(Transaction { inner }))
     }
 }
 

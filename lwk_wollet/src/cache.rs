@@ -1,9 +1,8 @@
-use crate::descriptor::Chain;
+use crate::descriptor::{Chain, WolletDescriptor};
 use crate::elements::{BlockHash, OutPoint, Script, Transaction, TxOutSecrets, Txid};
 use crate::hashes::Hash;
 use crate::{BlindingPublicKey, Error};
 use elements::bitcoin::bip32::ChildNumber;
-use elements_miniscript::{ConfidentialDescriptor, DescriptorPublicKey};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -21,7 +20,7 @@ pub struct Cache {
     pub paths: HashMap<Script, (Chain, ChildNumber)>,
 
     /// inverse of `paths`, with the blinding public key for each script
-    pub scripts: HashMap<(Chain, ChildNumber), (Script, BlindingPublicKey)>,
+    pub scripts: HashMap<(Chain, ChildNumber), (Script, Option<BlindingPublicKey>)>,
 
     /// contains only my wallet txs with the relative heights (None if unconfirmed)
     pub heights: HashMap<Txid, Option<Height>>,
@@ -100,23 +99,41 @@ impl std::hash::Hash for Cache {
 #[derive(Default, Debug)]
 pub struct ScriptBatch {
     pub cached: bool,
-    pub value: Vec<(Script, (Chain, ChildNumber, BlindingPublicKey))>,
+    #[allow(clippy::type_complexity)]
+    pub value: Vec<(Script, (Chain, ChildNumber, Option<BlindingPublicKey>))>,
 }
 
 impl Cache {
     pub fn get_script_batch(
         &self,
         batch: u32,
-        descriptor: &ConfidentialDescriptor<DescriptorPublicKey>, // non confidential (we need only script_pubkey), non multipath (we need to be able to derive with index)
+        descriptor: &WolletDescriptor,
+        ext_int: Chain,
     ) -> Result<ScriptBatch, Error> {
         let mut result = ScriptBatch {
             cached: true,
             ..Default::default()
         };
 
+        // For Spks, return all scripts in batch 0, empty for subsequent batches
+        if let Some(count) = descriptor.spk_count() {
+            if batch > 0 {
+                return Ok(result);
+            }
+            for j in 0..count as u32 {
+                let child = ChildNumber::from_normal_idx(j)?;
+                let (script, blinding_pubkey, cached) =
+                    self.get_or_derive(Chain::External, child, descriptor)?;
+                result.cached = cached;
+                result
+                    .value
+                    .push((script, (Chain::External, child, blinding_pubkey)));
+            }
+            return Ok(result);
+        }
+
         let start = batch * BATCH_SIZE;
         let end = start + BATCH_SIZE;
-        let ext_int: Chain = descriptor.try_into().unwrap_or(Chain::External);
         for j in start..end {
             let child = ChildNumber::from_normal_idx(j)?;
             let (script, blinding_pubkey, cached) =
@@ -134,14 +151,14 @@ impl Cache {
         &self,
         ext_int: Chain,
         child: ChildNumber,
-        descriptor: &ConfidentialDescriptor<DescriptorPublicKey>,
-    ) -> Result<(Script, BlindingPublicKey, bool), Error> {
+        descriptor: &WolletDescriptor,
+    ) -> Result<(Script, Option<BlindingPublicKey>, bool), Error> {
         let opt_script = self.scripts.get(&(ext_int, child));
         let (script, blinding_pubkey, cached) = match opt_script {
             Some((script, blinding_pubkey)) => (script.clone(), *blinding_pubkey, true),
             None => {
                 let (script, blinding_pubkey) =
-                    crate::wollet::derive_script_and_blinding_key(descriptor, child)?;
+                    descriptor.derive_script_and_blinding_key(ext_int, child)?;
                 (script, blinding_pubkey, false)
             }
         };
@@ -188,13 +205,17 @@ mod tests {
         let cache = Cache::default();
 
         let x = cache
-            .get_script_batch(0, &desc.as_single_descriptors().unwrap()[0])
+            .get_script_batch(
+                0,
+                &desc.as_single_descriptors().unwrap()[0],
+                crate::descriptor::Chain::External,
+            )
             .unwrap();
-        assert_eq!(format!("{:?}", x.value[0]), "(Script(OP_0 OP_PUSHBYTES_20 d11ef9e68385138627b09d52d6fe12662d049224), (External, Normal { index: 0 }, PublicKey(0525054b498a69342d90750ed5e8f91cb6fb4da48735fd7011fdbcfc0e8edee1f0a30ed1e5c1d730e281b73f70f02dec2cbe20d0ac864d3d3d6942a02d66c6e3)))");
+        assert_eq!(format!("{:?}", x.value[0]), "(Script(OP_0 OP_PUSHBYTES_20 d11ef9e68385138627b09d52d6fe12662d049224), (External, Normal { index: 0 }, Some(PublicKey(0525054b498a69342d90750ed5e8f91cb6fb4da48735fd7011fdbcfc0e8edee1f0a30ed1e5c1d730e281b73f70f02dec2cbe20d0ac864d3d3d6942a02d66c6e3))))");
         assert_ne!(x.value[0], x.value[1]);
         let addr2 = Address::from_script(
             &x.value[0].0,
-            Some(x.value[0].1 .2),
+            x.value[0].1 .2,
             &AddressParams::LIQUID_TESTNET,
         )
         .unwrap();

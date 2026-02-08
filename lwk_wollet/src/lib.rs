@@ -1,5 +1,5 @@
 #![cfg_attr(not(test), deny(clippy::unwrap_used))]
-#![cfg_attr(docsrs, feature(doc_auto_cfg))]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 #![warn(missing_docs)]
 
 //! LWK is a collection of libraries for Liquid wallets.
@@ -104,6 +104,10 @@ mod model;
 mod network;
 pub mod pegin;
 mod persister;
+
+#[cfg(feature = "prices")]
+mod pos;
+
 mod pset_create;
 pub mod registry;
 mod tx_builder;
@@ -138,6 +142,9 @@ pub use crate::wollet::{Tip, Wollet, WolletBuilder};
 pub use crate::prices::{
     CurrencyCode, ExchangeRate, ExchangeRates, PricesFetcher, PricesFetcherBuilder,
 };
+
+#[cfg(feature = "prices")]
+pub use crate::pos::PosConfig;
 
 #[cfg(feature = "electrum")]
 pub use crate::wollet::full_scan_to_index_with_electrum_client;

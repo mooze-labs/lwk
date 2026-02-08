@@ -61,7 +61,11 @@ impl<C: BlockchainBackend> TestWollet<C> {
         let db_root_dir = TempDir::new().unwrap();
 
         let network = ElementsNetwork::default_regtest();
-        let descriptor = add_checksum(desc);
+        let descriptor = if desc.starts_with("ct") {
+            add_checksum(desc)
+        } else {
+            desc.to_string()
+        };
 
         let desc: WolletDescriptor = descriptor.parse().unwrap();
         let mut wollet = Wollet::with_fs_persist(network, desc, &db_root_dir).unwrap();
@@ -110,8 +114,16 @@ impl<C: BlockchainBackend> TestWollet<C> {
         sync(&mut self.wollet, &mut self.client);
     }
 
+    fn has_descriptor(&self) -> bool {
+        self.wollet
+            .wollet_descriptor()
+            .to_string()
+            .starts_with("ct(")
+    }
+
     pub fn address(&self) -> Address {
-        self.wollet.address(None).unwrap().address().clone()
+        let index = (!self.has_descriptor()).then_some(0);
+        self.wollet.address(index).unwrap().address().clone()
     }
 
     pub fn address_result(&self, last_unused: Option<u32>) -> AddressResult {
@@ -196,7 +208,7 @@ impl<C: BlockchainBackend> TestWollet<C> {
         satoshi: u64,
         address: Option<Address>,
         asset: Option<AssetId>,
-    ) {
+    ) -> Txid {
         let explicit_utxos_before = self.wollet.explicit_utxos().unwrap().len();
 
         let address = address
@@ -207,6 +219,7 @@ impl<C: BlockchainBackend> TestWollet<C> {
 
         let explicit_utxos_after = self.wollet.explicit_utxos().unwrap().len();
         assert_eq!(explicit_utxos_after, explicit_utxos_before + 1);
+        txid
     }
 
     /// Send 10_000 satoshi to self with default fee rate.
@@ -262,14 +275,18 @@ impl<C: BlockchainBackend> TestWollet<C> {
         assert!(tx.inputs.iter().filter(|o| o.is_some()).count() > 0);
         assert!(tx.outputs.iter().filter(|o| o.is_some()).count() > 0);
 
-        self.wollet.descriptor().descriptor.for_each_key(|k| {
-            if let DescriptorPublicKey::XPub(x) = k {
-                if let Some(origin) = &x.origin {
-                    assert_eq!(pset.global.xpub.get(&x.xkey).unwrap(), origin);
+        self.wollet
+            .descriptor()
+            .unwrap()
+            .descriptor
+            .for_each_key(|k| {
+                if let DescriptorPublicKey::XPub(x) = k {
+                    if let Some(origin) = &x.origin {
+                        assert_eq!(pset.global.xpub.get(&x.xkey).unwrap(), origin);
+                    }
                 }
-            }
-            true
-        });
+                true
+            });
     }
 
     /// Send all L-BTC
@@ -628,7 +645,7 @@ impl<C: BlockchainBackend> TestWollet<C> {
     }
 
     pub fn check_persistence(wollet: TestWollet<C>) {
-        let descriptor = wollet.wollet.descriptor().to_string();
+        let descriptor = wollet.wollet.descriptor().unwrap().to_string();
         let expected_updates = wollet.wollet.updates().unwrap();
         let expected = wollet.wollet.balance().unwrap();
         let db_root_dir = wollet.db_root_dir();

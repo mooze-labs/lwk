@@ -23,6 +23,8 @@ pub enum SwapState {
     SwapExpired,
     ServerTransactionMempool,
     ServerTransactionConfirmed,
+    TransactionZeroconfRejected,
+    TransactionRefunded,
 }
 
 pub trait SwapStateTrait {
@@ -33,6 +35,23 @@ impl SwapStateTrait for SwapStatus {
         self.status
             .parse::<SwapState>()
             .map_err(|_| Error::InvalidSwapState(self.status.clone()))
+    }
+}
+
+impl SwapState {
+    /// Returns true if this state is terminal (swap has completed or failed).
+    ///
+    /// Terminal states indicate the swap has reached a final outcome and
+    /// no further `advance()` calls will change it.
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self,
+            SwapState::TransactionClaimed
+                | SwapState::TransactionDirect
+                | SwapState::InvoiceSettled
+                | SwapState::InvoiceExpired
+                | SwapState::SwapExpired
+        )
     }
 }
 
@@ -56,6 +75,8 @@ impl std::fmt::Display for SwapState {
             SwapState::SwapExpired => "swap.expired",
             SwapState::ServerTransactionMempool => "transaction.server.mempool",
             SwapState::ServerTransactionConfirmed => "transaction.server.confirmed",
+            SwapState::TransactionZeroconfRejected => "transaction.zeroconf.rejected",
+            SwapState::TransactionRefunded => "transaction.refunded",
         };
         write!(f, "{s}")
     }
@@ -83,6 +104,8 @@ impl std::str::FromStr for SwapState {
             "swap.expired" => Ok(SwapState::SwapExpired),
             "transaction.server.mempool" => Ok(SwapState::ServerTransactionMempool),
             "transaction.server.confirmed" => Ok(SwapState::ServerTransactionConfirmed),
+            "transaction.zeroconf.rejected" => Ok(SwapState::TransactionZeroconfRejected),
+            "transaction.refunded" => Ok(SwapState::TransactionRefunded),
             _ => Err(format!("Unknown swap status: {s}")),
         }
     }
@@ -130,6 +153,8 @@ mod tests {
             SwapState::SwapExpired,
             SwapState::ServerTransactionMempool,
             SwapState::ServerTransactionConfirmed,
+            SwapState::TransactionZeroconfRejected,
+            SwapState::TransactionRefunded,
         ]
     }
 

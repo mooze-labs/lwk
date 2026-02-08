@@ -1,3 +1,4 @@
+use std::array::TryFromSliceError;
 use std::sync::{MutexGuard, PoisonError};
 
 use elements::pset::ParseError;
@@ -47,6 +48,14 @@ impl From<ParseError> for LwkError {
 
 impl From<elements::pset::Error> for LwkError {
     fn from(value: elements::pset::Error) -> Self {
+        LwkError::Generic {
+            msg: format!("{value:?}"),
+        }
+    }
+}
+
+impl From<elements::pset::PsetBlindError> for LwkError {
+    fn from(value: elements::pset::PsetBlindError) -> Self {
         LwkError::Generic {
             msg: format!("{value:?}"),
         }
@@ -177,10 +186,68 @@ impl From<elements::bitcoin::secp256k1::Error> for LwkError {
     }
 }
 
+impl From<elements::bitcoin::key::FromSliceError> for LwkError {
+    fn from(value: elements::bitcoin::key::FromSliceError) -> Self {
+        LwkError::Generic {
+            msg: format!("{value:?}"),
+        }
+    }
+}
+
+impl From<elements::bitcoin::key::ParsePublicKeyError> for LwkError {
+    fn from(value: elements::bitcoin::key::ParsePublicKeyError) -> Self {
+        LwkError::Generic {
+            msg: format!("{value:?}"),
+        }
+    }
+}
+
+impl From<elements::secp256k1_zkp::Error> for LwkError {
+    fn from(value: elements::secp256k1_zkp::Error) -> Self {
+        LwkError::Generic {
+            msg: format!("{value:?}"),
+        }
+    }
+}
+
 impl From<elements::bitcoin::bip32::Error> for LwkError {
     fn from(value: elements::bitcoin::bip32::Error) -> Self {
         LwkError::Generic {
             msg: format!("{value:?}"),
+        }
+    }
+}
+
+impl From<elements::locktime::Error> for LwkError {
+    fn from(value: elements::locktime::Error) -> Self {
+        LwkError::Generic {
+            msg: format!("{value:?}"),
+        }
+    }
+}
+
+impl From<elements::VerificationError> for LwkError {
+    fn from(value: elements::VerificationError) -> Self {
+        LwkError::Generic {
+            msg: format!("{value:?}"),
+        }
+    }
+}
+
+#[cfg(feature = "simplicity")]
+impl From<lwk_simplicity::error::ProgramError> for LwkError {
+    fn from(value: lwk_simplicity::error::ProgramError) -> Self {
+        LwkError::Generic {
+            msg: format!("{value:?}"),
+        }
+    }
+}
+
+#[cfg(feature = "simplicity")]
+impl From<lwk_simplicity::simplicityhl::error::RichError> for LwkError {
+    fn from(value: lwk_simplicity::simplicityhl::error::RichError) -> Self {
+        LwkError::Generic {
+            msg: format!("{value}"),
         }
     }
 }
@@ -193,8 +260,48 @@ impl From<elements::UnblindError> for LwkError {
     }
 }
 
+impl From<elements::bitcoin::taproot::TaprootBuilderError> for LwkError {
+    fn from(value: elements::bitcoin::taproot::TaprootBuilderError) -> Self {
+        LwkError::Generic {
+            msg: format!("{value:?}"),
+        }
+    }
+}
+
+impl From<elements::bitcoin::taproot::TaprootError> for LwkError {
+    fn from(value: elements::bitcoin::taproot::TaprootError) -> Self {
+        LwkError::Generic {
+            msg: format!("{value:?}"),
+        }
+    }
+}
+
+impl From<elements::bitcoin::taproot::HiddenNodesError> for LwkError {
+    fn from(value: elements::bitcoin::taproot::HiddenNodesError) -> Self {
+        LwkError::Generic {
+            msg: format!("{value:?}"),
+        }
+    }
+}
+
 impl From<lwk_wollet::elements_miniscript::psbt::Error> for LwkError {
     fn from(value: lwk_wollet::elements_miniscript::psbt::Error) -> Self {
+        LwkError::Generic {
+            msg: format!("{value:?}"),
+        }
+    }
+}
+
+impl From<TryFromSliceError> for LwkError {
+    fn from(value: TryFromSliceError) -> Self {
+        LwkError::Generic {
+            msg: format!("{value:?}"),
+        }
+    }
+}
+
+impl From<elements::bitcoin::address::ParseError> for LwkError {
+    fn from(value: elements::bitcoin::address::ParseError) -> Self {
         LwkError::Generic {
             msg: format!("{value:?}"),
         }

@@ -1,6 +1,6 @@
 use std::{fmt, str::FromStr, time::Duration};
 
-use lwk_boltz::{InvoiceDataSerializable, PreparePayDataSerializable};
+use lwk_boltz::{InvoiceDataSerializable, PreparePayDataSerializable, SwapPersistence};
 use wasm_bindgen::prelude::*;
 
 use crate::{Address, Error, Network};
@@ -333,7 +333,7 @@ impl LightningPayment {
     #[wasm_bindgen(constructor)]
     pub fn new(invoice: &str) -> Result<LightningPayment, Error> {
         let payment = lwk_boltz::LightningPayment::from_str(invoice)
-            .map_err(|(e1, e2)| Error::Generic(format!("{e1:?}, {e2:?}")))?;
+            .map_err(|(e1, e2, e3)| Error::Generic(format!("{e1:?}, {e2:?}, {e3:?}")))?;
         Ok(payment.into())
     }
 
@@ -351,7 +351,9 @@ impl LightningPayment {
     }
 }
 
-#[cfg(all(test, target_arch = "wasm32"))]
+// Launch boltz regtest and activate "boltz_regtest" to launch these tests
+// (these tests relies on .env file, created by boltz regtest, to be present at compile time)
+#[cfg(all(test, target_arch = "wasm32", feature = "boltz_regtest"))]
 mod tests {
     use wasm_bindgen_test::*;
 
@@ -399,7 +401,6 @@ mod tests {
             .unwrap();
     }
 
-    // #[ignore = "requires regtest environment"]
     #[wasm_bindgen_test]
     async fn test_boltz_submarine_reverse() {
         let network = Network::regtest_default();

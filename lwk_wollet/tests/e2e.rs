@@ -1,7 +1,13 @@
 mod amp0;
+mod fees;
+mod prune;
+#[cfg(feature = "registry")]
+mod registry;
+mod spks;
 mod test_jade;
 mod test_ledger;
 mod test_wollet;
+mod tr;
 
 use crate::test_jade::jade_setup;
 use clients::blocking::{self, BlockchainBackend};
@@ -19,7 +25,6 @@ use lwk_wollet::pegin::fetch_last_full_header;
 use lwk_wollet::*;
 use std::{collections::HashSet, str::FromStr};
 use test_wollet::{generate_signer, test_client_electrum, wait_for_tx, TestWollet};
-use waterfalls::{be, Family};
 
 #[test]
 fn liquid_send_jade_signer() {
@@ -254,7 +259,6 @@ fn unsupported_descriptor() {
     let view_key = generate_view_key();
     let desc_p2pkh = format!("ct({view_key},elpkh({xpub1}/*))");
     let desc_p2sh = format!("ct({view_key},elsh(pkh({xpub1}/*)))",);
-    let desc_p2tr = format!("ct({view_key},eltr({xpub1}/*))");
 
     let desc_multi_path_1 = format!("ct({view_key},elwpkh({xpub1}/<0;1;2>/*))");
     let desc_multi_path_2 = format!("ct({view_key},elwpkh({xpub1}/<0;1>/0/*))");
@@ -263,9 +267,8 @@ fn unsupported_descriptor() {
     let desc_multi_path_5 = format!("ct({view_key},elwsh(multi(2,{xpub1}/<0;1>/*,{xpub2}/0/*)))");
 
     for (desc, err) in [
-        (desc_p2pkh, Error::UnsupportedDescriptorNonV0),
-        (desc_p2sh, Error::UnsupportedDescriptorNonV0),
-        (desc_p2tr, Error::UnsupportedDescriptorNonV0),
+        (desc_p2pkh, Error::UnsupportedDescriptorPreSegwit),
+        (desc_p2sh, Error::UnsupportedDescriptorPreSegwit),
         (desc_multi_path_1, Error::UnsupportedMultipathDescriptor),
         (desc_multi_path_2, Error::UnsupportedMultipathDescriptor),
         (desc_multi_path_3, Error::UnsupportedMultipathDescriptor),
@@ -1034,6 +1037,34 @@ async fn test_esplora_requests_counter() {
     println!("Total requests made: {}", client.requests());
 }
 
+// TODO: add a regtest test for last_used_index when there is a waterfalls release published on crates
+#[ignore = "require network calls"]
+#[cfg(feature = "esplora")]
+#[tokio::test]
+async fn test_esplora_waterfalls_last_used_index() {
+    let url = "https://waterfalls.liquidwebwallet.org/liquid/api";
+    let desc = "ct(slip77(2411e278affa5c47010eab6d313c1ec66628ec0dd03b6fc98d1a05a0618719e6),elwpkh([a8874235/84'/1776'/0']xpub6DLHCiTPg67KE9ksCjNVpVHTRDHzhCSmoBTKzp2K4FxLQwQvvdNzuqxhK2f9gFVCN6Dori7j2JMLeDoB4VqswG7Et9tjqauAvbDmzF8NEPH/<0;1>/*))#upsg7h8m";
+    let desc = WolletDescriptor::from_str(desc).unwrap();
+
+    let mut client = clients::asyncr::EsploraClientBuilder::new(url, ElementsNetwork::Liquid)
+        .waterfalls(true)
+        .build()
+        .unwrap();
+
+    let result = client.last_used_index(&desc).await.unwrap();
+
+    // The descriptor has been used, so external or internal should be Some
+    assert!(result.external.is_some() || result.internal.is_some());
+    // Tip should be present and a valid block hash (non-zero)
+    assert!(result.tip.is_some());
+    assert_ne!(
+        result.tip.unwrap().to_string(),
+        "0000000000000000000000000000000000000000000000000000000000000000"
+    );
+
+    println!("result: {result:?}");
+}
+
 #[ignore = "require network calls"]
 #[cfg(feature = "esplora")]
 #[tokio::test]
@@ -1124,13 +1155,9 @@ async fn test_esplora_wasm_waterfalls_desc(desc: &str, url: &str) -> usize {
 }
 
 #[cfg(feature = "esplora")]
-#[tokio::test]
-async fn test_esplora_waterfalls_utxo_only() {
-    use clients::asyncr::{self, async_sleep};
-
-    init_logging();
-    let exe = std::env::var("ELEMENTSD_EXEC").unwrap();
-    let test_env = waterfalls::test_env::launch(exe, Family::Elements).await;
+#[test]
+fn test_esplora_waterfalls_utxo_only() {
+    let env = TestEnvBuilder::from_env().with_waterfalls().build();
 
     let signer = generate_signer();
     let view_key = generate_view_key();
@@ -1140,28 +1167,27 @@ async fn test_esplora_waterfalls_utxo_only() {
 
     let network = ElementsNetwork::default_regtest();
     let mut wollet = Wollet::without_persist(network, desc.clone()).unwrap();
-    let mut client = asyncr::EsploraClientBuilder::new(test_env.base_url(), network)
+    let mut client = asyncr::EsploraClientBuilder::new(&env.waterfalls_url(), network)
         .waterfalls(true)
-        .build()
+        .build_blocking()
         .unwrap();
 
     let mut wollet_utxo_only = Wollet::without_persist(network, desc.clone()).unwrap();
-    let mut client_utxo_only = asyncr::EsploraClientBuilder::new(test_env.base_url(), network)
+    let mut client_utxo_only = asyncr::EsploraClientBuilder::new(&env.waterfalls_url(), network)
         .waterfalls(true)
         .utxo_only(true)
-        .build()
+        .build_blocking()
         .unwrap();
 
     let address = wollet.address(None).unwrap();
-    test_env.send_to(&to_be(address.address()), 1_000_000);
-    async_sleep(2_000).await;
+    let _txid = env.elementsd_sendtoaddress(address.address(), 1_000_000, None);
+    std::thread::sleep(std::time::Duration::from_millis(2_000));
 
     // check both wallets have the same balance
-    let update = client.full_scan(&wollet).await.unwrap().unwrap();
+    let update = client.full_scan(&wollet).unwrap().unwrap();
     wollet.apply_update(update).unwrap();
     let update = client_utxo_only
         .full_scan(&wollet_utxo_only)
-        .await
         .unwrap()
         .unwrap();
     wollet_utxo_only.apply_update(update).unwrap();
@@ -1181,11 +1207,10 @@ async fn test_esplora_waterfalls_utxo_only() {
     );
 
     // spend from wollet and sync again both wallets
-    let address = test_env.get_new_address(None);
-    let address = address.elements().unwrap();
+    let address = env.elementsd_getnewaddress();
     let mut pset = wollet
         .tx_builder()
-        .add_lbtc_recipient(address, 100_000)
+        .add_lbtc_recipient(&address, 100_000)
         .unwrap()
         .finish()
         .unwrap()
@@ -1195,16 +1220,15 @@ async fn test_esplora_waterfalls_utxo_only() {
 
     let tx = wollet.finalize(&mut pset).unwrap();
 
-    client.broadcast(&tx).await.unwrap();
+    client.broadcast(&tx).unwrap();
 
-    test_env.node_generate(1).await; // TODO: remove this
-    async_sleep(2_000).await;
+    env.elementsd_generate(1); // TODO: remove this
+    std::thread::sleep(std::time::Duration::from_millis(2_000));
 
-    let update = client.full_scan(&wollet).await.unwrap().unwrap();
+    let update = client.full_scan(&wollet).unwrap().unwrap();
     wollet.apply_update(update).unwrap();
     let update = client_utxo_only
         .full_scan(&wollet_utxo_only)
-        .await
         .unwrap()
         .unwrap();
     wollet_utxo_only.apply_update(update).unwrap();
@@ -1233,8 +1257,6 @@ async fn test_esplora_waterfalls_utxo_only() {
         .unwrap()
         .iter()
         .all(|tx| !tx.outputs.is_empty()));
-
-    test_env.shutdown().await;
 }
 
 #[cfg(feature = "esplora")]
@@ -1808,6 +1830,49 @@ fn test_external_utxo() {
 }
 
 #[test]
+fn test_external_not_lwk() {
+    // Simulate a case where we need to sign a PSET where
+    // some of the inputs belong to an external wallet that
+    // is not LWK, and some information might be missing
+    let env = TestEnvBuilder::from_env().with_electrum().build();
+
+    let s1 = generate_signer();
+    let d1 = format!("ct({},elwpkh({}/*))", generate_view_key(), s1.xpub());
+    let client = test_client_electrum(&env.electrum_url());
+    let mut w1 = TestWollet::new(client, &d1);
+
+    let s2 = generate_signer();
+    let d2 = format!("ct({},elsh(wpkh({}/*)))", generate_view_key(), s2.xpub());
+    let client = test_client_electrum(&env.electrum_url());
+    let mut w2 = TestWollet::new(client, &d2);
+
+    w1.fund_btc(&env);
+    w2.fund_btc(&env);
+
+    let utxo = &w2.wollet.utxos().unwrap()[0];
+    let external_utxo = w2.make_external(utxo);
+
+    let node_address = env.elementsd_getnewaddress();
+    let mut pset = w1
+        .tx_builder()
+        .add_lbtc_recipient(&node_address, 110_000)
+        .unwrap()
+        .add_external_utxos(vec![external_utxo])
+        .unwrap()
+        .finish()
+        .unwrap();
+
+    // Remove data from the external UTXO: some external wallets
+    // do not share this data so we should not rely on them being there
+    let inp = &mut pset.inputs_mut()[0];
+    assert_eq!(inp.previous_txid, utxo.outpoint.txid);
+    inp.redeem_script = None; // required to compute sighash if p2sh
+
+    let sigs_added = s1.sign(&mut pset).unwrap();
+    assert_eq!(sigs_added, 1);
+}
+
+#[test]
 fn test_unblinded_utxo() {
     // Receive unblinded utxo and spend it
     let env = TestEnvBuilder::from_env().with_electrum().build();
@@ -1823,9 +1888,24 @@ fn test_unblinded_utxo() {
 
     // Fund the wallet with an unblinded UTXO
     let satoshi = 100_000;
-    w.fund_explicit(&env, satoshi, None, None);
+    let txid = w.fund_explicit(&env, satoshi, None, None);
 
     assert_eq!(w.balance(&policy_asset), 0);
+    assert_eq!(w.wollet.transactions().unwrap().len(), 1);
+    let tx = w.wollet.transaction(&txid).unwrap().unwrap();
+    assert!(tx.inputs.iter().all(|i| i.is_none()));
+    let txout = tx
+        .outputs
+        .iter()
+        .find(|o| o.is_some())
+        .unwrap()
+        .as_ref()
+        .unwrap();
+    assert_eq!(txout.unblinded.value, satoshi);
+    assert!(txout.address.blinding_pubkey.is_none());
+    assert_eq!(*tx.balance.get(&policy_asset).unwrap_or(&0), 0);
+    assert_eq!(w.wollet.utxos().unwrap().len(), 0);
+    assert_eq!(w.wollet.txos().unwrap().len(), 1);
 
     let external_utxo = w.wollet.explicit_utxos().unwrap()[0].clone();
 
@@ -2287,7 +2367,7 @@ fn test_non_standard_gap_limit_waterfalls_esplora() {
 }
 
 #[test]
-fn test_manual_coin_selection() {
+fn test_manual_coin_selection() -> Result<(), Box<dyn std::error::Error>> {
     let env = TestEnvBuilder::from_env().with_electrum().build();
 
     let signer = generate_signer();
@@ -2305,7 +2385,9 @@ fn test_manual_coin_selection() {
     env.elementsd_generate(1);
 
     assert_eq!(w.balance(&policy_asset), 600_000);
-    let utxos = w.wollet.utxos().unwrap();
+    // ANCHOR: get_utxos
+    let utxos = w.wollet.utxos()?;
+    // ANCHOR_END: get_utxos
     assert_eq!(utxos.len(), 2);
     assert_eq!(
         utxos[0].unblinded.value, 500_000,
@@ -2331,10 +2413,11 @@ fn test_manual_coin_selection() {
         .unwrap_err();
     assert!(matches!(err, Error::InsufficientFunds { .. }));
 
+    // ANCHOR: manual_coin_selection
+    let sent_satoshi = 200_000;
     let mut pset = w
         .tx_builder()
-        .add_recipient(&node_address, 200_000, policy_asset)
-        .unwrap()
+        .add_recipient(&node_address, sent_satoshi, policy_asset)?
         .set_wallet_utxos(vec![utxos[0].outpoint])
         .finish()
         .unwrap()
@@ -2344,6 +2427,7 @@ fn test_manual_coin_selection() {
     signer.sign(&mut pset).unwrap();
     let tx = w.wollet.finalize(&mut pset).unwrap();
     let tx = serialize(&tx);
+    // ANCHOR_END: manual_coin_selection
     assert!(env.elementsd_testmempoolaccept(&tx.to_hex()));
 
     let mut pset = w
@@ -2398,6 +2482,7 @@ fn test_manual_coin_selection() {
         .unwrap_err();
     assert!(matches!(err, Error::InsufficientFunds { .. }));
 
+    // ANCHOR: manual_coin_selection_asset
     // One asset and LBTC
     let mut pset = w
         .tx_builder()
@@ -2413,6 +2498,7 @@ fn test_manual_coin_selection() {
     let tx = w.wollet.finalize(&mut pset).unwrap();
     let tx = serialize(&tx);
     assert!(env.elementsd_testmempoolaccept(&tx.to_hex()));
+    // ANCHOR_END: manual_coin_selection_asset
 
     // Two assets and LBTC
     let mut pset = w
@@ -2454,6 +2540,8 @@ fn test_manual_coin_selection() {
     let tx = w.wollet.finalize(&mut pset).unwrap();
     let tx = serialize(&tx);
     assert!(env.elementsd_testmempoolaccept(&tx.to_hex()));
+
+    Ok(())
 }
 
 #[ignore = "This test connects to liquid testnet"]
@@ -2605,6 +2693,7 @@ fn liquidex<C: BlockchainBackend>(
     sats_recv: u64,
     asset_recv: elements::AssetId,
 ) {
+    // ANCHOR: liquidex_make
     // LiquiDEX make
     let addr = wallet_maker.address_result(None).address().clone();
     let mut pset = wallet_maker
@@ -2616,21 +2705,24 @@ fn liquidex<C: BlockchainBackend>(
         .0;
 
     let details = wallet_maker.wollet.get_details(&pset).unwrap();
-    assert_eq!(details.balance.fee, 0);
-    let asset_send = pset.inputs()[0].asset.unwrap();
-    let sats_send = pset.inputs()[0].amount.unwrap();
-    let from_details_send = *details.balance.balances.get(&asset_send).unwrap();
-    let from_details_recv = *details.balance.balances.get(&asset_recv).unwrap();
-    assert_eq!(from_details_send, -(sats_send as i64));
-    assert_eq!(from_details_recv, sats_recv as i64);
+    assert_eq!(details.balance.fee, 0); // ANCHOR: ignore
+    let asset_send = pset.inputs()[0].asset.unwrap(); // ANCHOR: ignore
+    let sats_send = pset.inputs()[0].amount.unwrap(); // ANCHOR: ignore
+    let from_details_send = *details.balance.balances.get(&asset_send).unwrap(); // ANCHOR: ignore
+    let from_details_recv = *details.balance.balances.get(&asset_recv).unwrap(); // ANCHOR: ignore
+    assert_eq!(from_details_send, -(sats_send as i64)); // ANCHOR: ignore
+    assert_eq!(from_details_recv, sats_recv as i64); // ANCHOR: ignore
 
     wallet_maker.sign(signer_maker, &mut pset);
     let proposal = LiquidexProposal::from_pset(&pset).unwrap();
+    // ANCHOR_END: liquidex_make
 
+    // ANCHOR: liquidex_validate
     let txid = proposal.needed_tx().unwrap();
-    assert_eq!(txid, utxo_send.txid);
+    assert_eq!(txid, utxo_send.txid); // ANCHOR: ignore
     let tx = wallet_maker.wollet.transaction(&txid).unwrap().unwrap().tx;
     let proposal = proposal.validate(tx).unwrap();
+    // ANCHOR_END: liquidex_validate
 
     // Extract validated assets and amounts from the proposal
     let AssetAmount {
@@ -2646,6 +2738,7 @@ fn liquidex<C: BlockchainBackend>(
     assert_eq!(maker_output_sats, sats_recv);
     assert_eq!(maker_output_asset, asset_recv);
 
+    // ANCHOR: liquidex_take
     // LiquiDEX take
     let mut pset = wallet_taker
         .tx_builder()
@@ -2671,8 +2764,10 @@ fn liquidex<C: BlockchainBackend>(
     assert_eq!(from_details_send, sats_send as i64);
     assert_eq!(from_details_recv, -(sats_recv as i64));
 
+    // ANCHOR: liquidex_take_2
     wallet_taker.sign(signer_taker, &mut pset);
     let _txid = wallet_taker.send(&mut pset);
+    // ANCHOR_END: liquidex_take_2
     wait_tx_update(wallet_maker);
 }
 
@@ -3604,10 +3699,6 @@ fn test_fee_service() {
     let tx = w.wollet.finalize(&mut pset).unwrap();
     let txid = w.client.broadcast(&tx).unwrap();
     wait_for_tx(&mut w.wollet, &mut w.client, &txid);
-}
-
-fn to_be(addr: &elements::Address) -> be::Address {
-    be::Address::Elements(addr.clone())
 }
 
 #[tokio::test]

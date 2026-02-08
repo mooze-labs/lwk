@@ -17,7 +17,7 @@ mod tests {
     };
     use lwk_boltz::{
         clients::{AnyClient, ElectrumClient},
-        BoltzSession, LightningPayment, PreparePayDataSerializable,
+        BoltzSession, LightningPayment, PreparePayDataSerializable, SwapPersistence,
     };
     use lwk_wollet::{elements, secp256k1::rand::thread_rng, ElementsNetwork};
 
@@ -309,6 +309,290 @@ mod tests {
         .await
         .unwrap();
         prepare_pay_response.complete_pay().await.unwrap();
+
+        // Stop the mining task
+        mining_handle.abort();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires regtest environment"]
+    async fn test_session_restore_submarine_from_swap_list() {
+        let _ = env_logger::try_init();
+
+        // Start concurrent block mining task
+        let mining_handle = utils::start_block_mining();
+        let mnemonic = Mnemonic::from_str(
+            "damp cart merit asset obvious idea chef traffic absent armed road link",
+        )
+        .unwrap();
+
+        let refund_address = utils::generate_address(Chain::Liquid(LiquidChain::LiquidRegtest))
+            .await
+            .unwrap();
+        let refund_address = elements::Address::from_str(&refund_address).unwrap();
+        let client = Arc::new(
+            ElectrumClient::new(
+                DEFAULT_REGTEST_NODE,
+                false,
+                false,
+                ElementsNetwork::default_regtest(),
+            )
+            .unwrap(),
+        );
+
+        let session = BoltzSession::builder(
+            ElementsNetwork::default_regtest(),
+            AnyClient::Electrum(client.clone()),
+        )
+        .create_swap_timeout(TIMEOUT)
+        .mnemonic(mnemonic.clone())
+        .build()
+        .await
+        .unwrap();
+
+        // Create a swap but don't complete it
+        let bolt11_invoice = utils::generate_invoice_lnd(50_000).await.unwrap();
+        let lightning_payment = LightningPayment::from_str(&bolt11_invoice).unwrap();
+        let prepare_pay_response = session
+            .prepare_pay(&lightning_payment, &refund_address, None)
+            .await
+            .unwrap();
+
+        let swap_id = prepare_pay_response.swap_id();
+        let swap_list = session.swap_restore().await.unwrap();
+        let restorable = session
+            .restorable_submarine_swaps(&swap_list, &refund_address)
+            .await
+            .unwrap();
+        let swaps: Vec<_> = restorable
+            .iter()
+            .filter(|data| data.create_swap_response.id == swap_id)
+            .collect();
+        log::info!("Found {swaps:?} restorable submarine swaps");
+        assert_eq!(swaps.len(), 0); // the just created swap is not restorable.
+
+        utils::send_to_address(
+            Chain::Liquid(LiquidChain::LiquidRegtest),
+            &prepare_pay_response.uri_address().unwrap().to_string(),
+            prepare_pay_response.uri_amount(),
+        )
+        .await
+        .unwrap();
+        sleep(Duration::from_secs(3)).await;
+        let swap_id = prepare_pay_response.swap_id().to_string();
+
+        // Drop the response and session (simulating app crash/restart without serializing)
+        drop(prepare_pay_response);
+        drop(session);
+
+        // Create a new session with the same mnemonic
+        let session = BoltzSession::builder(
+            ElementsNetwork::default_regtest(),
+            AnyClient::Electrum(client.clone()),
+        )
+        .create_swap_timeout(TIMEOUT)
+        .mnemonic(mnemonic)
+        .build()
+        .await
+        .unwrap();
+
+        // Get all swaps from Boltz API
+        let swap_list = session.swap_restore().await.unwrap();
+        log::info!("Found {} swaps in swap_restore", swap_list.len());
+
+        // Filter to get restorable submarine swaps
+        let restorable = session
+            .restorable_submarine_swaps(&swap_list, &refund_address)
+            .await
+            .unwrap();
+        log::info!("Found {} restorable submarine swaps", restorable.len());
+
+        // Find our swap in the restorable list
+        let our_swap: PreparePayDataSerializable = restorable
+            .into_iter()
+            .map(|data| data.into())
+            .find(|data: &PreparePayDataSerializable| data.create_swap_response.id == swap_id)
+            .expect("Our swap should be in the restorable list");
+
+        // Restore and complete the swap
+        let prepare_pay_response = session.restore_prepare_pay(our_swap).await.unwrap();
+        // Use the captured expected_amount since uri_amount() returns 0 for restored swaps
+        // (see WORKAROUND comment above)
+
+        prepare_pay_response.complete_pay().await.unwrap();
+        log::info!("Swap completed successfully");
+
+        // Stop the mining task
+        mining_handle.abort();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires regtest environment"]
+    async fn test_session_restore_submarine_with_store() {
+        let _ = env_logger::try_init();
+
+        // Start concurrent block mining task
+        let mining_handle = utils::start_block_mining();
+        let mnemonic = Mnemonic::from_str(
+            "damp cart merit asset obvious idea chef traffic absent armed road link",
+        )
+        .unwrap();
+
+        let refund_address = utils::generate_address(Chain::Liquid(LiquidChain::LiquidRegtest))
+            .await
+            .unwrap();
+        let refund_address = elements::Address::from_str(&refund_address).unwrap();
+        let client = Arc::new(
+            ElectrumClient::new(
+                DEFAULT_REGTEST_NODE,
+                false,
+                false,
+                ElementsNetwork::default_regtest(),
+            )
+            .unwrap(),
+        );
+
+        // Create a shared store that persists across sessions
+        let store = Arc::new(lwk_common::MemoryStore::new());
+
+        let session = BoltzSession::builder(
+            ElementsNetwork::default_regtest(),
+            AnyClient::Electrum(client.clone()),
+        )
+        .create_swap_timeout(TIMEOUT)
+        .mnemonic(mnemonic.clone())
+        .store(store.clone())
+        .build()
+        .await
+        .unwrap();
+
+        // Initially no pending swaps
+        let pending = session.pending_swap_ids().unwrap();
+        assert!(pending.is_empty(), "Should start with no pending swaps");
+
+        // Create a second session with a DIFFERENT mnemonic but the SAME store
+        // This tests that encrypted keys don't collide between sessions
+        let mnemonic2 = Mnemonic::from_str(
+            "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+        )
+        .unwrap();
+        let session2 = BoltzSession::builder(
+            ElementsNetwork::default_regtest(),
+            AnyClient::Electrum(client.clone()),
+        )
+        .create_swap_timeout(TIMEOUT)
+        .mnemonic(mnemonic2.clone())
+        .store(store.clone())
+        .build()
+        .await
+        .unwrap();
+
+        // Session 2 should also see no pending swaps (different mnemonic = different encrypted keys)
+        let pending2 = session2.pending_swap_ids().unwrap();
+        assert!(
+            pending2.is_empty(),
+            "Session 2 should start with no pending swaps"
+        );
+
+        // Create a swap - it should be automatically persisted
+        let bolt11_invoice = utils::generate_invoice_lnd(50_000).await.unwrap();
+        let lightning_payment = LightningPayment::from_str(&bolt11_invoice).unwrap();
+        let prepare_pay_response = session
+            .prepare_pay(&lightning_payment, &refund_address, None)
+            .await
+            .unwrap();
+
+        let swap_id = prepare_pay_response.swap_id().to_string();
+
+        // Verify swap is in pending list
+        let pending = session.pending_swap_ids().unwrap();
+        assert!(
+            pending.contains(&swap_id),
+            "Swap should be in pending list after creation"
+        );
+
+        // Verify swap data is stored
+        let swap_data = session.get_swap_data(&swap_id).unwrap();
+        assert!(swap_data.is_some(), "Swap data should be stored");
+
+        // IMPORTANT: Verify session2 cannot see session1's swap (key isolation test)
+        let pending2 = session2.pending_swap_ids().unwrap();
+        assert!(
+            !pending2.contains(&swap_id),
+            "Session 2 should NOT see session 1's swap - keys should be isolated"
+        );
+        assert!(
+            session2.get_swap_data(&swap_id).unwrap().is_none(),
+            "Session 2 should NOT be able to read session 1's swap data"
+        );
+
+        // Drop the sessions and response
+        drop(prepare_pay_response);
+        drop(session);
+        drop(session2);
+
+        // Create a new session with the same store
+        let session = BoltzSession::builder(
+            ElementsNetwork::default_regtest(),
+            AnyClient::Electrum(client.clone()),
+        )
+        .create_swap_timeout(TIMEOUT)
+        .mnemonic(mnemonic)
+        .store(store.clone())
+        .build()
+        .await
+        .unwrap();
+
+        // Verify swap is still in pending list
+        let pending = session.pending_swap_ids().unwrap();
+        assert!(
+            pending.contains(&swap_id),
+            "Swap should still be in pending list after session restart"
+        );
+
+        // Restore the swap from store data
+        let swap_data_json = session.get_swap_data(&swap_id).unwrap().unwrap();
+        let data = PreparePayDataSerializable::deserialize(&swap_data_json).unwrap();
+        let prepare_pay_response = session.restore_prepare_pay(data).await.unwrap();
+
+        // Send funds and complete the swap
+        utils::send_to_address(
+            Chain::Liquid(LiquidChain::LiquidRegtest),
+            &prepare_pay_response.uri_address().unwrap().to_string(),
+            prepare_pay_response.uri_amount(),
+        )
+        .await
+        .unwrap();
+        prepare_pay_response.complete_pay().await.unwrap();
+
+        // Verify swap moved from pending to completed
+        let pending = session.pending_swap_ids().unwrap();
+        let completed = session.completed_swap_ids().unwrap();
+        assert!(
+            !pending.contains(&swap_id),
+            "Swap should not be in pending list after completion"
+        );
+        assert!(
+            completed.contains(&swap_id),
+            "Swap should be in completed list after completion"
+        );
+
+        // Test remove_swap
+        session.remove_swap(&swap_id).unwrap();
+        let pending = session.pending_swap_ids().unwrap();
+        let completed = session.completed_swap_ids().unwrap();
+        assert!(
+            !pending.contains(&swap_id),
+            "Swap should be removed from pending"
+        );
+        assert!(
+            !completed.contains(&swap_id),
+            "Swap should be removed from completed"
+        );
+        assert!(
+            session.get_swap_data(&swap_id).unwrap().is_none(),
+            "Swap data should be removed"
+        );
 
         // Stop the mining task
         mining_handle.abort();

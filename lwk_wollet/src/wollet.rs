@@ -17,7 +17,7 @@ use crate::util::EC;
 use crate::ElementsNetwork;
 use crate::{BlindingPublicKey, FsPersister, NoPersist, Persister, Update, WolletDescriptor};
 use elements::bitcoin::bip32::ChildNumber;
-use elements::{bitcoin, Address, AddressParams};
+use elements::{bitcoin, Address};
 use elements_miniscript::psbt::PsbtExt;
 use elements_miniscript::{BtcDescriptor, ForEachKey};
 use elements_miniscript::{
@@ -69,10 +69,10 @@ impl WolletBuilder {
     /// Build the `Wollet`
     pub fn build(self) -> Result<Wollet, Error> {
         let cache = Cache::default();
-        let max_weight_to_satisfy = self
-            .descriptor
-            .definite_descriptor(Chain::External, 0)?
-            .max_weight_to_satisfy()?;
+        let max_weight_to_satisfy = match self.descriptor.definite_descriptor(Chain::External, 0) {
+            Ok(d) => d.max_weight_to_satisfy()?,
+            Err(_) => 0, // If we don't have the descriptor we don't know this value
+        };
         let mut wollet = Wollet {
             cache,
             network: self.network,
@@ -100,24 +100,19 @@ pub struct WolletConciseState {
     descriptor: WolletDescriptor,
     txs: HashSet<Txid>,
     paths: HashMap<Script, (Chain, ChildNumber)>,
-    scripts: HashMap<(Chain, ChildNumber), (Script, BlindingPublicKey)>,
+    scripts: HashMap<(Chain, ChildNumber), (Script, Option<BlindingPublicKey>)>,
     heights: HashMap<Txid, Option<Height>>,
     tip: (Height, BlockHash),
     last_unused: LastUnused,
 }
 
 pub trait WolletState {
-    fn get_script_batch(
-        &self,
-        batch: u32,
-        descriptor: &ConfidentialDescriptor<DescriptorPublicKey>,
-    ) -> Result<ScriptBatch, Error>;
+    fn get_script_batch(&self, batch: u32, ext_int: Chain) -> Result<ScriptBatch, Error>;
     fn get_or_derive(
         &self,
         ext_int: Chain,
         child: ChildNumber,
-        descriptor: &ConfidentialDescriptor<DescriptorPublicKey>,
-    ) -> Result<(Script, BlindingPublicKey, bool), Error>;
+    ) -> Result<(Script, Option<BlindingPublicKey>, bool), Error>;
     fn heights(&self) -> &HashMap<Txid, Option<Height>>;
     fn paths(&self) -> &HashMap<Script, (Chain, ChildNumber)>;
     fn txs(&self) -> HashSet<Txid>;
@@ -129,23 +124,35 @@ pub trait WolletState {
 
 impl WolletState for WolletConciseState {
     // TODO duplicated from Wollet
-    fn get_script_batch(
-        &self,
-        batch: u32,
-        descriptor: &ConfidentialDescriptor<DescriptorPublicKey>, // non confidential (we need only script_pubkey), non multipath (we need to be able to derive with index)
-    ) -> Result<ScriptBatch, Error> {
+    fn get_script_batch(&self, batch: u32, ext_int: Chain) -> Result<ScriptBatch, Error> {
+        let descriptor = &self.descriptor;
         let mut result = ScriptBatch {
             cached: true,
             ..Default::default()
         };
 
+        // For Spks, return all scripts in batch 0, empty for subsequent batches
+        if let Some(count) = descriptor.spk_count() {
+            if batch > 0 {
+                return Ok(result);
+            }
+            for j in 0..count as u32 {
+                let child = ChildNumber::from_normal_idx(j)?;
+                let (script, blinding_pubkey, cached) =
+                    self.get_or_derive(Chain::External, child)?;
+                result.cached = cached;
+                result
+                    .value
+                    .push((script, (Chain::External, child, blinding_pubkey)));
+            }
+            return Ok(result);
+        }
+
         let start = batch * BATCH_SIZE;
         let end = start + BATCH_SIZE;
-        let ext_int: Chain = descriptor.try_into().unwrap_or(Chain::External);
         for j in start..end {
             let child = ChildNumber::from_normal_idx(j)?;
-            let (script, blinding_pubkey, cached) =
-                self.get_or_derive(ext_int, child, descriptor)?;
+            let (script, blinding_pubkey, cached) = self.get_or_derive(ext_int, child)?;
             result.cached = cached;
             result
                 .value
@@ -159,13 +166,14 @@ impl WolletState for WolletConciseState {
         &self,
         ext_int: Chain,
         child: ChildNumber,
-        descriptor: &ConfidentialDescriptor<DescriptorPublicKey>,
-    ) -> Result<(Script, BlindingPublicKey, bool), Error> {
+    ) -> Result<(Script, Option<BlindingPublicKey>, bool), Error> {
         let opt_script = self.scripts.get(&(ext_int, child));
         let (script, blinding_pubkey, cached) = match opt_script {
             Some((script, blinding_pubkey)) => (script.clone(), *blinding_pubkey, true),
             None => {
-                let (script, blinding_pubkey) = derive_script_and_blinding_key(descriptor, child)?;
+                let (script, blinding_pubkey) = self
+                    .descriptor
+                    .derive_script_and_blinding_key(ext_int, child)?;
                 (script, blinding_pubkey, false)
             }
         };
@@ -208,21 +216,17 @@ impl std::fmt::Debug for Wollet {
 }
 
 impl WolletState for Wollet {
-    fn get_script_batch(
-        &self,
-        batch: u32,
-        descriptor: &ConfidentialDescriptor<DescriptorPublicKey>,
-    ) -> Result<ScriptBatch, Error> {
-        self.cache.get_script_batch(batch, descriptor)
+    fn get_script_batch(&self, batch: u32, ext_int: Chain) -> Result<ScriptBatch, Error> {
+        self.cache
+            .get_script_batch(batch, &self.descriptor, ext_int)
     }
 
     fn get_or_derive(
         &self,
         ext_int: Chain,
         child: ChildNumber,
-        descriptor: &ConfidentialDescriptor<DescriptorPublicKey>,
-    ) -> Result<(Script, BlindingPublicKey, bool), Error> {
-        self.cache.get_or_derive(ext_int, child, descriptor)
+    ) -> Result<(Script, Option<BlindingPublicKey>, bool), Error> {
+        self.cache.get_or_derive(ext_int, child, &self.descriptor)
     }
 
     fn heights(&self) -> &HashMap<Txid, Option<Height>> {
@@ -281,10 +285,7 @@ impl Wollet {
     /// Whether the wallet is segwit (BIP141)
     pub fn is_segwit(&self) -> bool {
         self.descriptor()
-            .descriptor
-            .desc_type()
-            .segwit_version()
-            .is_some()
+            .is_ok_and(|d| d.descriptor.desc_type().segwit_version().is_some())
     }
 
     /// Whether the wallet is AMP0
@@ -353,8 +354,8 @@ impl Wollet {
     }
 
     /// Get a reference of the wallet descriptor
-    pub fn descriptor(&self) -> &ConfidentialDescriptor<DescriptorPublicKey> {
-        self.descriptor.as_ref()
+    pub fn descriptor(&self) -> Result<&ConfidentialDescriptor<DescriptorPublicKey>, Error> {
+        self.descriptor.ct_descriptor()
     }
 
     /// Get a copy of the wallet descriptor
@@ -373,22 +374,34 @@ impl Wollet {
         }
     }
 
+    fn inner_address(&self, chain: Chain, index: Option<u32>) -> Result<AddressResult, Error> {
+        let has_descriptor = self.descriptor.spk_count().is_none();
+        if has_descriptor && !self.descriptor.has_wildcard() && index.is_some() {
+            // Descriptor wollets without wildcard cannot pass the index
+            return Err(Error::IndexWithoutWildcard);
+        }
+        if !has_descriptor && index.is_none() {
+            // For wollets without descriptors, caller must pass index
+            return Err(Error::UnsupportedWithoutDescriptor);
+        }
+        let index = match (chain, index) {
+            (_, Some(i)) => i,
+            (Chain::Internal, None) => self.last_unused_internal(),
+            (Chain::External, None) => self.last_unused_external(),
+        };
+
+        let address = self
+            .descriptor
+            .inner_address(index, self.network.address_params(), chain)?;
+        Ok(AddressResult::new(address, index))
+    }
+
     /// Get a wallet address
     ///
     /// If Some return the address at the given index,
     /// otherwise the last unused address.
     pub fn address(&self, index: Option<u32>) -> Result<AddressResult, Error> {
-        if index.is_some() && !self.descriptor.has_wildcard() {
-            // TODO: this error should be upstreamed to at_derivation_index https://github.com/rust-bitcoin/rust-miniscript/issues/829
-            return Err(Error::IndexWithoutWildcard);
-        }
-
-        let index = self.unwrap_or_last_unused(index);
-
-        let address = self
-            .descriptor
-            .address(index, self.network.address_params())?;
-        Ok(AddressResult::new(address, index))
+        self.inner_address(Chain::External, index)
     }
 
     /// Get a wallet pegin address
@@ -441,22 +454,14 @@ impl Wollet {
     /// If Some return the address at the given index,
     /// otherwise the last unused address.
     pub fn change(&self, index: Option<u32>) -> Result<AddressResult, Error> {
-        let index = match index {
-            Some(i) => i,
-            None => self.last_unused_internal(),
-        };
-
-        let address = self
-            .descriptor
-            .change(index, self.network.address_params())?;
-        Ok(AddressResult::new(address, index))
+        self.inner_address(Chain::Internal, index)
     }
 
     fn utxos_inner(&self) -> Result<Vec<WalletTxOut>, Error> {
         Ok(self
             .txos_inner()?
             .into_iter()
-            .filter(|txo| !txo.is_spent)
+            .filter(|txo| !txo.is_spent && !is_explicit(&txo.unblinded))
             .collect())
     }
 
@@ -481,30 +486,31 @@ impl Wollet {
                     (out_point, output, spent.contains(&out_point))
                 })
                 .filter_map(|(outpoint, output, is_spent)| {
-                    if let Some(unblinded) = self.cache.unblinded.get(&outpoint) {
-                        let index = self.index(&output.script_pubkey).ok()?;
-                        let blinding_pubkey = self
-                            .cache
-                            .scripts
-                            .get(&(index.0, index.1.into()))
-                            .map(|(_, blinding_pubkey)| *blinding_pubkey);
-                        let address = Address::from_script(
-                            &output.script_pubkey,
-                            blinding_pubkey,
-                            self.network().address_params(),
-                        )?;
-                        return Some(WalletTxOut {
-                            outpoint,
-                            script_pubkey: output.script_pubkey.clone(),
-                            height: *height,
-                            unblinded: *unblinded,
-                            wildcard_index: index.1,
-                            ext_int: index.0,
-                            is_spent,
-                            address,
-                        });
-                    }
-                    None
+                    let unblinded = *self.cache.unblinded.get(&outpoint)?;
+                    let index = self.index(&output.script_pubkey).ok()?;
+                    let blinding_pubkey = (!is_explicit(&unblinded))
+                        .then(|| {
+                            self.cache
+                                .scripts
+                                .get(&(index.0, index.1.into()))
+                                .and_then(|(_, blinding_pubkey)| *blinding_pubkey)
+                        })
+                        .flatten();
+                    let address = Address::from_script(
+                        &output.script_pubkey,
+                        blinding_pubkey,
+                        self.network().address_params(),
+                    )?;
+                    Some(WalletTxOut {
+                        outpoint,
+                        script_pubkey: output.script_pubkey.clone(),
+                        height: *height,
+                        unblinded,
+                        wildcard_index: index.1,
+                        ext_int: index.0,
+                        is_spent,
+                        address,
+                    })
                 });
             txos.extend(tx_txos);
         }
@@ -740,17 +746,20 @@ impl Wollet {
                 .ok_or_else(|| Error::Generic(format!("list_tx no tx {txid}")))?;
 
             let balance = tx_balance(**txid, tx, &txos);
-            if balance.is_empty() {
-                // Transaction has no output or input that the wollet can unblind,
-                // ignore this transaction
+            let inputs = tx_inputs(tx, &txos);
+            let outputs = tx_outputs(**txid, tx, &txos);
+            if balance.is_empty()
+                && inputs.iter().all(|i| i.is_none())
+                && outputs.iter().all(|o| o.is_none())
+            {
+                // Transaction has no output or input that the wollet can unblind or
+                // match as explicit, ignore this transaction
                 continue;
             }
             let fee = tx_fee(tx);
             let policy_asset = self.policy_asset();
             let type_ = tx_type(tx, &policy_asset, &balance, fee);
             let timestamp = height.and_then(|h| self.cache.timestamps.get(&h).cloned());
-            let inputs = tx_inputs(tx, &txos);
-            let outputs = tx_outputs(**txid, tx, &txos);
             txs.push(WalletTx {
                 tx: tx.clone(),
                 txid: **txid,
@@ -826,7 +835,7 @@ impl Wollet {
     /// Get the PSET details with respect to the wallet
     pub fn get_details(&self, pset: &PartiallySignedTransaction) -> Result<PsetDetails, Error> {
         Ok(PsetDetails {
-            balance: pset_balance(pset, self.descriptor(), self.network.address_params())?,
+            balance: pset_balance(pset, self.descriptor()?, self.network.address_params())?,
             sig_details: pset_signatures(pset),
             issuances: pset_issuances(pset),
         })
@@ -858,6 +867,11 @@ impl Wollet {
 
     /// Add the PSET details with respect to the wallet
     pub fn add_details(&self, pset: &mut PartiallySignedTransaction) -> Result<(), Error> {
+        if self.descriptor.spk_count().is_some() {
+            // The wollet does not have a descriptor, nothing to add
+            // Since this method is also called internally, we prefer not to raise an error
+            return Ok(());
+        }
         let pset_clone = pset.clone();
         for (idx, input) in pset_clone.inputs().iter().enumerate() {
             if let Some(txout) = input.witness_utxo.as_ref() {
@@ -882,7 +896,7 @@ impl Wollet {
         }
 
         // Set PSET xpub origin
-        self.descriptor().descriptor.for_each_key(|k| {
+        self.descriptor()?.descriptor.for_each_key(|k| {
             match k {
                 DescriptorPublicKey::XPub(x) => {
                     if let Some(origin) = &x.origin {
@@ -905,13 +919,15 @@ impl Wollet {
     /// Get the signers' fingerprints involved in this descriptor
     pub fn signers(&self) -> Vec<Fingerprint> {
         let mut signers = vec![];
-        self.descriptor().descriptor.for_each_key(|k| {
-            // xpub without key origin and single pubkey unexpectedly return a master fingerprint,
-            // see tests below for the actual behaviour.
-            // This should not be dangerous though, worst case is that we report a signer that
-            // cannot sign.
-            signers.push(k.master_fingerprint());
-            true
+        let _ = self.descriptor().map(|d| {
+            d.descriptor.for_each_key(|k| {
+                // xpub without key origin and single pubkey unexpectedly return a master fingerprint,
+                // see tests below for the actual behaviour.
+                // This should not be dangerous though, worst case is that we report a signer that
+                // cannot sign.
+                signers.push(k.master_fingerprint());
+                true
+            })
         });
         signers
     }
@@ -1020,6 +1036,11 @@ impl Wollet {
     }
 }
 
+fn is_explicit(txoutsecrets: &TxOutSecrets) -> bool {
+    txoutsecrets.asset_bf == AssetBlindingFactor::zero()
+        && txoutsecrets.value_bf == ValueBlindingFactor::zero()
+}
+
 fn tx_balance(
     txid: Txid,
     tx: &Transaction,
@@ -1030,12 +1051,16 @@ fn tx_balance(
 
     for out_idx in 0..tx.output.len() {
         if let Some(txout) = txos.get(&OutPoint::new(txid, out_idx as u32)) {
-            *balance.entry(txout.unblinded.asset).or_default() += txout.unblinded.value as i64;
+            if !is_explicit(&txout.unblinded) {
+                *balance.entry(txout.unblinded.asset).or_default() += txout.unblinded.value as i64;
+            }
         }
     }
     for input in &tx.input {
         if let Some(txout) = txos.get(&input.previous_output) {
-            *balance.entry(txout.unblinded.asset).or_default() -= txout.unblinded.value as i64;
+            if !is_explicit(&txout.unblinded) {
+                *balance.entry(txout.unblinded.asset).or_default() -= txout.unblinded.value as i64;
+            }
         }
     }
     balance
@@ -1157,23 +1182,6 @@ impl Tip {
     pub fn timestamp(&self) -> Option<Timestamp> {
         self.timestamp
     }
-}
-
-/// Derive script_pubkey and blinding_pubkey from a descriptor at a given derivation index
-pub fn derive_script_and_blinding_key(
-    descriptor: &ConfidentialDescriptor<DescriptorPublicKey>,
-    child: ChildNumber,
-) -> Result<(Script, BlindingPublicKey), Error> {
-    let address = descriptor
-        .at_derivation_index(child.into())?
-        .address(&EC, &AddressParams::ELEMENTS) // the params, doesn't matter, we don't use the address but its script and blinding pubkey, the latter cannot be retrieved in other way.
-        .expect("all supported descriptors can generate an address");
-    Ok((
-        address.script_pubkey(),
-        address
-            .blinding_pubkey
-            .expect("descriptor used include blinding key"),
-    ))
 }
 
 #[cfg(feature = "test_wallet")]
@@ -1371,11 +1379,16 @@ mod tests {
         let w = new_wollet(&desc);
         let a = w.address(None).unwrap();
         assert_eq!(a.address().to_string(), "tlq1qqtkq6nptvwfycgsvkclsg8uyslwy9pn5mmw6049nmqq02y7l9330a6vmsc5zdfq2xtpyc7tct5rtr80rlvrk7jll6mc5gjfup");
-        let e = w.address(Some(0)).unwrap_err();
-        assert_eq!(
-            e.to_string(),
-            "Cannot use derivation index when the descriptor has no wildcard"
-        );
+        let err = "Cannot use derivation index when the descriptor has no wildcard";
+        assert_eq!(w.address(Some(0)).unwrap_err().to_string(), err);
+        // With change
+        let desc = format!("ct(slip77({k}),elwpkh({x}/<0;1>))");
+        let w = new_wollet(&desc);
+        let a = w.address(None).unwrap().address().to_string();
+        let c = w.change(None).unwrap().address().to_string();
+        assert_ne!(a, c);
+        assert_eq!(w.address(Some(0)).unwrap_err().to_string(), err);
+        assert_eq!(w.change(Some(0)).unwrap_err().to_string(), err);
     }
 
     #[test]

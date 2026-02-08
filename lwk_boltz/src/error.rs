@@ -1,3 +1,4 @@
+use crate::SwapAsset;
 use crate::SwapState;
 use boltz_client::elements::AddressError;
 use boltz_client::error::Error as BoltzError;
@@ -6,6 +7,9 @@ use lightning::bitcoin::XKeyIdentifier;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    #[error("Failed to build refund transaction")]
+    FailBuildingRefundTransaction,
+
     #[error("Invalid electrum url: {0}")]
     InvalidElectrumUrl(#[from] lwk_wollet::UrlError),
 
@@ -80,11 +84,35 @@ pub enum Error {
     #[error("Bolt12 (offers) are not yet supported")]
     Bolt12Unsupported,
 
+    #[error("LnUrl are not supperted")]
+    LnUrlUnsupported,
+
     #[error("Mnemonic identifier mismatch: {0} != {1}")]
     MnemonicIdentifierMismatch(XKeyIdentifier, XKeyIdentifier),
 
     #[error("No update available, continuing polling")]
     NoBoltzUpdate,
+
+    #[error("Invalid swap pair: {from:?} -> {to:?}")]
+    InvalidSwapPair { from: SwapAsset, to: SwapAsset },
+
+    #[error("Quote builder missing {0} parameter")]
+    MissingQuoteParam(&'static str),
+
+    #[error("Swap pair not available from Boltz API")]
+    PairNotAvailable,
+
+    #[error("Internal lock error: {0}")]
+    LockPoisoned(String),
+
+    #[error("Store error: {0}")]
+    Store(#[source] Box<dyn std::error::Error + Send + Sync>),
+
+    #[error("Store not configured")]
+    StoreNotConfigured,
+
+    #[error("Encryption error: {0}")]
+    Encryption(String),
 }
 
 impl From<BoltzError> for Error {
@@ -96,5 +124,17 @@ impl From<BoltzError> for Error {
 impl From<ParseOrSemanticError> for Error {
     fn from(err: ParseOrSemanticError) -> Self {
         Error::InvalidBolt11Invoice(err)
+    }
+}
+
+impl From<aes_gcm_siv::Error> for Error {
+    fn from(err: aes_gcm_siv::Error) -> Self {
+        Error::Encryption(err.to_string())
+    }
+}
+
+impl From<lwk_common::EncryptError> for Error {
+    fn from(err: lwk_common::EncryptError) -> Self {
+        Error::Encryption(err.to_string())
     }
 }

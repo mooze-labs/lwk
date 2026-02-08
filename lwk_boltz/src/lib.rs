@@ -9,9 +9,20 @@ mod error;
 mod invoice_data;
 mod lightning_payment;
 mod prepare_pay_data;
+mod quote;
 mod reverse;
+mod store;
 mod submarine;
 mod swap_state;
+
+// Re-export store module contents for public API
+pub use store::cipher_from_xpub;
+pub use store::encrypt_key;
+pub use store::store_keys;
+pub use store::DynStore;
+pub use store::SwapPersistence;
+
+use aes_gcm_siv::Aes256GcmSiv;
 
 use std::sync::atomic::AtomicU32;
 use std::sync::atomic::Ordering;
@@ -22,6 +33,7 @@ use bip39::Mnemonic;
 use boltz_client::boltz::BoltzApiClientV2;
 use boltz_client::boltz::BoltzWsApi;
 use boltz_client::boltz::BoltzWsConfig;
+use boltz_client::boltz::GetChainPairsResponse;
 use boltz_client::boltz::GetReversePairsResponse;
 use boltz_client::boltz::GetSubmarinePairsResponse;
 use boltz_client::boltz::SwapStatus;
@@ -51,6 +63,7 @@ use lwk_wollet::ElectrumUrl;
 use lwk_wollet::ElementsNetwork;
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast::error::TryRecvError;
+use tokio::sync::Mutex;
 
 pub use crate::chain_data::{to_chain_data, ChainSwapData, ChainSwapDataSerializable};
 pub use crate::chain_swaps::LockupResponse;
@@ -62,6 +75,7 @@ pub use crate::invoice_data::InvoiceDataSerializable;
 pub use crate::lightning_payment::LightningPayment;
 pub use crate::prepare_pay_data::PreparePayData;
 pub use crate::prepare_pay_data::PreparePayDataSerializable;
+pub use crate::quote::{Quote, QuoteBuilder, SwapAsset, LIQUID_UNCOOPERATIVE_EXTRA};
 pub use crate::reverse::InvoiceResponse;
 pub use crate::submarine::PreparePayResponse;
 pub use crate::swap_state::SwapState;
@@ -75,6 +89,13 @@ pub use boltz_client::boltz::SwapRestoreType as SwapType;
 
 pub(crate) const WAIT_TIME: std::time::Duration = std::time::Duration::from_secs(5);
 
+#[derive(Clone)]
+pub struct SwapInfo {
+    pub reverse_pairs: GetReversePairsResponse,
+    pub submarine_pairs: GetSubmarinePairsResponse,
+    pub chain_pairs: GetChainPairsResponse,
+}
+
 pub struct BoltzSession {
     ws: Arc<BoltzWsApi>,
     api: Arc<BoltzApiClientV2>,
@@ -83,6 +104,7 @@ pub struct BoltzSession {
     timeout: Duration,
 
     mnemonic: Mnemonic,
+    xpub: Xpub,
     next_index_to_use: AtomicU32,
 
     polling: bool,
@@ -91,6 +113,11 @@ pub struct BoltzSession {
     referral_id: Option<String>,
 
     random_preimages: bool,
+
+    swap_info: Mutex<SwapInfo>,
+
+    /// Optional store for persisting swap data
+    store: Option<Arc<dyn DynStore>>,
 }
 
 impl BoltzSession {
@@ -139,6 +166,7 @@ impl BoltzSession {
         referral_id: Option<String>,
         _bitcoin_electrum_client: Option<ElectrumUrl>,
         random_preimages: bool,
+        store: Option<Arc<dyn DynStore>>,
     ) -> Result<Self, Error> {
         let liquid_chain = elements_network_to_liquid_chain(network);
 
@@ -180,21 +208,23 @@ impl BoltzSession {
 
         start_ws(ws.clone());
 
-        let (next_index_to_use, mnemonic) = match mnemonic {
-            Some(mnemonic) => {
-                let next_index_to_use = match next_index_to_use {
-                    Some(next_index_to_use) => next_index_to_use,
-                    None => {
-                        fetch_next_index_to_use(&mnemonic, network_kind(liquid_chain), &api).await?
-                    }
-                };
-                (next_index_to_use, mnemonic)
-            }
-            None => (0, Mnemonic::generate(12).expect("12 is a valid word count")),
+        // Fetch pairs data concurrently
+        let swap_info = fetch_swap_info_concurrently(api.clone()).await?;
+
+        let provided_mnemonic = mnemonic.is_some();
+        let mnemonic =
+            mnemonic.unwrap_or_else(|| Mnemonic::generate(12).expect("12 is a valid word count"));
+        let xpub = derive_xpub_from_mnemonic(&mnemonic, network_kind(liquid_chain))?;
+        let next_index_to_use = match next_index_to_use {
+            Some(next_index_to_use) => next_index_to_use,
+            None if provided_mnemonic => fetch_next_index_to_use(&xpub, &api).await?,
+            None => 0,
         };
+
         Ok(Self {
             next_index_to_use: AtomicU32::new(next_index_to_use),
             mnemonic,
+            xpub,
             ws,
             api,
             chain_client,
@@ -204,6 +234,8 @@ impl BoltzSession {
             timeout_advance: timeout_advance.unwrap_or(Duration::from_secs(180)),
             referral_id,
             random_preimages,
+            swap_info: Mutex::new(swap_info),
+            store,
         })
     }
 
@@ -242,6 +274,28 @@ impl BoltzSession {
             .store(next_index_to_use, Ordering::Relaxed);
     }
 
+    /// Get a reference to the store, if configured
+    pub fn store(&self) -> Option<&Arc<dyn DynStore>> {
+        self.store.as_ref()
+    }
+
+    /// Get a cipher for encrypting/decrypting store data
+    ///
+    /// The cipher is derived from the xpub using a tagged hash.
+    pub fn cipher(&self) -> Aes256GcmSiv {
+        cipher_from_xpub(&self.xpub)
+    }
+
+    /// Clone the store Arc for use in swap responses
+    pub(crate) fn clone_store(&self) -> Option<Arc<dyn DynStore>> {
+        self.store.clone()
+    }
+
+    /// Clone the cipher for use in swap responses
+    pub(crate) fn clone_cipher(&self) -> Aes256GcmSiv {
+        self.cipher()
+    }
+
     /// Generate a rescue file with the lightning session mnemonic.
     ///
     /// The rescue file is a JSON file that contains the swaps mnemonic.
@@ -257,18 +311,91 @@ impl BoltzSession {
     /// This is useful as a swap list but can also be used to restore non-completed swaps that have not
     /// being persisted or that have been lost. TODO: use fn xxx
     pub async fn swap_restore(&self) -> Result<Vec<SwapRestoreResponse>, Error> {
-        let xpub = derive_xpub_from_mnemonic(&self.mnemonic, network_kind(self.liquid_chain))?;
-        let result = self.api.post_swap_restore(&xpub.to_string()).await?;
+        let result = self.api.post_swap_restore(&self.xpub.to_string()).await?;
         Ok(result)
     }
 
-    /// Fetch information, such as min and max amounts, about the reverse and submarine pairs from the boltz api.
-    pub async fn fetch_swaps_info(
-        &self,
-    ) -> Result<(GetReversePairsResponse, GetSubmarinePairsResponse), Error> {
-        let a = self.api.get_reverse_pairs().await?;
-        let b = self.api.get_submarine_pairs().await?;
-        Ok((a, b))
+    /// Get the list of pending swap IDs from the store
+    ///
+    /// Returns an error if no store is configured, otherwise returns the list of pending swap IDs
+    /// (which may be empty).
+    pub fn pending_swap_ids(&self) -> Result<Vec<String>, Error> {
+        let store = self.store.as_ref().ok_or(Error::StoreNotConfigured)?;
+        let mut cipher = self.cipher();
+        store_keys::get_pending_swaps(store.as_ref(), &mut cipher)
+    }
+
+    /// Get the list of completed swap IDs from the store
+    ///
+    /// Returns an error if no store is configured, otherwise returns the list of completed swap IDs
+    /// (which may be empty).
+    pub fn completed_swap_ids(&self) -> Result<Vec<String>, Error> {
+        let store = self.store.as_ref().ok_or(Error::StoreNotConfigured)?;
+        let mut cipher = self.cipher();
+        store_keys::get_completed_swaps(store.as_ref(), &mut cipher)
+    }
+
+    /// Get the raw swap data for a specific swap ID from the store
+    ///
+    /// Returns `None` if no store is configured or the swap doesn't exist.
+    /// The returned string is the serialized swap data (JSON).
+    pub fn get_swap_data(&self, swap_id: &str) -> Result<Option<String>, Error> {
+        let Some(store) = &self.store else {
+            return Ok(None);
+        };
+        let mut cipher = self.cipher();
+        let data = store_keys::get_swap_data(store.as_ref(), &mut cipher, swap_id)?
+            .map(|data| String::from_utf8_lossy(&data).to_string());
+        Ok(data)
+    }
+
+    /// Remove a swap from the store
+    ///
+    /// This removes the swap data and removes the swap ID from both the pending and completed lists.
+    /// Returns an error if no store is configured.
+    pub fn remove_swap(&self, swap_id: &str) -> Result<(), Error> {
+        let store = self.store.as_ref().ok_or(Error::StoreNotConfigured)?;
+        let mut cipher = self.cipher();
+
+        let encrypted_key = store::encrypt_key(&mut cipher, &format!("boltz:swap:{swap_id}"))?;
+        store.remove(&encrypted_key).map_err(Error::Store)?;
+
+        // Remove from pending list
+        let mut cipher = self.cipher();
+        let mut pending = store_keys::get_pending_swaps(store.as_ref(), &mut cipher)?;
+        let was_pending = pending.contains(&swap_id.to_string());
+        pending.retain(|id| id != swap_id);
+        if was_pending {
+            let mut cipher = self.cipher();
+            store_keys::set_pending_swaps(store.as_ref(), &mut cipher, &pending)?;
+        }
+
+        // Remove from completed list
+        let mut cipher = self.cipher();
+        let mut completed = store_keys::get_completed_swaps(store.as_ref(), &mut cipher)?;
+        let was_completed = completed.contains(&swap_id.to_string());
+        completed.retain(|id| id != swap_id);
+        if was_completed {
+            let mut cipher = self.cipher();
+            store_keys::set_completed_swaps(store.as_ref(), &mut cipher, &completed)?;
+        }
+
+        log::debug!("Removed swap {swap_id} from store");
+        Ok(())
+    }
+
+    /// Fetch information, such as min and max amounts, about the swap pairs from the boltz api.
+    pub async fn fetch_swaps_info(&self) -> Result<SwapInfo, Error> {
+        fetch_swap_info_concurrently(self.api.clone()).await
+    }
+
+    /// Refresh the cached pairs data from the Boltz API
+    ///
+    /// This updates the internal cache used by [`BoltzSession::quote()`].
+    pub async fn refresh_swap_info(&self) -> Result<(), Error> {
+        let swap_info = self.fetch_swaps_info().await?;
+        *self.swap_info.lock().await = swap_info;
+        Ok(())
     }
 
     /// Returns a preimage from the keys or a random one according to flag `self.random_preimage`
@@ -279,6 +406,73 @@ impl BoltzSession {
             preimage_from_keypair(our_keys)
         }
     }
+
+    /// Create a quote builder for calculating swap fees
+    ///
+    /// This uses the cached pairs data from session initialization.
+    ///
+    /// If the pairs data is stale, you can refresh it using [`BoltzSession::refresh_swap_info()`].
+    ///
+    /// # Example
+    /// ```ignore
+    /// let quote = session
+    ///     .quote(25000)
+    ///     .await
+    ///     .send(SwapAsset::Lightning)
+    ///     .receive(SwapAsset::Liquid)
+    ///     .build()?;
+    ///
+    /// println!("You will receive: {} sats", quote.receive_amount);
+    /// println!("Network fee: {} sats", quote.network_fee);
+    /// println!("Boltz fee: {} sats", quote.boltz_fee);
+    /// ```
+    pub async fn quote(&self, send_amount: u64) -> QuoteBuilder {
+        // Clone the pairs data from the mutex.
+        let swap_info = self.swap_info.lock().await;
+        QuoteBuilder::new_send(send_amount, swap_info.clone())
+    }
+
+    /// Create a quote builder for calculating send amount from desired receive amount
+    ///
+    /// This is the inverse of [`BoltzSession::quote()`] - given the amount you want
+    /// to receive, it calculates how much you need to send.
+    ///
+    /// This uses the cached pairs data from session initialization.
+    ///
+    /// If the pairs data is stale, you can refresh it using [`BoltzSession::refresh_swap_info()`].
+    ///
+    /// # Example
+    /// ```ignore
+    /// let quote = session
+    ///     .quote_receive(24887)
+    ///     .await
+    ///     .send(SwapAsset::Lightning)
+    ///     .receive(SwapAsset::Liquid)
+    ///     .build()?;
+    ///
+    /// println!("You need to send: {} sats", quote.send_amount);
+    /// println!("Network fee: {} sats", quote.network_fee);
+    /// println!("Boltz fee: {} sats", quote.boltz_fee);
+    /// ```
+    pub async fn quote_receive(&self, receive_amount: u64) -> QuoteBuilder {
+        // Clone the pairs data from the mutex.
+        let swap_info = self.swap_info.lock().await;
+        QuoteBuilder::new_receive(receive_amount, swap_info.clone())
+    }
+}
+
+async fn fetch_swap_info_concurrently(api: Arc<BoltzApiClientV2>) -> Result<SwapInfo, Error> {
+    let (submarine_pairs, reverse_pairs, chain_pairs) = tokio::try_join!(
+        api.get_submarine_pairs(),
+        api.get_reverse_pairs(),
+        api.get_chain_pairs(),
+    )?;
+
+    Ok(SwapInfo {
+        reverse_pairs,
+        submarine_pairs,
+        chain_pairs,
+    })
 }
 
 #[cfg(feature = "blocking")]
@@ -317,6 +511,7 @@ pub struct BoltzSessionBuilder {
     referral_id: Option<String>,
     bitcoin_electrum_client: Option<ElectrumUrl>,
     random_preimages: bool,
+    store: Option<Arc<dyn DynStore>>,
 }
 
 impl BoltzSessionBuilder {
@@ -333,6 +528,7 @@ impl BoltzSessionBuilder {
             referral_id: None,
             bitcoin_electrum_client: None,
             random_preimages: false,
+            store: None,
         }
     }
 
@@ -407,6 +603,18 @@ impl BoltzSessionBuilder {
         self
     }
 
+    /// Set the store for persisting swap data
+    ///
+    /// When set, swap data will be automatically persisted to the store after creation
+    /// and on each state change. This enables automatic restoration of pending swaps.
+    ///
+    /// The store uses keys prefixed with `boltz:` to avoid collisions with other users.
+    /// See [`store_keys`] for the key format.
+    pub fn store(mut self, store: Arc<dyn DynStore>) -> Self {
+        self.store = Some(store);
+        self
+    }
+
     /// Build the `BoltzSession`
     pub async fn build(self) -> Result<BoltzSession, Error> {
         BoltzSession::initialize(
@@ -420,6 +628,7 @@ impl BoltzSessionBuilder {
             self.referral_id,
             self.bitcoin_electrum_client,
             self.random_preimages,
+            self.store,
         )
         .await
     }
@@ -460,12 +669,7 @@ pub(crate) fn mnemonic_identifier(mnemonic: &Mnemonic) -> Result<XKeyIdentifier,
     Ok(xpriv.identifier(&lwk_wollet::EC))
 }
 
-async fn fetch_next_index_to_use(
-    mnemonic: &Mnemonic,
-    network_kind: NetworkKind,
-    client: &BoltzApiClientV2,
-) -> Result<u32, Error> {
-    let xpub = derive_xpub_from_mnemonic(mnemonic, network_kind)?;
+async fn fetch_next_index_to_use(xpub: &Xpub, client: &BoltzApiClientV2) -> Result<u32, Error> {
     log::info!("xpub for restore is: {xpub}");
 
     let result = client.post_swap_restore_index(&xpub.to_string()).await?;

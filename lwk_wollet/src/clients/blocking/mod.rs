@@ -76,7 +76,7 @@ pub trait BlockchainBackend {
             let chain: Chain = (&descriptor).try_into().unwrap_or(Chain::External);
             let index = index.max(last_unused[chain]);
             loop {
-                let batch = state.get_script_batch(batch_count, &descriptor)?;
+                let batch = state.get_script_batch(batch_count, chain)?;
 
                 let s: Vec<_> = batch.value.iter().map(|e| &e.0).collect();
                 let result: Vec<Vec<History>> = self.get_scripts_history(&s)?;
@@ -124,7 +124,7 @@ pub trait BlockchainBackend {
 
                 batch_count += 1;
 
-                if !descriptor.descriptor.has_wildcard() {
+                if !descriptor.has_wildcard() {
                     // No wildcard, 1 loop is enough
                     return Ok(data);
                 }
@@ -250,7 +250,7 @@ pub trait BlockchainBackend {
             let scripts_with_blinding_pubkey: Vec<(_, _, _, _)> = scripts
                 .iter()
                 .map(|(script, (chain, child, blinding_pubkey))| {
-                    (*chain, *child, script.clone(), Some(*blinding_pubkey))
+                    (*chain, *child, script.clone(), *blinding_pubkey)
                 })
                 .collect();
 
@@ -274,7 +274,7 @@ pub trait BlockchainBackend {
     fn download_txs<S: WolletState>(
         &self,
         history_txs_id: &HashSet<Txid>,
-        scripts: &HashMap<Script, (Chain, ChildNumber, BlindingPublicKey)>,
+        scripts: &HashMap<Script, (Chain, ChildNumber, Option<BlindingPublicKey>)>,
         state: &S,
         descriptor: &WolletDescriptor,
     ) -> Result<DownloadTxResult, Error> {
