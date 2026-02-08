@@ -18,14 +18,6 @@ use elements::{
 use lwk_common::calculate_fee;
 use rand::thread_rng;
 
-use crate::{
-    hashes::Hash,
-    liquidex::{self, LiquidexError, Validated},
-    model::{ExternalUtxo, IssuanceDetails, Recipient},
-    pset_create::{validate_address, IssuanceRequest, SECP256K1_SURJECTIONPROOF_MAX_N_INPUTS},
-    Contract, ElementsNetwork, Error, LiquidexProposal, UnvalidatedRecipient, Wollet, EC,
-};
-
 pub type PsetBlindingFactors = HashMap<
     usize,
     (
