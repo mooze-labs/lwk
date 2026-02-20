@@ -1709,9 +1709,9 @@ fn test_external_utxo() {
     // Add the details for the extenal wallet to sign
     w2.wollet.add_details(&mut pset).unwrap();
     let details = w1.wollet.get_details(&pset).unwrap();
-    assert_eq!(details.sig_details.len(), 2);
-    assert_eq!(details.sig_details[0].missing_signature.len(), 1);
-    assert_eq!(details.sig_details[1].missing_signature.len(), 1);
+    assert_eq!(details.sig_details.len(), 2); // ANCHOR: ignore
+    assert_eq!(details.sig_details[0].missing_signature.len(), 1); // ANCHOR: ignore
+    assert_eq!(details.sig_details[1].missing_signature.len(), 1); // ANCHOR: ignore
 
     let signers = [&AnySigner::Software(signer1), &AnySigner::Software(signer2)];
     for signer in signers {
@@ -1830,6 +1830,78 @@ fn test_external_utxo() {
 }
 
 #[test]
+fn test_docs_external_utxo() -> Result<(), Box<dyn std::error::Error>> {
+    // Send tx with external utxos
+    let env = TestEnvBuilder::from_env().with_electrum().build();
+
+    let signer = generate_signer();
+    let view_key = generate_view_key();
+    let desc = format!("ct({},elwpkh({}/*))", view_key, signer.xpub());
+    let client = test_client_electrum(&env.electrum_url());
+    let mut wollet_ = TestWollet::new(client, &desc);
+
+    let external_signer = generate_signer();
+    let view_key = generate_view_key();
+    let desc = format!("ct({},elwpkh({}/*))", view_key, external_signer.xpub());
+    let client = test_client_electrum(&env.electrum_url());
+    let mut external_wollet_ = TestWollet::new(client, &desc);
+
+    let asset = wollet_.fund_asset(&env);
+    external_wollet_.fund_btc(&env);
+
+    let external_wollet_address = external_wollet_.address();
+    let node_address = env.elementsd_getnewaddress();
+
+    let external_wollet = &external_wollet_.wollet;
+    // ANCHOR: external_utxo_create
+    // Create an external UTXO (LBTC) from the external wollet
+    let utxo = &external_wollet.utxos()?[0];
+    let txid = utxo.outpoint.txid;
+    let vout = utxo.outpoint.vout as usize;
+    let tx = external_wollet.transaction(&txid)?.expect("from utxo").tx;
+    let txout = tx.output[vout].clone();
+    let external_utxo = ExternalUtxo {
+        outpoint: utxo.outpoint,
+        txout,
+        tx: Some(tx),
+        unblinded: utxo.unblinded,
+        max_weight_to_satisfy: external_wollet.max_weight_to_satisfy(),
+    };
+    // ANCHOR_END: external_utxo_create
+    let wollet = &wollet_.wollet;
+    // ANCHOR: external_utxo_add
+    let mut pset = wollet
+        .tx_builder()
+        // Add external UTXO (LBTC)
+        .add_external_utxos(vec![external_utxo])?
+        // Send asset to the node (funded by wollet's UTXOs)
+        .add_recipient(&node_address, 1, asset)?
+        // Send LBTC back to external wollet
+        .drain_lbtc_wallet()
+        .drain_lbtc_to(external_wollet_address)
+        .finish()?;
+    // ANCHOR_END: external_utxo_add
+    // ANCHOR: external_utxo_sign
+    signer.sign(&mut pset)?;
+
+    // To sign the external UTXO, the external wollet must
+    // augment the PSET with details derived from its wollet
+    external_wollet.add_details(&mut pset)?;
+    external_signer.sign(&mut pset)?;
+    // ANCHOR_END: external_utxo_sign
+
+    wollet_.send(&mut pset);
+    external_wollet_.sync();
+
+    let lbtc = wollet_.policy_asset();
+    assert_eq!(external_wollet_.balance(&asset), 0);
+    assert!(external_wollet_.balance(&lbtc) > 0);
+    assert!(wollet_.balance(&asset) > 0);
+    assert_eq!(wollet_.balance(&lbtc), 0);
+    Ok(())
+}
+
+#[test]
 fn test_external_not_lwk() {
     // Simulate a case where we need to sign a PSET where
     // some of the inputs belong to an external wallet that
@@ -1907,7 +1979,9 @@ fn test_unblinded_utxo() {
     assert_eq!(w.wollet.utxos().unwrap().len(), 0);
     assert_eq!(w.wollet.txos().unwrap().len(), 1);
 
+    // ANCHOR: external_utxo_unblinded
     let external_utxo = w.wollet.explicit_utxos().unwrap()[0].clone();
+    // ANCHOR_END: external_utxo_unblinded
 
     // Create tx sending the unblinded utxo
     let node_address = env.elementsd_getnewaddress();
@@ -2224,14 +2298,8 @@ fn test_non_standard_gap_limit() {
     let network = ElementsNetwork::default_regtest();
     let satoshi = 1_000_000;
 
-    let mut wollet_std_gap = Wollet::new(
-        network,
-        std::sync::Arc::new(NoPersist {}),
-        wollet_desc.clone(),
-    )
-    .unwrap();
-    let mut wollet_longer_gap =
-        Wollet::new(network, std::sync::Arc::new(NoPersist {}), wollet_desc).unwrap();
+    let mut wollet_std_gap = Wollet::without_persist(network, wollet_desc.clone()).unwrap();
+    let mut wollet_longer_gap = Wollet::without_persist(network, wollet_desc).unwrap();
 
     let i = Some(25);
     let address_after_gap_limit = wollet_std_gap.address(i).unwrap().address().clone();
@@ -2284,7 +2352,7 @@ async fn test_non_standard_gap_limit_esplora() {
     let wollet_desc = WolletDescriptor::from_str(&desc).unwrap();
     let satoshi = 1_000_000;
 
-    let mut wollet = Wollet::new(network, std::sync::Arc::new(NoPersist {}), wollet_desc).unwrap();
+    let mut wollet = Wollet::without_persist(network, wollet_desc).unwrap();
 
     let i = Some(25);
     let address_after_gap_limit = wollet.address(i).unwrap().address().clone();
@@ -2549,12 +2617,7 @@ fn test_manual_coin_selection() -> Result<(), Box<dyn std::error::Error>> {
 fn test_liquid_testnet() {
     let desc = "ct(slip77(ac53739ddde9fdf6bba3dbc51e989b09aa8c9cdce7b7d7eddd49cec86ddf71f7),elwpkh([93970d14/84'/1'/0']tpubDC3BrFCCjXq4jAceV8k6UACxDDJCFb1eb7R7BiKYUGZdNagEhNfJoYtUrRdci9JFs1meiGGModvmNm8PrqkrEjJ6mpt6gA1DRNU8vu7GqXH/<0;1>/*))#u0y4axgs";
     let wollet_desc = WolletDescriptor::from_str(desc).unwrap();
-    let mut wollet = Wollet::new(
-        ElementsNetwork::LiquidTestnet,
-        std::sync::Arc::new(NoPersist {}),
-        wollet_desc,
-    )
-    .unwrap();
+    let mut wollet = Wollet::without_persist(ElementsNetwork::LiquidTestnet, wollet_desc).unwrap();
     let url = "https://waterfalls.liquidwebwallet.org/liquidtestnet/api";
     let mut client = blocking::EsploraClient::new(url, ElementsNetwork::LiquidTestnet).unwrap();
     let update = client.full_scan(&wollet).unwrap().unwrap();
@@ -2959,12 +3022,7 @@ fn test_no_wildcard() {
 
     // Use esplora client
     let network = ElementsNetwork::default_regtest();
-    let mut esplora_wollet = Wollet::new(
-        network,
-        std::sync::Arc::new(NoPersist {}),
-        desc.parse().unwrap(),
-    )
-    .unwrap();
+    let mut esplora_wollet = Wollet::without_persist(network, desc.parse().unwrap()).unwrap();
 
     let esplora_url = env.esplora_url();
     let mut esplora_client = clients::blocking::EsploraClient::new(&esplora_url, network).unwrap();

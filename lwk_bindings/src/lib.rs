@@ -23,7 +23,6 @@ mod bip21;
 mod bip321;
 pub use bip21::Bip21;
 pub use bip321::Bip321;
-mod persister;
 mod precision;
 mod pset;
 mod pset_details;
@@ -48,9 +47,9 @@ pub use lightning::{BoltzSession, LogLevel, Logging, LoggingLink};
 mod simplicity;
 #[cfg(feature = "simplicity")]
 pub use simplicity::{
-    simplicity_control_block, simplicity_derive_xonly_pubkey, SimplicityArguments,
+    simplicity_control_block, simplicity_derive_xonly_pubkey, Cmr, SimplicityArguments,
     SimplicityLogLevel, SimplicityProgram, SimplicityRunResult, SimplicityType,
-    SimplicityTypedValue, SimplicityWitnessValues,
+    SimplicityTypedValue, SimplicityWitnessValues, StateTaprootBuilder, StateTaprootSpendInfo,
 };
 
 pub use blockdata::address::Address;
@@ -59,8 +58,11 @@ pub use blockdata::block_header::BlockHeader;
 pub use blockdata::external_utxo::ExternalUtxo;
 pub use blockdata::out_point::OutPoint;
 pub use blockdata::script::Script;
-pub use blockdata::transaction::{Transaction, TransactionEditor};
+pub use blockdata::transaction::Transaction;
+#[cfg(feature = "simplicity")]
+pub use blockdata::transaction::TransactionEditor;
 pub use blockdata::tx_in::TxIn;
+#[cfg(feature = "simplicity")]
 pub use blockdata::tx_in_witness::{TxInWitness, TxInWitnessBuilder};
 pub use blockdata::tx_out::TxOut;
 pub use blockdata::tx_out_secrets::TxOutSecrets;
@@ -70,6 +72,7 @@ pub use blockdata::wallet_tx_out::WalletTxOut;
 
 pub use crate::contract::Contract;
 pub use crate::signer::{Bip, Signer};
+#[cfg(feature = "simplicity")]
 pub use crate::types::{
     asset_id_from_issuance, asset_id_inner_hex, reissuance_token_from_issuance,
     AssetBlindingFactor, ContractHash, ControlBlock, Keypair, LockTime, PublicKey, Tweak,
@@ -85,10 +88,11 @@ pub use esplora_client::{EsploraClient, EsploraClientBuilder};
 pub use liquidex::{AssetAmount, UnvalidatedLiquidexProposal, ValidatedLiquidexProposal};
 pub use mnemonic::Mnemonic;
 pub use network::Network;
-pub use persister::{ForeignPersister, ForeignPersisterLink};
 pub use pos::PosConfig;
 pub use precision::Precision;
-pub use pset::{Pset, PsetBuilder, PsetInput, PsetInputBuilder, PsetOutput, PsetOutputBuilder};
+pub use pset::{Pset, PsetInput, PsetOutput};
+#[cfg(feature = "simplicity")]
+pub use pset::{PsetBuilder, PsetInputBuilder, PsetOutputBuilder};
 pub use pset_details::{Issuance, PsetDetails};
 pub use store::{ForeignStore, ForeignStoreLink};
 pub use test_env::{LwkTestEnv, LwkTestStore};

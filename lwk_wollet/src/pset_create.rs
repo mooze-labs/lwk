@@ -1,4 +1,5 @@
 use crate::bitcoin::PublicKey as BitcoinPublicKey;
+use crate::contract::Contract;
 use crate::elements::confidential::AssetBlindingFactor;
 use crate::elements::issuance::ContractHash;
 use crate::elements::pset::{Output, PartiallySignedTransaction};
@@ -6,7 +7,6 @@ use crate::elements::{Address, AssetId, OutPoint, Transaction, TxOut, TxOutSecre
 use crate::error::Error;
 use crate::hashes::Hash;
 use crate::model::{Recipient, WalletTxOut};
-use crate::registry::Contract;
 use crate::tx_builder::add_input_inner;
 use crate::wollet::Wollet;
 use crate::ElementsNetwork;
@@ -230,8 +230,6 @@ mod test {
     use crate::{pset_create::validate_address, ElementsNetwork, Update, WolletDescriptor};
 
     use super::*;
-    use crate::NoPersist;
-
     #[test]
     fn test_validate() {
         let testnet_address = "tlq1qq2xvpcvfup5j8zscjq05u2wxxjcyewk7979f3mmz5l7uw5pqmx6xf5xy50hsn6vhkm5euwt72x878eq6zxx2z58hd7zrsg9qn";
@@ -283,12 +281,8 @@ mod test {
         let descriptor = lwk_test_util::wollet_descriptor_many_transactions();
         let descriptor: WolletDescriptor = descriptor.parse().unwrap();
         let update = Update::deserialize(&update).unwrap();
-        let mut wollet = Wollet::new(
-            ElementsNetwork::LiquidTestnet,
-            std::sync::Arc::new(NoPersist {}),
-            descriptor,
-        )
-        .unwrap();
+        let mut wollet =
+            Wollet::without_persist(ElementsNetwork::LiquidTestnet, descriptor).unwrap();
         wollet.apply_update(update).unwrap();
         wollet
     }

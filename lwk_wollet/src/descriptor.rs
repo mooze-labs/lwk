@@ -498,14 +498,20 @@ impl WolletDescriptor {
         self.inner_address(index, params, Chain::Internal)
     }
 
+    /// Get the encryption key bytes derived from the descriptor.
+    ///
+    /// The rationale to derive a key from the descriptor is to avoid storing a separate key that you need to backup for the wallet data.
+    /// In the end the descriptor allows you to recover the same data directly from the blockchain, thus we don't need additional security.
+    pub fn encryption_key_bytes(&self) -> [u8; 32] {
+        EncryptionKeyHash::hash(self.to_string().as_bytes()).to_byte_array()
+    }
+
     /// Get a cipher from the descriptor, used to encrypt and decrypt updates.
     ///
     /// The rationale to derive a key from the descriptor is to avoid storing a separate key that you need to backup for the wallet data.
     /// In the end the descriptor allows you to recover the same data directly from the blockchain, thus we don't need additional security.
-    #[allow(deprecated)]
     pub fn cipher(&self) -> Aes256GcmSiv {
-        let key_bytes = EncryptionKeyHash::hash(self.to_string().as_bytes()).to_byte_array();
-        cipher_from_key_bytes(key_bytes)
+        cipher_from_key_bytes(self.encryption_key_bytes())
     }
 
     /// Derive an address from this descriptor at the given `index`.
@@ -887,6 +893,13 @@ mod test {
         let mut hasher = DefaultHasher::new();
         desc.hash(&mut hasher);
         assert_eq!(12055616352728229988, hasher.finish());
+    }
+
+    #[test]
+    fn test_encryption_key_hash_empty_input_regression() {
+        let got = <super::EncryptionKeyHash as crate::hashes::Hash>::hash(b"").to_string();
+        let exp = "1fa0594ee956effe074a3e3c515c5b997a460d90ccfcc49404bd9005d437abd2";
+        assert_eq!(got, exp);
     }
 
     #[test]

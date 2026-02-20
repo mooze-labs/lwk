@@ -1,6 +1,5 @@
 #[cfg(feature = "foreign_bindings")]
 uniffi::build_foreign_language_testcases!(
-    "tests/bindings/custom_persister.py",
     "tests/bindings/custom_store.py",
     "tests/bindings/external_unblind.py",
     "tests/bindings/list_transactions.py",
@@ -25,12 +24,14 @@ uniffi::build_foreign_language_testcases!(
     "tests/bindings/basics.py",
     "tests/bindings/bip85.py",
     "tests/bindings/dwid.py",
+    "tests/bindings/drain_lbtc.py",
     "tests/bindings/payment_instructions.py"
 );
 
 #[cfg(all(feature = "foreign_bindings", feature = "simplicity"))]
 uniffi::build_foreign_language_testcases!(
     "tests/bindings/simplicity_p2pk.py",
+    "tests/bindings/simplicity_taproot_builder.py",
     "tests/bindings/simplicity_p2pk_regtest.py",
     "tests/bindings/simplicity_options_regtest.py"
 );

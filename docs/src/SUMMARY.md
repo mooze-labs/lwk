@@ -13,12 +13,11 @@
 * [Advanced]() #(advanced.md) ❌
   * [Blockchain Clients](clients.md) ✅
   * [Multisig](multisig.md) ✅
-  * [Custom Wollet Persister]() #(persiter.md) ❌
   * [Issuance](issuance.md) ✅
   * [Reissuance](reissuance.md) ✅
   * [Burn](burn.md) ✅
   * [Manual Coin Selection](manual.md) ✅
-  * [Add External Inputs]() #(external.md) ❌
+  * [Add External Inputs](external.md) ✅
   * [Send All Funds](sendall.md) ✅
   * [Explicit Input and Outputs]() #(explicit.md) ❌
   * [AMP0](amp0.md) ✅

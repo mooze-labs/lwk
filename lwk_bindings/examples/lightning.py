@@ -131,6 +131,16 @@ def lockup_thread(lockup_response):
             traceback.print_exc()
             break
 
+def should_start_completion_thread(swap_data):
+    """Ask whether to start monitoring for a restored swap."""
+    swap_id = swap_data.get("id", "unknown")
+    last_state = swap_data.get("last_state", "unknown")
+    answer = input(
+        f"Swap {swap_id} (state: {last_state}). "
+        "Start completion thread? [y/N]: "
+    ).strip().lower()
+    return answer in ("y", "yes")
+
 def show_invoice(boltz_session, wollet):
     """Create and show an invoice"""
     # Ask for the invoice amount
@@ -287,6 +297,18 @@ def restorable_reverse_swaps(boltz_session, wollet):
             swap_data = json.loads(data)
             print(json.dumps(swap_data, indent=2))
             print()
+
+            if should_start_completion_thread(swap_data):
+                invoice_response = boltz_session.restore_invoice(data)
+                thread = threading.Thread(
+                    target=invoice_thread,
+                    args=(invoice_response, claim_address),
+                )
+                thread.daemon = True
+                thread.start()
+                print(f"Started completion thread for restored swap {invoice_response.swap_id()}")
+            else:
+                print("Skipped completion thread startup.")
     except Exception as e:
         print(f"Error fetching reverse swaps: {e}")
 
@@ -314,8 +336,100 @@ def restorable_submarine_swaps(boltz_session, wollet):
             swap_data = json.loads(data)
             print(json.dumps(swap_data, indent=2))
             print()
+
+            if should_start_completion_thread(swap_data):
+                prepare_pay_response = boltz_session.restore_prepare_pay(data)
+                thread = threading.Thread(
+                    target=pay_invoice_thread,
+                    args=(prepare_pay_response,),
+                )
+                thread.daemon = True
+                thread.start()
+                print(f"Started completion thread for restored swap {prepare_pay_response.swap_id()}")
+            else:
+                print("Skipped completion thread startup.")
     except Exception as e:
         print(f"Error fetching submarine swaps: {e}")
+
+def restorable_btc_to_lbtc_swaps(boltz_session, wollet):
+    """Fetch BTC to LBTC chain swaps for the wallet"""
+    try:
+        # Get the claim address for this wallet (Liquid)
+        claim_address = wollet.address(None).address()
+        print(f"Using claim address (Liquid): {claim_address}")
+
+        # Ask for the Bitcoin refund address
+        refund_address_str = input("Enter Bitcoin refund address: ").strip()
+        refund_address = BitcoinAddress(refund_address_str)
+
+        # Fetch restorable BTC to LBTC swaps from Boltz
+        swap_list = boltz_session.swap_restore()
+        swap_data_list = boltz_session.restorable_btc_to_lbtc_swaps(
+            swap_list, claim_address, refund_address
+        )
+
+        if not swap_data_list:
+            print("No BTC to LBTC chain swaps found")
+            return
+
+        print(f"Found {len(swap_data_list)} BTC to LBTC chain swap(s)\n")
+
+        for i, data in enumerate(swap_data_list, 1):
+            print(f"=== Swap {i} ===")
+            swap_data = json.loads(data)
+            print(json.dumps(swap_data, indent=2))
+            print()
+
+            if should_start_completion_thread(swap_data):
+                lockup_response = boltz_session.restore_lockup(data)
+                thread = threading.Thread(target=lockup_thread, args=(lockup_response,))
+                thread.daemon = True
+                thread.start()
+                print(f"Started completion thread for restored swap {lockup_response.swap_id()}")
+            else:
+                print("Skipped completion thread startup.")
+    except Exception as e:
+        print(f"Error fetching BTC to LBTC chain swaps: {e}")
+
+def restorable_lbtc_to_btc_swaps(boltz_session, wollet):
+    """Fetch LBTC to BTC chain swaps for the wallet"""
+    try:
+        # Get the refund address for this wallet (Liquid)
+        refund_address = wollet.address(None).address()
+        print(f"Using refund address (Liquid): {refund_address}")
+
+        # Ask for the Bitcoin claim address
+        claim_address_str = input("Enter Bitcoin claim address: ").strip()
+        claim_address = BitcoinAddress(claim_address_str)
+
+        # Fetch restorable LBTC to BTC swaps from Boltz
+        swap_list = boltz_session.swap_restore()
+        swap_data_list = boltz_session.restorable_lbtc_to_btc_swaps(
+            swap_list, claim_address, refund_address
+        )
+
+        if not swap_data_list:
+            print("No LBTC to BTC chain swaps found")
+            return
+
+        print(f"Found {len(swap_data_list)} LBTC to BTC chain swap(s)\n")
+
+        for i, data in enumerate(swap_data_list, 1):
+            print(f"=== Swap {i} ===")
+            swap_data = json.loads(data)
+            print(json.dumps(swap_data, indent=2))
+            print()
+
+            if should_start_completion_thread(swap_data):
+                lockup_response = boltz_session.restore_lockup(data)
+                thread = threading.Thread(target=lockup_thread, args=(lockup_response,))
+                thread.daemon = True
+                thread.start()
+                print(f"Started completion thread for restored swap {lockup_response.swap_id()}")
+            else:
+                print("Skipped completion thread startup.")
+    except Exception as e:
+        print(f"Error fetching LBTC to BTC chain swaps: {e}")
 
 def list_all_swaps(boltz_session):
     """List all swaps for the lightning session"""
@@ -633,7 +747,12 @@ def main():
 
     wollet = Wollet(network, desc, datadir=None)
 
-    mnemonic_lightning = signer.derive_bip85_mnemonic(0, 12) # for security reasons using a different mnemonic for the lightning session
+    mnemonic_derivation_index = os.getenv('MNEMONIC_DERIVATION_INDEX')
+    if mnemonic_derivation_index:
+        mnemonic_derivation_index = int(mnemonic_derivation_index)
+    else:
+        mnemonic_derivation_index = 26589
+    mnemonic_lightning = signer.derive_bip85_mnemonic(mnemonic_derivation_index, 12) # for security reasons using a different mnemonic for the lightning session
     lightning_client = AnyClient.from_esplora(esplora_client)
     logger = MyLogger()
 
@@ -728,14 +847,16 @@ def main():
         print("5) Generate rescue file")
         print("6) Fetch restorable reverse swaps")
         print("7) Fetch restorable submarine swaps")
-        print("8) List all swaps (from Boltz API)")
-        print("9) Show swaps info")
-        print("10) Swap LBTC to BTC (chain swap)")
-        print("11) Swap BTC to LBTC (chain swap) (requires external btc wallet)")
-        print("12) Get swap quote")
-        print("13) List pending swaps (from local store)")
-        print("14) List completed swaps (from local store)")
-        print("15) Remove swap from store")
+        print("8) Fetch restorable BTC to LBTC swaps")
+        print("9) Fetch restorable LBTC to BTC swaps")
+        print("10) List all swaps (from Boltz API)")
+        print("11) Show swaps info")
+        print("12) Swap LBTC to BTC (chain swap)")
+        print("13) Swap BTC to LBTC (chain swap) (requires external btc wallet)")
+        print("14) Get swap quote")
+        print("15) List pending swaps (from local store)")
+        print("16) List completed swaps (from local store)")
+        print("17) Remove swap from store")
         print("q) Quit")
 
         choice = input("Choose option: ").strip().lower()
@@ -773,21 +894,27 @@ def main():
             print("\n=== Fetching Submarine Swaps ===")
             restorable_submarine_swaps(boltz_session, wollet)
         elif choice == '8':
+            print("\n=== Fetching BTC to LBTC Chain Swaps ===")
+            restorable_btc_to_lbtc_swaps(boltz_session, wollet)
+        elif choice == '9':
+            print("\n=== Fetching LBTC to BTC Chain Swaps ===")
+            restorable_lbtc_to_btc_swaps(boltz_session, wollet)
+        elif choice == '10':
             print("\n=== Listing All Swaps ===")
             list_all_swaps(boltz_session)
-        elif choice == '9':
+        elif choice == '11':
             print("\n=== Showing Swaps Info ===")
             show_swaps_info(boltz_session)
-        elif choice == '10':
+        elif choice == '12':
             print("\n=== Swapping LBTC to BTC ===")
             lbtc_to_btc_swap(boltz_session, wollet, esplora_client, signer)
-        elif choice == '11':
+        elif choice == '13':
             print("\n=== Swapping BTC to LBTC ===")
             btc_to_lbtc_swap(boltz_session, wollet)
-        elif choice == '12':
+        elif choice == '14':
             print("\n=== Get Swap Quote ===")
             get_quote(boltz_session)
-        elif choice == '13':
+        elif choice == '15':
             print("\n=== Pending Swaps (from local store) ===")
             pending = boltz_session.pending_swap_ids()
             if pending is None:
@@ -805,7 +932,7 @@ def main():
                         print(f"  - {swap_id} ({swap_type}) - state: {last_state}")
                     else:
                         print(f"  - {swap_id} (data not found)")
-        elif choice == '14':
+        elif choice == '16':
             print("\n=== Completed Swaps (from local store) ===")
             completed = boltz_session.completed_swap_ids()
             if completed is None:
@@ -823,7 +950,7 @@ def main():
                         print(f"  - {swap_id} ({swap_type}) - state: {last_state}")
                     else:
                         print(f"  - {swap_id} (data not found)")
-        elif choice == '15':
+        elif choice == '17':
             print("\n=== Remove Swap from Store ===")
             swap_id = input("Enter swap ID to remove: ").strip()
             if swap_id:
