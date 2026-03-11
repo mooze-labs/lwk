@@ -9,12 +9,45 @@ For this reason we don't necessarily follow Rust guidelines.
 Documentation of this crate should not use link to rust types such as [`elements::Transaction`] because they are not usable in end-user languages.
 Many types are wrappers of types in LWK crates, in this cases we mostly duplicate the original documentation with context adjustment.
 
+If a function is complex or has non-obvious behavior, add extra caller-facing context (for example by copying/adapting the relevant explanation from upstream docs).
+
 ## Tests
 Rust unit tests are welcome, however testing the Rust intermediate interface is not enough.
-We must have coverage also from a destination language.
+We must have coverage also from a destination language, and we should treat that coverage as required for interface changes.
+
 Python is a common choice for tests due to its simplicity and popularity.
+
 Tests in destination languages also serve as examples, try to make them useful for devs using that language.
-When a function is not self-explanatory or a flow is complex, add comments; name variables to document function parameters.
+
+When adding/changing API surface, include destination-language checks for expected behavior and roundtrip consistency when serialization is involved.
+
+## Function/method arguments
+Always accept a function argument by an immutable reference.
+
+This is an example of how NOT to do it: `fn some_func(arr: Vec<Arc<TxOut>>)`; instead, do: `fn some_func(arr: &[Arc<TxOut>])`.
+
+This is because, in the targeted language, we won't have any borrowing checks, but in Rust, when the Rust compiler sees that the argument is now owned by the function, it could modify or destroy it. Therefore, if you use it again in the target language, you would have a headache debugging why the value is now broken.
+
+Note that this sometimes implies a performance penalty, with some extra clones.
+This is a deliberate choice to avoid the situation we described above.
+If performance really matters, consider using the Rust crates directly.
+
+### Exceptions
+There are situations where it’s acceptable to bypass this rule.
+Below is a non-exhaustive list of such cases:
+- When the type implements the `Copy` trait, there is no need to add a reference. 
+  - This applies to all types like `u32`, `u64`, etc.
+  - This is ok: `LockTime::from_height(height: u32)`
+- When an object is consumed and cannot be used afterwards
+  - This is ok: `Amp0Connected::login(self: Arc<Self>, sig: &str) -> Result<Arc<Amp0LoggedIn>, LwkError>`,
+  for AMP0, when you log in, you cannot log in again with the same `Amp0Connected` object.
+  - This is WRONG: `EsploraClient::from_builder(builder: EsploraClientBuilder)`, argument should `&EsploraClientBuilder`.
+  - This is WRONG: `SomeBuilder::add_data(&self, Vec<Arc<TxOut>>)`. The second argument should be `&[Arc<TxOut>]`.
+- When the argument is a shared-ownership smart pointer (e.g. `Arc<T>`) and the callee needs to retain it (store it / keep a handle).
+  - In this case, taking it by value is acceptable since cloning is cheap and the intent is to keep a shared owner.
+  - This is ok: `LoggingLink::new(logging: Arc<dyn Logging>)`
+- Or you have another **strong** reason for it
+  - Make sure to explicitly state it in the end-user-facing documentation to prevent misuse.
 
 ## Constructors
 Do not use the default constructor `new()` if there are multiple ways in which an object can be created.
@@ -42,17 +75,27 @@ Add a _python_ test to check that they roundtrip.
 ### String
 If the object has a natural string representation, implement `Display` and add `#[uniffi::export(Display)]`
 
-For constructors, be explicit about the string format necessary (implement a constructor from string):
+Use a single canonical string interface for parsing/serialization:
 ```
 impl MyType {
-    // explicitly comment if hex-reversed, eg
-    /// Note: hex representation is byte-reversed
     #[uniffi::constructor]
-    pub fn from_hex(s: &str) -> Result<Arc<Self>, LwkError> { }
-
-    #[uniffi::constructor]
-    pub fn from_b64(s: &str) -> Result<Arc<Self>, LwkError> { }
+    pub fn from_string(s: &str) -> Result<Arc<Self>, LwkError> { }
 }
 ```
 
-Add a _python_ test to check that serialization roundtrip
+`to_string()` (via `Display`) must produce the format accepted by `from_string`.
+
+Document any non-obvious detail of that format in the constructor doc comment (for example if `to_string()` returns bytes in a reverse order).
+
+Add a _python_ test to check serialization roundtrip.
+
+## Deprecating functions
+If there are functions that contradict the guidelines above and should be marked as deprecated, add the following comment:
+```
+Deprecated: use `function_name()` instead.
+```
+We do not use deprecation macros because they are ignored in the targeted bindings:
+
+Make sure that deprecated functions are not referenced in examples/tests by running CI or local tests without them.
+
+When deprecating a function/method mention it in the CHANGELOG.md.

@@ -81,10 +81,10 @@ async function runMultisigTest() {
 
 	// ANCHOR: multisig-send
 	// Carol creates a transaction send few sats to a certain address
-	const sats = BigInt(1000);
+	const sats = BigInt(100);
 	if (false) { // ANCHOR: ignore
 	const address = new lwk.Address("<address>");
-	const asset = new lwk.AssetId("<asset>");
+	const asset = new lwk.AssetId.fromString("<asset>");
 	} // ANCHOR: ignore
 	const address = new lwk.Address("tlq1qq2g07nju42l0nlx0erqa3wsel2l8prnq96rlnhml262mcj7pe8w6ndvvyg237japt83z24m8gu4v3yfhaqvrqxydadc9scsmw"); // ANCHOR: ignore
 	const asset = network.policyAsset(); // ANCHOR: ignore

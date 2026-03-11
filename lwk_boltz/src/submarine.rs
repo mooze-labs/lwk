@@ -180,6 +180,7 @@ impl BoltzSession {
             data: PreparePayData {
                 last_state: SwapState::InvoiceSet,
                 swap_type: SwapType::Submarine,
+                lockup_txid: None,
                 fee: Some(fee),
                 boltz_fee,
                 bolt11_invoice: Some((**bolt11_invoice).clone()),
@@ -207,7 +208,11 @@ impl BoltzSession {
         &self,
         data: PreparePayDataSerializable,
     ) -> Result<PreparePayResponse, Error> {
-        let data = to_prepare_pay_data(data, &self.mnemonic)?;
+        let mut data = to_prepare_pay_data(data, &self.mnemonic)?;
+        if data.lockup_txid.is_none() {
+            data.lockup_txid =
+                fetch_lockup_txid(self.api.as_ref(), &data.create_swap_response.id).await;
+        }
         let p = data.our_keys.public_key();
         let swap_script = SwapScript::submarine_from_swap_resp(
             self.chain(),
@@ -249,8 +254,9 @@ impl BoltzSession {
 
     /// From the swaps returned by the boltz api via [`BoltzSession::swap_restore`]:
     ///
-    /// - filter the submarine swaps that can be restored
-    /// - Add the private information from the session needed to restore the swap
+    /// - filter the submarine swaps
+    /// - add information from the session
+    /// - return typed data
     ///
     /// The refund address doesn't need to be the same used when creating the swap.
     pub async fn restorable_submarine_swaps(
@@ -261,13 +267,6 @@ impl BoltzSession {
         swaps
             .iter()
             .filter(|e| matches!(e.swap_type, SwapRestoreType::Submarine))
-            .filter(|e| {
-                e.status != "swap.expired"
-                    && e.status != "transaction.claimed"
-                    && e.status != "swap.created"
-                    && e.status != "invoice.set"
-                    && e.status != "transaction.refunded"
-            })
             .map(|e| {
                 convert_swap_restore_response_to_prepare_pay_data(
                     e,
@@ -276,6 +275,20 @@ impl BoltzSession {
                 )
             })
             .collect()
+    }
+}
+
+async fn fetch_lockup_txid(api: &BoltzApiClientV2, swap_id: &str) -> Option<String> {
+    match api.get_submarine_tx(swap_id).await {
+        Ok(tx) => Some(tx.id),
+        Err(err) => {
+            log::warn!(
+                "failed to fetch submarine txid for swap {}: {}",
+                swap_id,
+                err
+            );
+            None
+        }
     }
 }
 
@@ -339,6 +352,7 @@ pub(crate) fn convert_swap_restore_response_to_prepare_pay_data(
     Ok(PreparePayData {
         last_state,
         swap_type: SwapType::Submarine,
+        lockup_txid: None,
         fee: None,            // Fee information not available in restore response
         bolt11_invoice: None, // Invoice information not available in restore response
         our_keys,
@@ -403,6 +417,7 @@ impl PreparePayResponse {
         let flow = match update_status {
             SwapState::InvoiceSet => Ok(ControlFlow::Continue(update)),
             SwapState::TransactionMempool => {
+                self.data.lockup_txid = update.transaction.as_ref().map(|tx| tx.id.clone());
                 log::info!("transaction.mempool Boltz broadcasted funding tx");
                 Ok(ControlFlow::Continue(update))
             }
@@ -420,6 +435,11 @@ impl PreparePayResponse {
             SwapState::InvoicePending => Ok(ControlFlow::Continue(update)),
             SwapState::InvoicePaid => Ok(ControlFlow::Continue(update)),
             SwapState::TransactionClaimed => {
+                if self.data.lockup_txid.is_none() {
+                    log::warn!("transaction.claimed Boltz claimed funding tx but lockup_txid is not set, fetching it");
+                    self.data.lockup_txid =
+                        fetch_lockup_txid(self.api.as_ref(), self.swap_id()).await;
+                }
                 log::info!("transaction.claimed Boltz claimed funding tx");
                 Ok(ControlFlow::Break(true))
             }
@@ -533,5 +553,21 @@ impl PreparePayResponse {
     /// For example for paying an invoice of 1000 satoshi with a 0.1% rate would be 1 satoshi.
     pub fn boltz_fee(&self) -> Option<u64> {
         self.data.boltz_fee
+    }
+
+    /// The txid of the lockup transaction
+    pub fn lockup_txid(&self) -> Option<&str> {
+        self.data.lockup_txid.as_deref()
+    }
+
+    /// Optionally set the lockup transaction txid.
+    ///
+    /// This is useful for apps that create and broadcast the lockup transaction and want to
+    /// immediately store the txid before Boltz websocket updates arrive. Doing so can prevent a
+    /// race where a very fast retry flow might create and send the lockup transaction twice.
+    pub fn set_lockup_txid(&mut self, txid: String) -> Result<(), Error> {
+        self.data.lockup_txid = Some(txid);
+        self.persist()?;
+        Ok(())
     }
 }

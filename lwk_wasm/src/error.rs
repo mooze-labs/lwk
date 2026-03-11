@@ -85,7 +85,19 @@ pub enum Error {
     Secp256k1Zkp(#[from] lwk_wollet::elements::secp256k1_zkp::Error),
 
     #[error(transparent)]
-    Taproot(#[from] lwk_wollet::elements::bitcoin::taproot::TaprootError),
+    Locktime(#[from] lwk_wollet::elements::locktime::Error),
+
+    #[error(transparent)]
+    ParsePublicKey(#[from] lwk_wollet::elements::bitcoin::key::ParsePublicKeyError),
+
+    #[error(transparent)]
+    TryFromSlice(#[from] std::array::TryFromSliceError),
+
+    #[error(transparent)]
+    HashesFromSlice(#[from] lwk_wollet::hashes::FromSliceError),
+
+    #[error(transparent)]
+    Taproot(#[from] lwk_wollet::elements::taproot::TaprootError),
 
     #[error("{0:?}")]
     Unblind(#[from] lwk_wollet::elements::UnblindError),
@@ -156,6 +168,7 @@ impl Error {
                 lwk_boltz::Error::LockPoisoned(_) => "Boltz::LockPoisoned",
                 lwk_boltz::Error::Store(_) => "Boltz::Store",
                 lwk_boltz::Error::StoreNotConfigured => "Boltz::StoreNotConfigured",
+                lwk_boltz::Error::BoltzBackendHttpError { .. } => "Boltz::BoltzBackendHttpError",
             },
             Error::HexToArray(_) => "HexToArray",
             Error::Wollet(_) => "Wollet",
@@ -190,6 +203,8 @@ impl Error {
             Error::KeyFromSlice(_) => "KeyFromSlice",
             Error::FromWif(_) => "FromWif",
             Error::Secp256k1Zkp(_) => "Secp256k1Zkp",
+            Error::Locktime(_) => "Locktime",
+            Error::TryFromSlice(_) => "TryFromSlice",
             Error::Taproot(_) => "Taproot",
             Error::Unblind(_) => "Unblind",
             Error::Generic(_) => "Generic",
@@ -199,6 +214,8 @@ impl Error {
             Error::SimplicityHlRich(_) => "SimplicityRich",
             #[cfg(feature = "simplicity")]
             Error::TaprootBuilder(_) => "TaprootBuilderError",
+            Error::HashesFromSlice(_) => "HashesFromSliceError",
+            Error::ParsePublicKey(_) => "ParsePublicKeyError",
         }
     }
 }

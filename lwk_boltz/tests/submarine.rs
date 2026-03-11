@@ -99,6 +99,10 @@ mod tests {
                 }
             }
         }
+        assert!(
+            prepare_pay_response.lockup_txid().is_some(),
+            "lockup txid should be available when submarine swap is claimed"
+        );
         // repeatly calling advance on a terminated swap don't timeout
         for _ in 0..10 {
             match prepare_pay_response.advance().await {
@@ -259,6 +263,154 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires regtest environment"]
+    async fn test_session_restore_lockup_txid_submarine() {
+        let _ = env_logger::try_init();
+
+        // Start concurrent block mining task
+        let mining_handle = utils::start_block_mining();
+
+        let mnemonic = Mnemonic::from_str(
+            "damp cart merit asset obvious idea chef traffic absent armed road link",
+        )
+        .unwrap();
+
+        let refund_address = utils::generate_address(Chain::Liquid(LiquidChain::LiquidRegtest))
+            .await
+            .unwrap();
+        let refund_address = elements::Address::from_str(&refund_address).unwrap();
+        let client = Arc::new(
+            ElectrumClient::new(
+                DEFAULT_REGTEST_NODE,
+                false,
+                false,
+                ElementsNetwork::default_regtest(),
+            )
+            .unwrap(),
+        );
+
+        let session_fn = || {
+            BoltzSession::builder(
+                ElementsNetwork::default_regtest(),
+                AnyClient::Electrum(client.clone()),
+            )
+            .create_swap_timeout(TIMEOUT)
+            .mnemonic(mnemonic.clone())
+            .build()
+        };
+
+        let session = session_fn().await.unwrap();
+        let bolt11_invoice = utils::generate_invoice_lnd(50_000).await.unwrap();
+        let lightning_payment = LightningPayment::from_str(&bolt11_invoice).unwrap();
+        let mut prepare_pay_response = session
+            .prepare_pay(&lightning_payment, &refund_address, None)
+            .await
+            .unwrap();
+
+        let serialized_data = prepare_pay_response.serialize().unwrap();
+        let data = PreparePayDataSerializable::deserialize(&serialized_data).unwrap();
+        assert_eq!(data.lockup_txid.as_deref(), None);
+
+        utils::send_to_address(
+            Chain::Liquid(LiquidChain::LiquidRegtest),
+            &prepare_pay_response.uri_address().unwrap().to_string(),
+            prepare_pay_response.uri_amount(),
+        )
+        .await
+        .unwrap();
+
+        while let Ok(std::ops::ControlFlow::Continue(_)) = prepare_pay_response.advance().await {}
+
+        let lockup_txid = prepare_pay_response
+            .lockup_txid()
+            .map(|s| s.to_string())
+            .expect("lockup_txid should be set");
+        log::info!("lockup_txid: {lockup_txid}");
+        drop(prepare_pay_response);
+        drop(session);
+
+        let session = session_fn().await.unwrap();
+        let prepare_pay_response = session.restore_prepare_pay(data).await.unwrap();
+        let lockup_txid_restored = prepare_pay_response
+            .lockup_txid()
+            .expect("lockup_txid should be set");
+        assert_eq!(lockup_txid, lockup_txid_restored);
+
+        // Check set_lockup_txid behavior on a fresh swap, without altering the flow above
+        let bolt11_invoice = utils::generate_invoice_lnd(51_000).await.unwrap();
+        let lightning_payment = LightningPayment::from_str(&bolt11_invoice).unwrap();
+        let mut prepare_pay_response = session
+            .prepare_pay(&lightning_payment, &refund_address, None)
+            .await
+            .unwrap();
+        assert_eq!(prepare_pay_response.lockup_txid(), None);
+        let txid = "1111111111111111111111111111111111111111111111111111111111111111";
+        prepare_pay_response
+            .set_lockup_txid(txid.to_string())
+            .unwrap();
+        assert_eq!(prepare_pay_response.lockup_txid(), Some(txid));
+        let txid2 = "2222222222222222222222222222222222222222222222222222222222222222";
+        prepare_pay_response
+            .set_lockup_txid(txid2.to_string())
+            .unwrap();
+        assert_eq!(prepare_pay_response.lockup_txid(), Some(txid2));
+        let serialized_data = prepare_pay_response.serialize().unwrap();
+        drop(prepare_pay_response);
+        let data = PreparePayDataSerializable::deserialize(&serialized_data).unwrap();
+        let prepare_pay_response = session.restore_prepare_pay(data).await.unwrap();
+        assert_eq!(prepare_pay_response.lockup_txid(), Some(txid2));
+
+        // Stop the mining task
+        mining_handle.abort();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires regtest environment"]
+    async fn test_session_submarine_duplicate_invoice_error() {
+        let _ = env_logger::try_init();
+
+        let refund_address = utils::generate_address(Chain::Liquid(LiquidChain::LiquidRegtest))
+            .await
+            .unwrap();
+        let refund_address = elements::Address::from_str(&refund_address).unwrap();
+        let client = Arc::new(
+            ElectrumClient::new(
+                DEFAULT_REGTEST_NODE,
+                false,
+                false,
+                ElementsNetwork::default_regtest(),
+            )
+            .unwrap(),
+        );
+
+        let session = BoltzSession::builder(
+            ElementsNetwork::default_regtest(),
+            AnyClient::Electrum(client),
+        )
+        .create_swap_timeout(TIMEOUT)
+        .build()
+        .await
+        .unwrap();
+
+        let bolt11_invoice = utils::generate_invoice_lnd(50_000).await.unwrap();
+        let lightning_payment = LightningPayment::from_str(&bolt11_invoice).unwrap();
+
+        session
+            .prepare_pay(&lightning_payment, &refund_address, None)
+            .await
+            .unwrap();
+
+        let err = session
+            .prepare_pay(&lightning_payment, &refund_address, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            lwk_boltz::Error::BoltzBackendHttpError { status, error } if status == 400 && error.as_ref().unwrap() == "a swap with this invoice exists already"
+        ));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires regtest environment"]
     async fn test_session_restore_submarine_from_swap_list() {
         let _ = env_logger::try_init();
 
@@ -312,7 +464,9 @@ mod tests {
             .filter(|data| data.create_swap_response.id == swap_id)
             .collect();
         log::info!("Found {swaps:?} restorable submarine swaps");
-        assert_eq!(swaps.len(), 0); // the just created swap is not restorable.
+
+        // Every swaps is now restored, independently of the status of the swap.
+        assert_eq!(swaps.len(), 1);
 
         utils::send_to_address(
             Chain::Liquid(LiquidChain::LiquidRegtest),

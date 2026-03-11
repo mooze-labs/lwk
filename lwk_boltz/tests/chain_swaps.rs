@@ -17,9 +17,9 @@ mod tests {
     use boltz_client::swaps::SwapScript;
     use boltz_client::swaps::{SwapTransactionParams, TransactionOptions};
     use boltz_client::util::{secrets::Preimage, sleep};
-    use boltz_client::Keypair;
     use boltz_client::PublicKey;
     use boltz_client::Secp256k1;
+    use boltz_client::{Amount, Keypair};
     use lwk_boltz::SwapPersistence;
     use lwk_boltz::{
         clients::{AnyClient, ElectrumClient},
@@ -392,7 +392,9 @@ mod tests {
             .filter(|data| data.create_chain_response.id == response.swap_id())
             .collect();
         log::info!("Found {swaps:?} restorable chain swaps");
-        assert_eq!(swaps.len(), 0); // the just created swap is not restorable.
+
+        // Every swaps is now restored, independently of the status of the swap.
+        assert_eq!(swaps.len(), 1);
 
         let swap_id = response.swap_id().to_string();
         let lockup_address = response.lockup_address().to_string();
@@ -444,6 +446,118 @@ mod tests {
             "Restored BTC to LBTC swap from swap list should succeed"
         );
         log::info!("Chain swap completed successfully");
+
+        // Stop the mining task
+        mining_handle.abort();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires regtest environment"]
+    async fn test_session_restore_chain_swaps_claim_txid() {
+        let _ = env_logger::try_init();
+
+        // Start concurrent block mining task
+        let mining_handle = crate::utils::start_block_mining();
+
+        let network = ElementsNetwork::default_regtest();
+        let client =
+            Arc::new(ElectrumClient::new(DEFAULT_REGTEST_NODE, false, false, network).unwrap());
+
+        let mnemonic = Mnemonic::from_str(
+            "damp cart merit asset obvious idea chef traffic absent armed road link",
+        )
+        .unwrap();
+
+        let session_fn = || {
+            BoltzSession::builder(network, AnyClient::Electrum(client.clone()))
+                .create_swap_timeout(TIMEOUT)
+                .mnemonic(mnemonic.clone())
+                .build()
+        };
+        let session = session_fn().await.unwrap();
+
+        let refund_address_str = crate::utils::generate_address(BTC_CHAIN.into())
+            .await
+            .unwrap();
+        let claim_address_str = crate::utils::generate_address(LBTC_CHAIN.into())
+            .await
+            .unwrap();
+        let refund_address = bitcoin::Address::from_str(&refund_address_str)
+            .unwrap()
+            .assume_checked();
+        let claim_address = elements::Address::from_str(&claim_address_str).unwrap();
+
+        let mut response = session
+            .btc_to_lbtc(50_000, &refund_address, &claim_address, None)
+            .await
+            .unwrap();
+
+        let lockup_txid_expected = crate::utils::send_to_address(
+            BTC_CHAIN.into(),
+            response.lockup_address(),
+            response.expected_amount(),
+        )
+        .await
+        .unwrap();
+        log::info!("lockup_txid_expected: {lockup_txid_expected}");
+
+        let _ = response.advance().await.unwrap();
+        let _ = response.advance().await.unwrap();
+
+        let lockup_txid = response
+            .lockup_txid()
+            .map(|s| s.to_string())
+            .expect("lockup_txid should be set");
+        log::info!("lockup_txid: {lockup_txid}");
+        assert_eq!(lockup_txid, lockup_txid_expected);
+
+        let _ = response.advance().await.unwrap();
+        let _ = response.advance().await.unwrap();
+
+        let claim_txid = response
+            .claim_txid()
+            .map(|s| s.to_string())
+            .expect("claim_txid should be set");
+        log::info!("claim_txid: {claim_txid}");
+
+        assert_ne!(lockup_txid, claim_txid);
+
+        let serialized_data = response.serialize().unwrap();
+        let data = lwk_boltz::ChainSwapDataSerializable::deserialize(&serialized_data).unwrap();
+        assert_eq!(data.claim_txid.as_deref(), Some(claim_txid.as_str()));
+        assert_eq!(data.lockup_txid.as_deref(), Some(lockup_txid.as_str()));
+
+        drop(response);
+        drop(session);
+
+        let session = session_fn().await.unwrap();
+        let response = session.restore_lockup(data).await.unwrap();
+        let claim_txid_restored = response.data.claim_txid.expect("claim_txid should be set");
+        assert_eq!(claim_txid, claim_txid_restored);
+        let lockup_txid_restored = response
+            .data
+            .lockup_txid
+            .expect("lockup_txid should be set");
+        assert_eq!(lockup_txid, lockup_txid_restored);
+        assert_ne!(lockup_txid, claim_txid);
+
+        // Check set_lockup_txid behavior on a fresh swap, without altering the flow above
+        let mut response = session
+            .btc_to_lbtc(50_001, &refund_address, &claim_address, None)
+            .await
+            .unwrap();
+        assert_eq!(response.lockup_txid(), None);
+        let txid = "3333333333333333333333333333333333333333333333333333333333333333";
+        response.set_lockup_txid(txid.to_string()).unwrap();
+        assert_eq!(response.lockup_txid(), Some(txid));
+        let txid2 = "4444444444444444444444444444444444444444444444444444444444444444";
+        response.set_lockup_txid(txid2.to_string()).unwrap();
+        assert_eq!(response.lockup_txid(), Some(txid2));
+        let serialized_data = response.serialize().unwrap();
+        drop(response);
+        let data = lwk_boltz::ChainSwapDataSerializable::deserialize(&serialized_data).unwrap();
+        let response = session.restore_lockup(data).await.unwrap();
+        assert_eq!(response.lockup_txid(), Some(txid2));
 
         // Stop the mining task
         mining_handle.abort();
@@ -782,9 +896,23 @@ mod tests {
             "boltz_fee should be less than 1% of amount"
         );
 
+        // Verify uri is consistent with lockup address and expected amount
+        let convert_sat = |s| Amount::from_sat(s).to_string_in(bitcoin::Denomination::Bitcoin);
+        let uri = response
+            .uri()
+            .expect("bip21 should be set for fresh chain swaps");
+        let expected_uri = format!(
+            "bitcoin:{}?amount={}",
+            response.lockup_address(),
+            convert_sat(response.expected_amount())
+        );
+        // uri contains also label and asset id, that's why it's a starts_with
+        assert!(uri.starts_with(&expected_uri));
+
         log::info!(
-            "BTC to LBTC swap - Lockup address: {}",
-            response.lockup_address()
+            "BTC to LBTC swap - Lockup address: {}, URI: {}",
+            response.lockup_address(),
+            uri,
         );
         crate::utils::send_to_address(
             BTC_CHAIN.into(),
@@ -871,10 +999,22 @@ mod tests {
             "boltz_fee should be less than 1% of amount"
         );
 
-        log::info!(
-            "LBTC to BTC swap - Lockup address: {}",
-            response.lockup_address()
+        // Verify uri is consistent with lockup address and expected amount
+        let uri = response
+            .uri()
+            .expect("bip21 should be set for fresh chain swaps");
+        let expected_uri = format!(
+            "liquidnetwork:{}?amount={}",
+            response.lockup_address(),
+            convert_sat(response.expected_amount()),
         );
+        log::info!(
+            "LBTC to BTC swap - Lockup address: {}, URI: {}",
+            response.lockup_address(),
+            uri,
+        );
+        assert!(uri.starts_with(&expected_uri));
+
         crate::utils::send_to_address(
             LBTC_CHAIN.into(),
             response.lockup_address(),

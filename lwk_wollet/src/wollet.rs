@@ -66,6 +66,8 @@ pub struct WolletBuilder {
     network: ElementsNetwork,
     descriptor: WolletDescriptor,
     store: Arc<dyn DynStore>,
+    /// Number of updates to trigger merge. None disables merging.
+    merge_threshold: Option<usize>,
 }
 
 impl WolletBuilder {
@@ -75,13 +77,38 @@ impl WolletBuilder {
             network,
             descriptor,
             store: Arc::new(FakeStore::new()),
+            merge_threshold: None,
         }
+    }
+
+    /// Set the threshold for merging updates during build.
+    /// When the number of updates exceeds this threshold, they will be merged into one.
+    /// Set to None to disable merging (default).
+    pub fn with_merge_threshold(mut self, threshold: Option<usize>) -> Self {
+        self.merge_threshold = threshold;
+        self
     }
 
     /// Specify the `Wollet` store for persistence
     pub fn with_store(mut self, store: Arc<dyn DynStore>) -> Self {
         self.store = store;
         self
+    }
+
+    /// Use the legacy `Wollet` store
+    pub fn with_legacy_fs_store<P: AsRef<Path>>(mut self, datadir: P) -> Result<Self, Error> {
+        // Build path: datadir/network/enc_cache/hash(descriptor)
+        let mut path = datadir.as_ref().to_path_buf();
+        path.push(self.network.as_str());
+        path.push("enc_cache");
+        path.push(DirectoryIdHash::hash(self.descriptor.to_string().as_bytes()).to_string());
+
+        let file_store = FileStore::new(path)?;
+        let key_bytes = self.descriptor.encryption_key_bytes();
+        let encrypted_store = EncryptedStore::new(file_store, key_bytes);
+
+        self.store = Arc::new(encrypted_store);
+        Ok(self)
     }
 
     /// Build the `Wollet`
@@ -100,21 +127,73 @@ impl WolletBuilder {
             max_weight_to_satisfy,
         };
 
+        // Check if merging is enabled and needed
+        let mut merging = if let Some(threshold) = self.merge_threshold {
+            let merge_key = update_key(threshold);
+            match wollet.store.get(&merge_key) {
+                Ok(Some(_)) => {
+                    // There are at least threshold+1 updates, need to merge
+                    let first_key = update_key(0);
+                    match wollet.store.get(&first_key) {
+                        Ok(Some(bytes)) => Some(Update::deserialize(&bytes)?),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+
         // Restore updates from the store using indexed keys
         for i in 0.. {
             let key = update_key(i);
             match wollet.store.get(&key) {
                 Ok(Some(bytes)) => {
                     let update = Update::deserialize(&bytes)?;
-                    wollet.apply_update_no_persist(update)?;
+                    wollet.apply_update_no_persist(update.clone())?;
+                    if let Some(ref mut m) = merging {
+                        if i > 0 {
+                            m.merge(update);
+                        }
+                    }
                 }
                 Ok(None) => {
-                    // Update the next index and stop
+                    // Update the next index
                     let mut next_update_index = wollet
                         .next_update_index
                         .lock()
                         .map_err(|_| Error::Generic("next_update_index lock poisoned".into()))?;
                     *next_update_index = i;
+
+                    // If we were merging, persist the merged update and clean up
+                    if let Some(merged) = merging {
+                        // Delete all old updates
+                        // we are starting from the last to avoid having holes in the beginning
+                        for j in (0..i).rev() {
+                            let old_key = update_key(j);
+                            wollet.store.remove(&old_key).map_err(|e| {
+                                Error::Generic(format!("failed to remove update {}: {}", j, e))
+                            })?;
+                        }
+
+                        // A crash here or during the removal loop will leave the cache empty or at
+                        // an old state which is not the end of the world, the following scan will
+                        // bring the cache back to the correct state.
+
+                        // Store the merged update as update 0
+                        let merged_bytes = merged.serialize()?;
+                        wollet
+                            .store
+                            .put(&update_key(0), &merged_bytes)
+                            .map_err(|e| {
+                                Error::Generic(format!("failed to store merged update: {}", e))
+                            })?;
+
+                        // Update next_update_index to 1
+                        *next_update_index = 1;
+                    }
+
                     break;
                 }
                 Err(e) => return Err(Error::Generic(format!("store error: {e}"))),
@@ -351,25 +430,19 @@ impl Wollet {
     }
 
     /// Create a new wallet persisting on file system
+    #[deprecated(since = "0.16.0", note = "please use `WolletBuilder` instead")]
     pub fn with_fs_persist<P: AsRef<Path>>(
         network: ElementsNetwork,
         descriptor: WolletDescriptor,
         datadir: P,
     ) -> Result<Self, Error> {
-        // Build path: datadir/network/enc_cache/hash(descriptor)
-        let mut path = datadir.as_ref().to_path_buf();
-        path.push(network.as_str());
-        path.push("enc_cache");
-        path.push(DirectoryIdHash::hash(descriptor.to_string().as_bytes()).to_string());
-
-        let file_store = FileStore::new(path)?;
-        let key_bytes = descriptor.encryption_key_bytes();
-        let encrypted_store = EncryptedStore::new(file_store, key_bytes);
-
-        Self::new(network, Arc::new(encrypted_store), descriptor)
+        WolletBuilder::new(network, descriptor)
+            .with_legacy_fs_store(datadir)?
+            .build()
     }
 
     /// Create a new wallet which does not persist anything
+    #[deprecated(since = "0.16.0", note = "please use `WolletBuilder` instead")]
     pub fn without_persist(
         network: ElementsNetwork,
         descriptor: WolletDescriptor,
@@ -821,10 +894,13 @@ impl Wollet {
     }
 
     /// Get a wallet transaction
+    ///
+    /// Note: this returns any transaction that the wallet has in its storage,
+    /// which in some circumstances might include non-wallet txs.
     pub fn transaction(&self, txid: &Txid) -> Result<Option<WalletTx>, Error> {
-        let height = self.cache.heights.get(txid);
+        let height = self.cache.heights.get(txid).unwrap_or(&None);
         let tx = self.cache.all_txs.get(txid);
-        if let (Some(height), Some(tx)) = (height, tx) {
+        if let Some(tx) = tx {
             let txos = self.txos_map()?;
 
             let balance = tx_balance(*txid, tx, &txos);
@@ -1240,7 +1316,7 @@ impl Wollet {
         let desc = WolletDescriptor::from_str(&desc)?;
         Ok((
             signer,
-            Wollet::without_persist(ElementsNetwork::default_regtest(), desc)?,
+            WolletBuilder::new(ElementsNetwork::default_regtest(), desc).build()?,
         ))
     }
 }
@@ -1321,7 +1397,9 @@ mod tests {
         let desc: WolletDescriptor = format!("{desc}#{}", desc_checksum(desc).unwrap())
             .parse()
             .unwrap();
-        Wollet::without_persist(ElementsNetwork::LiquidTestnet, desc).unwrap()
+        WolletBuilder::new(ElementsNetwork::LiquidTestnet, desc)
+            .build()
+            .unwrap()
     }
 
     #[test]
@@ -1361,9 +1439,11 @@ mod tests {
             .unwrap();
 
         let tempdir = tempfile::tempdir().unwrap();
-        let mut wollet =
-            Wollet::with_fs_persist(ElementsNetwork::LiquidTestnet, desc.clone(), &tempdir)
-                .unwrap();
+        let mut wollet = WolletBuilder::new(ElementsNetwork::LiquidTestnet, desc.clone())
+            .with_legacy_fs_store(&tempdir)
+            .unwrap()
+            .build()
+            .unwrap();
 
         let tip = lwk_test_util::liquid_block_1().header;
         let update = Update {
@@ -1390,9 +1470,11 @@ mod tests {
         wollet.apply_update(update2).unwrap();
 
         // We restore the wallet and expects the same status
-        let restored_wollet =
-            Wollet::with_fs_persist(ElementsNetwork::LiquidTestnet, desc, &tempdir).unwrap();
-
+        let restored_wollet = WolletBuilder::new(ElementsNetwork::LiquidTestnet, desc)
+            .with_legacy_fs_store(&tempdir)
+            .unwrap()
+            .build()
+            .unwrap();
         assert_eq!(wollet.status(), restored_wollet.status());
     }
 
@@ -1416,8 +1498,11 @@ mod tests {
         update_path.push("000000000000");
         std::fs::write(update_path, &enc_bytes).unwrap();
 
-        let wollet =
-            Wollet::with_fs_persist(ElementsNetwork::LiquidTestnet, desc, tempdir.path()).unwrap();
+        let wollet = WolletBuilder::new(ElementsNetwork::LiquidTestnet, desc)
+            .with_legacy_fs_store(tempdir.path())
+            .unwrap()
+            .build()
+            .unwrap();
 
         assert_eq!(wollet.updates().unwrap().len(), 1);
         assert_eq!(wollet.tip().height(), 1360180);
@@ -1443,6 +1528,190 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "Update height 1 too old (internal height 3)"
+        );
+    }
+
+    /// Test that verifies the merge test updates can be deserialized and applied correctly.
+    /// This is a unit test that uses hard-coded binary data (no external nodes required).
+    #[test]
+    fn test_merge_updates_deserialize() {
+        use lwk_test_util::{
+            update_merge_test_1, update_merge_test_2, update_merge_test_3,
+            update_merge_test_descriptor,
+        };
+
+        // Load the descriptor
+        let desc_str = update_merge_test_descriptor();
+        let desc: WolletDescriptor = desc_str.parse().unwrap();
+
+        // Load and deserialize the three updates
+        let update1_bytes = update_merge_test_1();
+        let update2_bytes = update_merge_test_2();
+        let update3_bytes = update_merge_test_3();
+
+        let update1 = Update::deserialize(&update1_bytes).unwrap();
+        let update2 = Update::deserialize(&update2_bytes).unwrap();
+        let update3 = Update::deserialize(&update3_bytes).unwrap();
+
+        // Verify updates can be applied sequentially
+        let mut wollet = WolletBuilder::new(ElementsNetwork::default_regtest(), desc.clone())
+            .build()
+            .unwrap();
+
+        // After update 1: should be empty (tip only update)
+        wollet.apply_update(update1).unwrap();
+        let balance1 = wollet.balance().unwrap();
+        let txs1 = wollet.transactions().unwrap();
+        let utxos1 = wollet.utxos().unwrap();
+        assert!(
+            balance1.is_empty() || balance1.values().all(|&v| v == 0),
+            "Balance should be 0 after update 1"
+        );
+        assert_eq!(txs1.len(), 0, "Should have 0 transactions after update 1");
+        assert_eq!(utxos1.len(), 0, "Should have 0 UTXOs after update 1");
+
+        // After update 2: should have 1,000,000 sats from funding
+        wollet.apply_update(update2).unwrap();
+        let balance2 = wollet.balance().unwrap();
+        let txs2 = wollet.transactions().unwrap();
+        let utxos2 = wollet.utxos().unwrap();
+        let policy_asset = wollet.policy_asset();
+        let btc_balance2 = balance2.get(&policy_asset).copied().unwrap_or(0);
+        assert_eq!(
+            btc_balance2, 1_000_000,
+            "Balance should be 1,000,000 after funding"
+        );
+        assert_eq!(txs2.len(), 1, "Should have 1 transaction after funding");
+        assert_eq!(utxos2.len(), 1, "Should have 1 UTXO after funding");
+
+        // After update 3: should have reduced balance after spending
+        wollet.apply_update(update3).unwrap();
+        let balance3 = wollet.balance().unwrap();
+        let txs3 = wollet.transactions().unwrap();
+        let utxos3 = wollet.utxos().unwrap();
+        let btc_balance3 = balance3.get(&policy_asset).copied().unwrap_or(0);
+        assert!(
+            btc_balance3 < 900_000,
+            "Balance should be less than 900,000 after spending (sent 100k + fee)"
+        );
+        assert!(
+            btc_balance3 > 800_000,
+            "Balance should be more than 800,000 (fee should be less than 100k)"
+        );
+        assert_eq!(txs3.len(), 2, "Should have 2 transactions after sending");
+        assert_eq!(utxos3.len(), 1, "Should have 1 UTXO after sending (change)");
+    }
+
+    /// Test that verifies the merge functionality works correctly.
+    /// Creates 3 updates, stores them, builds with merge_threshold=Some(2),
+    /// and verifies they are merged into a single update.
+    ///
+    /// Expected final state (from lwk_test_util/test_data/merge_updates/README.md):
+    /// - Balance: 899,974 sats
+    /// - Transactions: 2
+    /// - UTXOs: 1 (change output)
+    #[test]
+    fn test_merge_updates() {
+        use lwk_common::MemoryStore;
+        use lwk_test_util::{
+            update_merge_test_1, update_merge_test_2, update_merge_test_3,
+            update_merge_test_descriptor,
+        };
+
+        // Load the descriptor
+        let desc_str = update_merge_test_descriptor();
+        let desc: WolletDescriptor = desc_str.parse().unwrap();
+
+        // Load the three updates
+        let update1_bytes = update_merge_test_1();
+        let update2_bytes = update_merge_test_2();
+        let update3_bytes = update_merge_test_3();
+
+        // Create a memory store and manually insert the updates
+        let store = Arc::new(MemoryStore::default());
+        store
+            .put(&update_key(0), &update1_bytes)
+            .expect("Failed to store update 0");
+        store
+            .put(&update_key(1), &update2_bytes)
+            .expect("Failed to store update 1");
+        store
+            .put(&update_key(2), &update3_bytes)
+            .expect("Failed to store update 2");
+
+        // Build with merge_threshold=Some(2) (should trigger merge since we have 3 updates)
+        let wollet = WolletBuilder::new(ElementsNetwork::default_regtest(), desc.clone())
+            .with_store(store.clone())
+            .with_merge_threshold(Some(2))
+            .build()
+            .expect("Failed to build wollet");
+
+        // Verify state is correct (hardcoded values from README.md)
+        let balance = wollet.balance().expect("Failed to get balance");
+        let txs = wollet.transactions().expect("Failed to get transactions");
+        let utxos = wollet.utxos().expect("Failed to get utxos");
+        let policy_asset = wollet.policy_asset();
+        let btc_balance = balance.get(&policy_asset).copied().unwrap_or(0);
+
+        // Expected final state: Balance 899,974, Transactions: 2, UTXOs: 1
+        assert_eq!(
+            btc_balance, 899_974,
+            "Balance should be exactly 899,974 sats after merging all updates"
+        );
+        assert_eq!(
+            txs.len(),
+            2,
+            "Should have exactly 2 transactions after merge"
+        );
+        assert_eq!(utxos.len(), 1, "Should have exactly 1 UTXO after merge");
+
+        // Verify that updates were merged - only update 0 should exist
+        assert!(
+            store.get(&update_key(0)).unwrap().is_some(),
+            "Update 0 should exist"
+        );
+        assert!(
+            store.get(&update_key(1)).unwrap().is_none(),
+            "Update 1 should have been deleted"
+        );
+        assert!(
+            store.get(&update_key(2)).unwrap().is_none(),
+            "Update 2 should have been deleted"
+        );
+        assert!(
+            store.get(&update_key(3)).unwrap().is_none(),
+            "Update 3 should have been deleted"
+        );
+
+        // Verify the merged update can be deserialized and applied to a fresh wallet
+        let merged_bytes = store.get(&update_key(0)).unwrap().unwrap();
+        let merged_update =
+            Update::deserialize(&merged_bytes).expect("Failed to deserialize merged update");
+
+        // Apply merged update to a fresh wallet
+        let mut fresh_wollet = WolletBuilder::new(ElementsNetwork::default_regtest(), desc.clone())
+            .build()
+            .unwrap();
+        fresh_wollet
+            .apply_update(merged_update)
+            .expect("Failed to apply merged update");
+
+        // Verify fresh wallet has same state
+        let fresh_balance = fresh_wollet.balance().unwrap();
+        let fresh_btc_balance = fresh_balance.get(&policy_asset).copied().unwrap_or(0);
+        assert_eq!(
+            btc_balance, fresh_btc_balance,
+            "Merged update should produce same balance"
+        );
+        assert_eq!(
+            wollet.transactions().unwrap().len(),
+            fresh_wollet.transactions().unwrap().len(),
+            "Merged update should produce same transaction count"
+        );
+        assert_eq!(
+            wollet.utxos().unwrap().len(),
+            fresh_wollet.utxos().unwrap().len(),
+            "Merged update should produce same UTXO count"
         );
     }
 
@@ -1505,7 +1774,7 @@ mod tests {
                             .parse()
                             .unwrap();
 
-                    let wollet = Wollet::without_persist(network, desc).unwrap();
+                    let wollet = WolletBuilder::new(network, desc).build().unwrap();
                     let first_address = wollet.address(Some(0)).unwrap();
                     assert_eq!(first_address.address().to_string(), expected[i], "network: {network:?} variant: {script_variant:?} blinding_variant: {blinding_variant:?} i:{i}");
                     i += 1;

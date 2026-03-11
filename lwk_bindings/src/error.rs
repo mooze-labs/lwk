@@ -28,6 +28,9 @@ pub enum LwkError {
 
     #[error("Calling a function on an object that has already been consumed, like for example calling complete() on object that already is completed")]
     ObjectConsumed,
+
+    #[error("Boltz Backend HTTP Error: {status} {error:?}")]
+    BoltzBackendHttpError { status: u16, error: Option<String> },
 }
 
 impl From<lwk_wollet::Error> for LwkError {
@@ -268,8 +271,8 @@ impl From<elements::bitcoin::taproot::TaprootBuilderError> for LwkError {
     }
 }
 
-impl From<elements::bitcoin::taproot::TaprootError> for LwkError {
-    fn from(value: elements::bitcoin::taproot::TaprootError) -> Self {
+impl From<elements::taproot::TaprootError> for LwkError {
+    fn from(value: elements::taproot::TaprootError) -> Self {
         LwkError::Generic {
             msg: format!("{value:?}"),
         }
@@ -334,6 +337,9 @@ impl From<lwk_boltz::Error> for LwkError {
                 LwkError::SwapExpired { swap_id, status }
             }
             lwk_boltz::Error::NoBoltzUpdate => LwkError::NoBoltzUpdate,
+            lwk_boltz::Error::BoltzBackendHttpError { status, error } => {
+                LwkError::BoltzBackendHttpError { status, error }
+            }
             _ => LwkError::Generic {
                 msg: format!("{value:?}"),
             },

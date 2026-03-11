@@ -10,8 +10,6 @@ use std::{
 };
 
 use lwk_wollet::elements;
-#[cfg(feature = "simplicity")]
-use lwk_wollet::elements::hex::ToHex;
 
 use wasm_bindgen::prelude::*;
 
@@ -107,27 +105,36 @@ impl std::fmt::Display for AssetIds {
 #[wasm_bindgen]
 impl AssetId {
     /// Creates an `AssetId`
+    ///
+    /// Deprecated: use `from_string()` instead
     #[wasm_bindgen(constructor)]
     pub fn new(asset_id: &str) -> Result<AssetId, Error> {
         Ok(elements::AssetId::from_str(asset_id)?.into())
     }
 
+    /// Creates an `AssetId` from hex string
+    #[wasm_bindgen(js_name = fromString)]
+    pub fn from_string(s: &str) -> Result<AssetId, Error> {
+        Ok(elements::AssetId::from_str(s)?.into())
+    }
+
+    /// Creates an `AssetId` from a bytes.
+    #[wasm_bindgen(js_name = fromBytes)]
+    pub fn from_bytes(bytes: &[u8]) -> Result<AssetId, Error> {
+        Ok(elements::AssetId::from_slice(bytes)?.into())
+    }
+
+    /// Returns the `AssetId` bytes in little-endian byte order.
+    #[wasm_bindgen(js_name = toBytes)]
+    pub fn to_bytes(&self) -> Vec<u8> {
+        self.inner.into_inner().to_byte_array().to_vec()
+    }
+
     /// Return the string representation of the asset identifier (64 hex characters).
-    /// This representation can be used to recreate the asset identifier via `new()`
+    /// This representation can be used to recreate the asset identifier via `fromString()`
     #[wasm_bindgen(js_name = toString)]
     pub fn to_string_js(&self) -> String {
         format!("{self}")
-    }
-}
-
-#[cfg(feature = "simplicity")]
-#[wasm_bindgen]
-impl AssetId {
-    /// Return the inner byte-order hex representation of the asset identifier.
-    // TODO: rename to `reverse_hex`
-    #[wasm_bindgen(js_name = innerHex)]
-    pub fn inner_hex(&self) -> String {
-        self.inner.into_inner().to_byte_array().to_hex()
     }
 }
 
@@ -193,24 +200,30 @@ mod tests {
     async fn test_asset_id() {
         let expected = "HexToArray(InvalidLength(InvalidLengthError { expected: 64, invalid: 2 }))";
         let hex = "xx";
-        assert_eq!(expected, format!("{:?}", AssetId::new(hex).unwrap_err()));
+        assert_eq!(
+            expected,
+            format!("{:?}", AssetId::from_string(hex).unwrap_err())
+        );
 
         let expected = "HexToArray(InvalidChar(InvalidCharError { invalid: 120 }))";
         let hex = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
-        assert_eq!(expected, format!("{:?}", AssetId::new(hex).unwrap_err()));
+        assert_eq!(
+            expected,
+            format!("{:?}", AssetId::from_string(hex).unwrap_err())
+        );
 
         let hex = "0000000000000000000000000000000000000000000000000000000000000001";
-        assert_eq!(hex, AssetId::new(hex).unwrap().to_string());
+        assert_eq!(hex, AssetId::from_string(hex).unwrap().to_string());
     }
 
     #[wasm_bindgen_test]
     async fn test_asset_ids() {
         let a = "0000000000000000000000000000000000000000000000000000000000000001";
-        let asset_id1 = AssetId::new(a).unwrap();
+        let asset_id1 = AssetId::from_string(a).unwrap();
         let b = "0000000000000000000000000000000000000000000000000000000000000002";
-        let asset_id2 = AssetId::new(b).unwrap();
+        let asset_id2 = AssetId::from_string(b).unwrap();
         let c = "0000000000000000000000000000000000000000000000000000000000000003";
-        let asset_id3 = AssetId::new(c).unwrap();
+        let asset_id3 = AssetId::from_string(c).unwrap();
 
         let asset_ids: AssetIds = vec![asset_id3, asset_id1, asset_id2].into();
         assert_eq!(asset_ids.to_string(), format!("{{{a}, {b}, {c}}}"));
@@ -225,9 +238,10 @@ mod tests {
             "[elements]78b3e3232680f21f4be8c055a4fdb2edf4681bd6c0ae40edeca51331839106b4:1",
         )
         .unwrap();
-        let contract_hash =
-            ContractHash::new("a92d0f0f0a090c09b7970ce43a12448f55c1cc00325a6a8547d57d69f52378ec")
-                .unwrap();
+        let contract_hash = ContractHash::from_string(
+            "a92d0f0f0a090c09b7970ce43a12448f55c1cc00325a6a8547d57d69f52378ec",
+        )
+        .unwrap();
 
         let asset_id = super::asset_id_from_issuance(&outpoint, &contract_hash);
         assert_eq!(
@@ -242,6 +256,6 @@ mod tests {
         );
 
         let entropy = super::generate_asset_entropy(&outpoint, &contract_hash).unwrap();
-        assert_eq!(entropy.bytes().len(), 32);
+        assert_eq!(entropy.to_bytes().len(), 32);
     }
 }

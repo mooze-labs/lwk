@@ -223,16 +223,12 @@ pub struct QuoteBuilder {
     inner: Mutex<Option<lwk_boltz::QuoteBuilder>>,
 }
 
-fn quote_builder_consumed() -> LwkError {
-    "This quote builder has already been consumed".into()
-}
-
 #[uniffi::export]
 impl QuoteBuilder {
     /// Set the source asset for the swap
     pub fn send(&self, asset: SwapAsset) -> Result<(), LwkError> {
         let mut lock = self.inner.lock()?;
-        let builder = lock.take().ok_or_else(quote_builder_consumed)?;
+        let builder = lock.take().ok_or(LwkError::ObjectConsumed)?;
         *lock = Some(builder.send(asset.into()));
         Ok(())
     }
@@ -240,7 +236,7 @@ impl QuoteBuilder {
     /// Set the destination asset for the swap
     pub fn receive(&self, asset: SwapAsset) -> Result<(), LwkError> {
         let mut lock = self.inner.lock()?;
-        let builder = lock.take().ok_or_else(quote_builder_consumed)?;
+        let builder = lock.take().ok_or(LwkError::ObjectConsumed)?;
         *lock = Some(builder.receive(asset.into()));
         Ok(())
     }
@@ -248,7 +244,7 @@ impl QuoteBuilder {
     /// Build the quote, calculating fees and receive amount
     pub fn build(&self) -> Result<Quote, LwkError> {
         let mut lock = self.inner.lock()?;
-        let builder = lock.take().ok_or_else(quote_builder_consumed)?;
+        let builder = lock.take().ok_or(LwkError::ObjectConsumed)?;
         let quote = builder.build()?;
         Ok(quote.into())
     }
@@ -582,7 +578,13 @@ impl BoltzSession {
         Ok(self.inner.remove_swap(&swap_id)?)
     }
 
-    /// Filter the swap list to only include restorable reverse swaps
+    /// From the swaps returned by the boltz api via [`BoltzSession::swap_restore`]:
+    ///
+    /// - filter the reverse swaps
+    /// - add information from the session
+    /// - return typed data
+    ///
+    /// The claim address doesn't need to be the same used when creating the swap.
     pub fn restorable_reverse_swaps(
         &self,
         swap_list: &SwapList,
@@ -600,7 +602,13 @@ impl BoltzSession {
         Ok(data)
     }
 
-    /// Filter the swap list to only include restorable submarine swaps
+    /// From the swaps returned by the boltz api via [`BoltzSession::swap_restore`]:
+    ///
+    /// - filter the submarine swaps
+    /// - add information from the session
+    /// - return typed data
+    ///
+    /// The refund address doesn't need to be the same used when creating the swap.
     pub fn restorable_submarine_swaps(
         &self,
         swap_list: &SwapList,
@@ -617,7 +625,13 @@ impl BoltzSession {
         Ok(data)
     }
 
-    /// Filter the swap list to only include restorable BTC to LBTC swaps
+    /// From the swaps returned by the boltz api via [`BoltzSession::swap_restore`]:
+    ///
+    /// - filter the BTC to LBTC swaps
+    /// - add information from the session
+    /// - return typed data
+    ///
+    /// The claim and refund addresses don't need to be the same used when creating the swap.
     pub fn restorable_btc_to_lbtc_swaps(
         &self,
         swap_list: &SwapList,
@@ -637,7 +651,13 @@ impl BoltzSession {
         Ok(data)
     }
 
-    /// Filter the swap list to only include restorable LBTC to BTC swaps
+    /// From the swaps returned by the boltz api via [`BoltzSession::swap_restore`]:
+    ///
+    /// - filter the LBTC to BTC swaps
+    /// - add information from the session
+    /// - return typed data
+    ///
+    /// The claim and refund addresses don't need to be the same used when creating the swap.
     pub fn restorable_lbtc_to_btc_swaps(
         &self,
         swap_list: &SwapList,
@@ -811,6 +831,31 @@ impl PreparePayResponse {
             .boltz_fee())
     }
 
+    /// The txid of the user lockup transaction of the swap.
+    pub fn lockup_txid(&self) -> Result<Option<String>, LwkError> {
+        Ok(self
+            .inner
+            .lock()?
+            .as_ref()
+            .ok_or(LwkError::ObjectConsumed)?
+            .lockup_txid()
+            .map(|txid| txid.to_string()))
+    }
+
+    /// Optionally set the lockup transaction txid.
+    ///
+    /// This can be useful when the app creates and broadcasts the lockup transaction and wants to
+    /// persist the txid immediately before websocket updates arrive from Boltz. It helps avoid a
+    /// race where a fast retry flow could submit the lockup transaction twice.
+    pub fn set_lockup_txid(&self, txid: String) -> Result<(), LwkError> {
+        self.inner
+            .lock()?
+            .as_mut()
+            .ok_or(LwkError::ObjectConsumed)?
+            .set_lockup_txid(txid)?;
+        Ok(())
+    }
+
     pub fn advance(&self) -> Result<PaymentState, LwkError> {
         let mut lock = self.inner.lock()?;
         let mut response = lock.take().ok_or(LwkError::ObjectConsumed)?;
@@ -968,6 +1013,17 @@ impl LockupResponse {
             .expected_amount())
     }
 
+    /// The BIP21 URI for the lockup address, if provided by Boltz
+    pub fn uri(&self) -> Result<Option<String>, LwkError> {
+        Ok(self
+            .inner
+            .lock()?
+            .as_ref()
+            .ok_or(LwkError::ObjectConsumed)?
+            .uri()
+            .map(|s| s.to_string()))
+    }
+
     pub fn chain_from(&self) -> Result<String, LwkError> {
         Ok(self
             .inner
@@ -1010,6 +1066,42 @@ impl LockupResponse {
             .as_ref()
             .ok_or(LwkError::ObjectConsumed)?
             .boltz_fee())
+    }
+
+    /// The txid of the claim transaction of the swap
+    pub fn claim_txid(&self) -> Result<Option<String>, LwkError> {
+        Ok(self
+            .inner
+            .lock()?
+            .as_ref()
+            .ok_or(LwkError::ObjectConsumed)?
+            .claim_txid()
+            .map(|txid| txid.to_string()))
+    }
+
+    /// The txid of the lockup transaction of the swap
+    pub fn lockup_txid(&self) -> Result<Option<String>, LwkError> {
+        Ok(self
+            .inner
+            .lock()?
+            .as_ref()
+            .ok_or(LwkError::ObjectConsumed)?
+            .lockup_txid()
+            .map(|txid| txid.to_string()))
+    }
+
+    /// Optionally set the lockup transaction txid.
+    ///
+    /// This can be useful when the app creates and broadcasts the lockup transaction and wants to
+    /// persist the txid immediately before websocket updates arrive from Boltz. It helps avoid a
+    /// race where a fast retry flow could submit the lockup transaction twice.
+    pub fn set_lockup_txid(&self, txid: String) -> Result<(), LwkError> {
+        self.inner
+            .lock()?
+            .as_mut()
+            .ok_or(LwkError::ObjectConsumed)?
+            .set_lockup_txid(txid)?;
+        Ok(())
     }
 
     pub fn advance(&self) -> Result<PaymentState, LwkError> {

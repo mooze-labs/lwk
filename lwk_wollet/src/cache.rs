@@ -166,11 +166,22 @@ impl Cache {
     }
 
     pub fn spent(&self) -> Result<HashSet<OutPoint>, Error> {
-        Ok(self
+        // Dummy spent outputs are outputs that are not in height map, but we have to consider them
+        // for the utxo mode.
+        let dummy_spent: Vec<OutPoint> = self
             .all_txs
-            .values()
+            .iter()
+            .filter(|(_, tx)| tx.output.is_empty()) // Only dummy tx have no outputs
+            .flat_map(|(_, tx)| tx.input.iter().map(|i| i.previous_output))
+            .collect();
+
+        Ok(self
+            .heights
+            .keys()
+            .filter_map(|txid| self.all_txs.get(txid))
             .flat_map(|tx| tx.input.iter())
             .map(|i| i.previous_output)
+            .chain(dummy_spent)
             .collect())
     }
 }

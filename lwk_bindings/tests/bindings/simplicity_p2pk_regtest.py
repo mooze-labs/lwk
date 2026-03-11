@@ -19,7 +19,7 @@ xonly_pubkey = simplicity_derive_xonly_pubkey(signer, derivation_path)
 
 # 3. Compile P2PK program with the public key
 args = SimplicityArguments()
-args = args.add_value("PUBLIC_KEY", SimplicityTypedValue.u256(xonly_pubkey.to_hex()))
+args = args.add_value("PUBLIC_KEY", SimplicityTypedValue.u256(xonly_pubkey.to_bytes()))
 program = SimplicityProgram.load(P2PK_SOURCE, args)
 
 # 4. Create P2TR address from the program
@@ -69,7 +69,7 @@ signature = program.create_p2pk_signature(
 
 # 10. Finalize transaction with Simplicity witness
 witness = SimplicityWitnessValues()
-witness = witness.add_value("SIGNATURE", SimplicityTypedValue.byte_array(str(signature)))
+witness = witness.add_value("SIGNATURE", SimplicityTypedValue.byte_array(signature))
 
 finalized_tx = program.finalize_transaction(
     unsigned_tx, xonly_pubkey, all_utxos, 0,
@@ -95,18 +95,18 @@ simplicity_program_bytes = run_result.program_bytes()
 cmr = run_result.cmr()
 
 control_block = simplicity_control_block(cmr, xonly_pubkey)
-control_block_hex = control_block.serialize().hex()
+control_block_hex = control_block.to_bytes().hex()
 
 # Verify it matches what program.control_block() returns
-program_control_block_hex = str(program.control_block(xonly_pubkey))
+program_control_block_hex = program.control_block(xonly_pubkey).to_bytes().hex()
 assert control_block_hex == program_control_block_hex, \
     "simplicity_control_block should match program.control_block()"
 
 manual_script_witness = [
-    str(simplicity_witness_bytes),
-    str(simplicity_program_bytes),
-    cmr.to_hex(),
-    control_block_hex,
+    simplicity_witness_bytes,
+    simplicity_program_bytes,
+    cmr.to_bytes(),
+    control_block.to_bytes(),
 ]
 
 manual_witness = TxInWitness.from_script_witness(manual_script_witness)

@@ -20,16 +20,16 @@
 //!
 //! ### Generate an address
 //! ```rust
-//! # use lwk_wollet::{WolletDescriptor, Wollet, ElementsNetwork};
+//! # use lwk_wollet::{WolletBuilder, WolletDescriptor, Wollet, ElementsNetwork};
 //! # fn main() -> Result<(), lwk_wollet::Error> {
 //! let desc = "ct(slip77(ab5824f4477b4ebb00a132adfd8eb0b7935cf24f6ac151add5d1913db374ce92),elwpkh([759db348/84'/1'/0']tpubDCRMaF33e44pcJj534LXVhFbHibPbJ5vuLhSSPFAw57kYURv4tzXFL6LSnd78bkjqdmE3USedkbpXJUPA1tdzKfuYSL7PianceqAhwL2UkA/<0;1>/*))#cch6wrnp";
 //!
 //! // Parse the descriptor and create the watch only wallet
 //! let descriptor: WolletDescriptor = desc.parse()?;
-//! let mut wollet = Wollet::without_persist(
+//! let mut wollet = WolletBuilder::new(
 //!    ElementsNetwork::LiquidTestnet,
 //!    descriptor,
-//! )?;
+//! ).build()?;
 //!
 //! // Generate the address
 //! let addr = wollet.address(None)?;
@@ -40,15 +40,15 @@
 //!
 //! ### Sync wallet
 //! ```rust,no_run
-//! # use lwk_wollet::{WolletDescriptor, Wollet, ElementsNetwork, ElectrumClient, ElectrumUrl,
+//! # use lwk_wollet::{WolletBuilder, WolletDescriptor, Wollet, ElementsNetwork, ElectrumClient, ElectrumUrl,
 //! full_scan_with_electrum_client};
 //! # fn main() -> Result<(), lwk_wollet::Error> {
 //! # let desc = "ct(slip77(ab5824f4477b4ebb00a132adfd8eb0b7935cf24f6ac151add5d1913db374ce92),elwpkh([759db348/84'/1'/0']tpubDCRMaF33e44pcJj534LXVhFbHibPbJ5vuLhSSPFAw57kYURv4tzXFL6LSnd78bkjqdmE3USedkbpXJUPA1tdzKfuYSL7PianceqAhwL2UkA/<0;1>/*))#cch6wrnp";
 //! # let descriptor: WolletDescriptor = desc.parse()?;
-//! # let mut wollet = Wollet::without_persist(
+//! # let mut wollet = WolletBuilder::new(
 //! #    ElementsNetwork::LiquidTestnet,
 //! #    descriptor,
-//! # )?;
+//! # ).build()?;
 //! // Use an Electrum server
 //! let electrum_url = ElectrumUrl::new("elements-testnet.blockstream.info:50002", true, true)?;
 //! let mut electrum_client = ElectrumClient::new(&electrum_url)?;
@@ -64,14 +64,14 @@
 //!
 //! ### Create transaction
 //! ```rust,no_run
-//! # use lwk_wollet::{WolletDescriptor, Wollet, ElementsNetwork, UnvalidatedRecipient};
+//! # use lwk_wollet::{WolletBuilder, WolletDescriptor, Wollet, ElementsNetwork, UnvalidatedRecipient};
 //! # fn main() -> Result<(), lwk_wollet::Error> {
 //! # let desc = "ct(slip77(ab5824f4477b4ebb00a132adfd8eb0b7935cf24f6ac151add5d1913db374ce92),elwpkh([759db348/84'/1'/0']tpubDCRMaF33e44pcJj534LXVhFbHibPbJ5vuLhSSPFAw57kYURv4tzXFL6LSnd78bkjqdmE3USedkbpXJUPA1tdzKfuYSL7PianceqAhwL2UkA/<0;1>/*))#cch6wrnp";
 //! # let descriptor: WolletDescriptor = desc.parse()?;
-//! # let mut wollet = Wollet::without_persist(
+//! # let mut wollet = WolletBuilder::new(
 //! #    ElementsNetwork::LiquidTestnet,
 //! #    descriptor,
-//! # )?;
+//! # ).build()?;
 //! // Create a transaction
 //! let recipient = UnvalidatedRecipient {
 //!     satoshi: 1000,
@@ -98,6 +98,7 @@ pub mod clients;
 mod contract;
 mod descriptor;
 mod domain;
+mod elements_wallet;
 mod error;
 mod liquidex;
 mod model;

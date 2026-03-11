@@ -153,6 +153,7 @@ impl BoltzSession {
         self.inner.rescue_file()
     }
 
+    /// Blocking version of [`crate::BoltzSession::restorable_reverse_swaps`]
     pub fn restorable_reverse_swaps(
         &self,
         swaps: &[SwapRestoreResponse],
@@ -164,6 +165,7 @@ impl BoltzSession {
         Ok(inner)
     }
 
+    /// Blocking version of [`crate::BoltzSession::restorable_submarine_swaps`]
     pub fn restorable_submarine_swaps(
         &self,
         swaps: &[SwapRestoreResponse],
@@ -175,6 +177,7 @@ impl BoltzSession {
         Ok(inner)
     }
 
+    /// Blocking version of [`crate::BoltzSession::restorable_btc_to_lbtc_swaps`]
     pub fn restorable_btc_to_lbtc_swaps(
         &self,
         swaps: &[SwapRestoreResponse],
@@ -191,6 +194,7 @@ impl BoltzSession {
         Ok(inner)
     }
 
+    /// Blocking version of [`crate::BoltzSession::restorable_lbtc_to_btc_swaps`]
     pub fn restorable_lbtc_to_btc_swaps(
         &self,
         swaps: &[SwapRestoreResponse],
@@ -321,6 +325,16 @@ impl PreparePayResponse {
         self.inner.boltz_fee()
     }
 
+    /// See [`crate::PreparePayResponse::lockup_txid()`]
+    pub fn lockup_txid(&self) -> Option<&str> {
+        self.inner.lockup_txid()
+    }
+
+    /// See [`crate::PreparePayResponse::set_lockup_txid()`]
+    pub fn set_lockup_txid(&mut self, txid: String) -> Result<(), Error> {
+        self.inner.set_lockup_txid(txid)
+    }
+
     pub fn serialize(&self) -> Result<String, Error> {
         self.inner.serialize()
     }
@@ -383,6 +397,11 @@ impl LockupResponse {
         self.inner.expected_amount()
     }
 
+    /// See [`crate::LockupResponse::uri()`]
+    pub fn uri(&self) -> Option<&str> {
+        self.inner.uri()
+    }
+
     pub fn chain_from(&self) -> Chain {
         self.inner.chain_from()
     }
@@ -399,6 +418,21 @@ impl LockupResponse {
     /// See [`crate::LockupResponse::boltz_fee()`]
     pub fn boltz_fee(&self) -> Option<u64> {
         self.inner.boltz_fee()
+    }
+
+    /// See [`crate::LockupResponse::claim_txid()`]
+    pub fn claim_txid(&self) -> Option<&str> {
+        self.inner.claim_txid()
+    }
+
+    /// See [`crate::LockupResponse::lockup_txid()`]
+    pub fn lockup_txid(&self) -> Option<&str> {
+        self.inner.lockup_txid()
+    }
+
+    /// See [`crate::LockupResponse::set_lockup_txid()`]
+    pub fn set_lockup_txid(&mut self, txid: String) -> Result<(), Error> {
+        self.inner.set_lockup_txid(txid)
     }
 
     pub fn advance(&mut self) -> Result<ControlFlow<bool, SwapStatus>, Error> {

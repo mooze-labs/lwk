@@ -4,7 +4,7 @@ use elements::{
     hex::ToHex,
     pset::serialize::{Deserialize, Serialize},
 };
-use lwk_wollet::{WalletTx, EC};
+use lwk_wollet::{hashes::hex::FromHex, WalletTx, EC};
 
 use crate::{
     types::{AssetId, Hex},
@@ -45,7 +45,7 @@ impl From<&Transaction> for elements::Transaction {
 
 impl Display for Transaction {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.inner.serialize().to_hex())
+        write!(f, "{}", self.to_bytes().to_hex())
     }
 }
 
@@ -59,9 +59,27 @@ impl AsRef<elements::Transaction> for Transaction {
 impl Transaction {
     /// Construct a Transaction object from its hex representation.
     /// To create the hex representation of a transaction use `to_string()`.
+    ///
+    /// Deprecated: use `from_string()` instead.
     #[uniffi::constructor]
     pub fn new(hex: &Hex) -> Result<Arc<Self>, LwkError> {
         let inner: elements::Transaction = elements::Transaction::deserialize(hex.as_ref())?;
+        Ok(Arc::new(Self { inner }))
+    }
+
+    /// Construct a Transaction object from its bytes.
+    #[uniffi::constructor]
+    pub fn from_bytes(bytes: &[u8]) -> Result<Arc<Self>, LwkError> {
+        let inner: elements::Transaction = elements::Transaction::deserialize(bytes)?;
+        Ok(Arc::new(Self { inner }))
+    }
+
+    /// Construct a Transaction object from its canonical string representation.
+    /// To create the string representation of a transaction use `to_string()`.
+    #[uniffi::constructor]
+    pub fn from_string(s: &str) -> Result<Arc<Self>, LwkError> {
+        let bytes = Vec::<u8>::from_hex(s)?;
+        let inner: elements::Transaction = elements::Transaction::deserialize(&bytes)?;
         Ok(Arc::new(Self { inner }))
     }
 
@@ -71,7 +89,14 @@ impl Transaction {
     }
 
     /// Return the consensus encoded bytes of the transaction.
+    ///
+    ///  Deprecated: use `to_bytes()` instead.
     pub fn bytes(&self) -> Vec<u8> {
+        elements::Transaction::serialize(&self.inner)
+    }
+
+    /// Return the consensus encoded bytes of the transaction.
+    pub fn to_bytes(&self) -> Vec<u8> {
         elements::Transaction::serialize(&self.inner)
     }
 
@@ -104,9 +129,20 @@ impl Transaction {
             .collect()
     }
 
-    /// Verify transaction amount proofs against UTXOs.
+    /// Verify that the transaction has correctly calculated blinding factors and they CT
+    /// verification equation holds.
     ///
-    /// See [`elements::Transaction::verify_tx_amt_proofs`].
+    /// This is *NOT* a complete Transaction verification check
+    /// It does *NOT* check whether input witness/script satisfies the script pubkey, or
+    /// inputs are double-spent and other consensus checks.
+    ///
+    /// This method only checks if the `Transaction` verification equation for Confidential
+    /// transactions holds. i.e Sum of inputs = Sum of outputs + fees.
+    ///
+    /// And the corresponding surjection/rangeproofs are correct.
+    /// For checking of surjection proofs and amounts, spent_utxos parameter
+    /// should contain information about the prevouts. Note that the order of
+    /// spent_utxos should be consistent with transaction inputs.
     pub fn verify_tx_amt_proofs(&self, utxos: Vec<Arc<TxOut>>) -> Result<(), LwkError> {
         let utxos_inner: Vec<elements::TxOut> = utxos.iter().map(|u| u.as_ref().into()).collect();
         self.inner.verify_tx_amt_proofs(&EC, &utxos_inner)?;
@@ -115,17 +151,10 @@ impl Transaction {
 }
 
 /// Editor for modifying transactions.
-///
-/// See [`elements::Transaction`] for more details.
 #[cfg(feature = "simplicity")]
 #[derive(uniffi::Object, Debug)]
 pub struct TransactionEditor {
     inner: std::sync::Mutex<Option<elements::Transaction>>,
-}
-
-#[cfg(feature = "simplicity")]
-fn editor_consumed() -> LwkError {
-    LwkError::ObjectConsumed
 }
 
 #[cfg(feature = "simplicity")]
@@ -147,7 +176,7 @@ impl TransactionEditor {
     ) -> Result<(), LwkError> {
         let idx = input_index as usize;
         let mut lock = self.inner.lock()?;
-        let inner = lock.as_mut().ok_or_else(editor_consumed)?;
+        let inner = lock.as_mut().ok_or(LwkError::ObjectConsumed)?;
         if idx >= inner.input.len() {
             return Err(LwkError::Generic {
                 msg: format!(
@@ -164,32 +193,35 @@ impl TransactionEditor {
     /// Build the transaction, consuming the editor.
     pub fn build(&self) -> Result<Arc<Transaction>, LwkError> {
         let mut lock = self.inner.lock()?;
-        let inner = lock.take().ok_or_else(editor_consumed)?;
+        let inner = lock.take().ok_or(LwkError::ObjectConsumed)?;
         Ok(Arc::new(Transaction { inner }))
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use elements::hex::ToHex;
-
-    use super::Transaction;
+    use super::*;
 
     #[test]
     fn transaction() {
-        let tx_expected =
+        let tx_expected_hex =
             include_str!("../../../lwk_jade/test_data/pset_to_be_signed_transaction.hex")
                 .to_string();
-        let tx = Transaction::new(&tx_expected.parse().unwrap()).unwrap();
+        let tx_expected_bytes = Vec::from_hex(&tx_expected_hex).unwrap();
+        let tx_str = Transaction::from_string(&tx_expected_hex).unwrap();
+        let tx_bytes = Transaction::from_bytes(&tx_expected_bytes).unwrap();
 
-        assert_eq!(tx_expected, tx.to_string());
+        assert_eq!(tx_expected_hex, tx_str.to_string());
+        assert_eq!(tx_expected_bytes, tx_str.to_bytes());
 
         assert_eq!(
-            tx.txid().to_string(),
+            tx_str.txid().to_string(),
             "954f32449d00a9de3c42758dedee895c88ea417cb72999738b2631bcc00e13ad"
         );
-
-        assert_eq!(tx.bytes().to_hex(), tx_expected);
+        assert_eq!(
+            tx_bytes.txid().to_string(),
+            "954f32449d00a9de3c42758dedee895c88ea417cb72999738b2631bcc00e13ad"
+        );
     }
 
     #[test]
@@ -198,7 +230,7 @@ mod tests {
         let desc = "ct(slip77(9c8e4f05c7711a98c838be228bcb84924d4570ca53f35fa1c793e58841d47023),elwpkh([73c5da0a/84'/1'/0']tpubDC8msFGeGuwnKG9Upg7DM2b4DaRqg3CUZa5g8v2SRQ6K4NSkxUgd7HsL2XVWbVm39yBA4LAxysQAm397zwQSQoQgewGiYZqrA9DsP4zbQ1M/<0;1>/*))#2e4n992d";
         let desc = crate::WolletDescriptor::new(desc).unwrap();
         let tx_hex = include_str!("../../tests/test_data/tx.hex").to_string();
-        let tx = Transaction::new(&tx_hex.parse().unwrap()).unwrap();
+        let tx = Transaction::from_string(&tx_hex).unwrap();
         for output in tx.outputs() {
             if output.is_fee() {
                 assert!(!output.is_partially_blinded());

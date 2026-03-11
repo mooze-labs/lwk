@@ -16,18 +16,10 @@ def build_options_arguments(params):
 
     for key in [
         "COLLATERAL_ASSET_ID", "SETTLEMENT_ASSET_ID",
-        "ISSUANCE_ASSET_ENTROPY",
-        "OPTION_OUTPOINT_TXID", "GRANTOR_OUTPOINT_TXID",
         "OPTION_TOKEN_ASSET", "OPTION_REISSUANCE_TOKEN_ASSET",
         "GRANTOR_TOKEN_ASSET", "GRANTOR_REISSUANCE_TOKEN_ASSET",
     ]:
-        args = args.add_value(key, SimplicityTypedValue.u256(params[key]))
-
-    for key in ["OPTION_OUTPOINT_VOUT", "GRANTOR_OUTPOINT_VOUT"]:
-        args = args.add_value(key, SimplicityTypedValue.u32(params[key]))
-
-    for key in ["OPTION_CONFIDENTIAL", "GRANTOR_CONFIDENTIAL"]:
-        args = args.add_value(key, SimplicityTypedValue.boolean(params[key]))
+        args = args.add_value(key, SimplicityTypedValue.u256(bytes.fromhex(params[key])))
 
     return args
 
@@ -75,7 +67,7 @@ derivation_path = "m/86'/1'/0'/0/0"
 xonly_pubkey = simplicity_derive_xonly_pubkey(signer, derivation_path)
 
 p2pk_args = SimplicityArguments()
-p2pk_args = p2pk_args.add_value("PUBLIC_KEY", SimplicityTypedValue.u256(xonly_pubkey.to_hex()))
+p2pk_args = p2pk_args.add_value("PUBLIC_KEY", SimplicityTypedValue.u256(xonly_pubkey.to_bytes()))
 p2pk_program = SimplicityProgram.load(P2PK_SOURCE, p2pk_args)
 p2pk_address = p2pk_program.create_p2tr_address(xonly_pubkey, network)
 p2pk_script = p2pk_address.script_pubkey()
@@ -102,15 +94,15 @@ vout3, output3 = find_output_by_script(funding_tx3, p2pk_script_hex)
 
 # Step 3: Build creation transaction
 
-option_contract_hash = ContractHash.from_hex("0000000000000000000000000000000000000000000000000000000000000001")
-grantor_contract_hash = ContractHash.from_hex("0000000000000000000000000000000000000000000000000000000000000002")
+option_contract_hash = ContractHash.from_string("0000000000000000000000000000000000000000000000000000000000000001")
+grantor_contract_hash = ContractHash.from_string("0000000000000000000000000000000000000000000000000000000000000002")
 
 outpoint0 = OutPoint.from_parts(txid1, vout1)
 inp_builder0 = PsetInputBuilder.from_prevout(outpoint0)
 inp_builder0.witness_utxo(output1)
 inp_builder0.sequence(TxSequence.zero())
 inp_builder0.issuance_inflation_keys(1)
-inp_builder0.issuance_asset_entropy(option_contract_hash)
+inp_builder0.issuance_asset_entropy(option_contract_hash.to_bytes())
 inp_builder0.blinded_issuance(False)
 creation_input0 = inp_builder0.build()
 
@@ -119,7 +111,7 @@ inp_builder1 = PsetInputBuilder.from_prevout(outpoint1)
 inp_builder1.witness_utxo(output2)
 inp_builder1.sequence(TxSequence.zero())
 inp_builder1.issuance_inflation_keys(1)
-inp_builder1.issuance_asset_entropy(grantor_contract_hash)
+inp_builder1.issuance_asset_entropy(grantor_contract_hash.to_bytes())
 inp_builder1.blinded_issuance(False)
 creation_input1 = inp_builder1.build()
 
@@ -152,15 +144,6 @@ options_params = {
     "OPTION_REISSUANCE_TOKEN_ASSET": asset_id_inner_hex(option_reissuance_token_asset),
     "GRANTOR_TOKEN_ASSET": asset_id_inner_hex(grantor_token_asset),
     "GRANTOR_REISSUANCE_TOKEN_ASSET": asset_id_inner_hex(grantor_reissuance_token_asset),
-    # The parameters below are used only for storing information in the arguments
-    # If they are used, make sure to handle the correct endianness
-    "OPTION_OUTPOINT_TXID": str(txid1),
-    "OPTION_OUTPOINT_VOUT": vout1,
-    "OPTION_CONFIDENTIAL": True,
-    "GRANTOR_OUTPOINT_TXID": str(txid2),
-    "GRANTOR_OUTPOINT_VOUT": vout2,
-    "GRANTOR_CONFIDENTIAL": True,
-    "ISSUANCE_ASSET_ENTROPY": issuance_entropy.to_hex(),
 }
 options_args = build_options_arguments(options_params)
 options_program = SimplicityProgram.load(OPTIONS_SOURCE, options_args)
@@ -229,7 +212,7 @@ sig0 = p2pk_program.create_p2pk_signature(
     creation_utxos, 0, network
 )
 witness0 = SimplicityWitnessValues()
-witness0 = witness0.add_value("SIGNATURE", SimplicityTypedValue.byte_array(str(sig0)))
+witness0 = witness0.add_value("SIGNATURE", SimplicityTypedValue.byte_array(sig0))
 creation_tx = p2pk_program.finalize_transaction(
     creation_tx, xonly_pubkey, creation_utxos, 0,
     witness0, network, SimplicityLogLevel.NONE
@@ -240,7 +223,7 @@ sig1 = p2pk_program.create_p2pk_signature(
     creation_utxos, 1, network
 )
 witness1 = SimplicityWitnessValues()
-witness1 = witness1.add_value("SIGNATURE", SimplicityTypedValue.byte_array(str(sig1)))
+witness1 = witness1.add_value("SIGNATURE", SimplicityTypedValue.byte_array(sig1))
 creation_tx = p2pk_program.finalize_transaction(
     creation_tx, xonly_pubkey, creation_utxos, 1,
     witness1, network, SimplicityLogLevel.NONE
@@ -282,9 +265,9 @@ fund_inp_builder0 = PsetInputBuilder.from_prevout(funding_outpoint0)
 fund_inp_builder0.witness_utxo(creation_out_output0)
 fund_inp_builder0.sequence(TxSequence.zero())
 fund_inp_builder0.issuance_value_amount(NUM_CONTRACTS)
-fund_inp_builder0.issuance_asset_entropy(option_token_entropy)
+fund_inp_builder0.issuance_asset_entropy(option_token_entropy.to_bytes())
 fund_inp_builder0.blinded_issuance(False)
-fund_inp_builder0.issuance_blinding_nonce(Tweak.from_hex(secrets0.asset_blinding_factor().to_hex()))
+fund_inp_builder0.issuance_blinding_nonce(Tweak.from_bytes(secrets0.asset_blinding_factor().to_bytes()))
 funding_input0 = fund_inp_builder0.build()
 
 funding_outpoint1 = OutPoint.from_parts(creation_txid, creation_out_vout1)
@@ -292,9 +275,9 @@ fund_inp_builder1 = PsetInputBuilder.from_prevout(funding_outpoint1)
 fund_inp_builder1.witness_utxo(creation_out_output1)
 fund_inp_builder1.sequence(TxSequence.zero())
 fund_inp_builder1.issuance_value_amount(NUM_CONTRACTS)
-fund_inp_builder1.issuance_asset_entropy(grantor_token_entropy)
+fund_inp_builder1.issuance_asset_entropy(grantor_token_entropy.to_bytes())
 fund_inp_builder1.blinded_issuance(False)
-fund_inp_builder1.issuance_blinding_nonce(Tweak.from_hex(secrets1.asset_blinding_factor().to_hex()))
+fund_inp_builder1.issuance_blinding_nonce(Tweak.from_bytes(secrets1.asset_blinding_factor().to_bytes()))
 funding_input1 = fund_inp_builder1.build()
 
 outpoint2 = OutPoint.from_parts(txid3, vout3)
@@ -397,14 +380,15 @@ path_type = SimplicityType.parse(
     "Either<Either<(u64,u256,u256,u256,u256,u256,u256,u256,u256), Either<(bool,u64,u64,u64),(bool,u64,u64)>>, Either<(bool,u64,u64),(bool,u64,u64)>>"
 )
 
-in_opt_abf = secrets0.asset_blinding_factor().to_hex()
-in_opt_vbf = secrets0.value_blinding_factor().to_hex()
-in_gra_abf = secrets1.asset_blinding_factor().to_hex()
-in_gra_vbf = secrets1.value_blinding_factor().to_hex()
-out_opt_abf = out_secrets0.asset_blinding_factor().to_hex()
-out_opt_vbf = out_secrets0.value_blinding_factor().to_hex()
-out_gra_abf = out_secrets1.asset_blinding_factor().to_hex()
-out_gra_vbf = out_secrets1.value_blinding_factor().to_hex()
+# SimplicityHL requires bindings factors to be in hex reversed order
+in_opt_abf = secrets0.asset_blinding_factor().to_bytes().hex()
+in_opt_vbf = secrets0.value_blinding_factor().to_bytes().hex()
+in_gra_abf = secrets1.asset_blinding_factor().to_bytes().hex()
+in_gra_vbf = secrets1.value_blinding_factor().to_bytes().hex()
+out_opt_abf = out_secrets0.asset_blinding_factor().to_bytes().hex()
+out_opt_vbf = out_secrets0.value_blinding_factor().to_bytes().hex()
+out_gra_abf = out_secrets1.asset_blinding_factor().to_bytes().hex()
+out_gra_vbf = out_secrets1.value_blinding_factor().to_bytes().hex()
 
 path_value_str = (
     f"Left(Left(({settlement_sats},"
@@ -437,7 +421,7 @@ sig2 = p2pk_program.create_p2pk_signature(
     funding_utxos, 2, network
 )
 witness2 = SimplicityWitnessValues()
-witness2 = witness2.add_value("SIGNATURE", SimplicityTypedValue.byte_array(str(sig2)))
+witness2 = witness2.add_value("SIGNATURE", SimplicityTypedValue.byte_array(sig2))
 funding_tx = p2pk_program.finalize_transaction(
     funding_tx, xonly_pubkey, funding_utxos, 2,
     witness2, network, SimplicityLogLevel.NONE

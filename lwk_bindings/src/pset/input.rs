@@ -2,10 +2,7 @@ use crate::types::AssetId;
 #[cfg(feature = "simplicity")]
 use crate::LwkError;
 #[cfg(feature = "simplicity")]
-use crate::{
-    types::{ContractHash, Tweak},
-    TxSequence,
-};
+use crate::{types::Tweak, TxSequence};
 use crate::{Issuance, Script, Txid};
 #[cfg(feature = "simplicity")]
 use crate::{OutPoint, TxOut};
@@ -15,9 +12,6 @@ use std::sync::Arc;
 use std::sync::Mutex;
 
 use elements::pset::Input;
-
-#[cfg(feature = "simplicity")]
-use lwk_wollet::hashes::Hash;
 
 /// PSET input (read-only)
 #[derive(uniffi::Object, Debug)]
@@ -110,13 +104,8 @@ impl PsetInput {
 #[cfg(feature = "simplicity")]
 #[derive(uniffi::Object, Debug)]
 pub struct PsetInputBuilder {
-    /// Uses Mutex for in-place mutation. See [`crate::TxBuilder`] for rationale.
+    /// Uses Mutex for in-place mutation.
     inner: Mutex<Option<Input>>,
-}
-
-#[cfg(feature = "simplicity")]
-fn builder_consumed() -> LwkError {
-    "PsetInputBuilder already consumed".into()
 }
 
 #[cfg(feature = "simplicity")]
@@ -140,7 +129,7 @@ impl PsetInputBuilder {
     /// Set the witness UTXO.
     pub fn witness_utxo(&self, utxo: &TxOut) -> Result<(), LwkError> {
         let mut lock = self.inner.lock()?;
-        let inner = lock.as_mut().ok_or_else(builder_consumed)?;
+        let inner = lock.as_mut().ok_or(LwkError::ObjectConsumed)?;
         inner.witness_utxo = Some(utxo.into());
         Ok(())
     }
@@ -148,7 +137,7 @@ impl PsetInputBuilder {
     /// Set the sequence number.
     pub fn sequence(&self, sequence: &TxSequence) -> Result<(), LwkError> {
         let mut lock = self.inner.lock()?;
-        let inner = lock.as_mut().ok_or_else(builder_consumed)?;
+        let inner = lock.as_mut().ok_or(LwkError::ObjectConsumed)?;
         inner.sequence = Some((*sequence).into());
         Ok(())
     }
@@ -156,7 +145,7 @@ impl PsetInputBuilder {
     /// Set the issuance value amount.
     pub fn issuance_value_amount(&self, amount: u64) -> Result<(), LwkError> {
         let mut lock = self.inner.lock()?;
-        let inner = lock.as_mut().ok_or_else(builder_consumed)?;
+        let inner = lock.as_mut().ok_or(LwkError::ObjectConsumed)?;
         inner.issuance_value_amount = Some(amount);
         Ok(())
     }
@@ -164,24 +153,23 @@ impl PsetInputBuilder {
     /// Set the issuance inflation keys.
     pub fn issuance_inflation_keys(&self, amount: u64) -> Result<(), LwkError> {
         let mut lock = self.inner.lock()?;
-        let inner = lock.as_mut().ok_or_else(builder_consumed)?;
+        let inner = lock.as_mut().ok_or(LwkError::ObjectConsumed)?;
         inner.issuance_inflation_keys = Some(amount);
         Ok(())
     }
 
-    /// Set the issuance asset entropy.
-    pub fn issuance_asset_entropy(&self, contract_hash: &ContractHash) -> Result<(), LwkError> {
-        let inner_hash: elements::ContractHash = contract_hash.into();
+    /// Set the issuance asset entropy (should be exactly 32 bytes long, rejected otherwise).
+    pub fn issuance_asset_entropy(&self, issuance_asset_entropy: &[u8]) -> Result<(), LwkError> {
         let mut lock = self.inner.lock()?;
-        let inner = lock.as_mut().ok_or_else(builder_consumed)?;
-        inner.issuance_asset_entropy = Some(inner_hash.to_byte_array());
+        let inner = lock.as_mut().ok_or(LwkError::ObjectConsumed)?;
+        inner.issuance_asset_entropy = Some(issuance_asset_entropy.try_into()?);
         Ok(())
     }
 
     /// Set the blinded issuance flag.
     pub fn blinded_issuance(&self, flag: bool) -> Result<(), LwkError> {
         let mut lock = self.inner.lock()?;
-        let inner = lock.as_mut().ok_or_else(builder_consumed)?;
+        let inner = lock.as_mut().ok_or(LwkError::ObjectConsumed)?;
         inner.blinded_issuance = Some(u8::from(flag));
         Ok(())
     }
@@ -189,7 +177,7 @@ impl PsetInputBuilder {
     /// Set the issuance blinding nonce.
     pub fn issuance_blinding_nonce(&self, nonce: &Tweak) -> Result<(), LwkError> {
         let mut lock = self.inner.lock()?;
-        let inner = lock.as_mut().ok_or_else(builder_consumed)?;
+        let inner = lock.as_mut().ok_or(LwkError::ObjectConsumed)?;
         inner.issuance_blinding_nonce = Some(nonce.into());
         Ok(())
     }
@@ -197,7 +185,7 @@ impl PsetInputBuilder {
     /// Build the PsetInput, consuming the builder.
     pub fn build(&self) -> Result<Arc<PsetInput>, LwkError> {
         let mut lock = self.inner.lock()?;
-        let inner = lock.take().ok_or_else(builder_consumed)?;
+        let inner = lock.take().ok_or(LwkError::ObjectConsumed)?;
         Ok(Arc::new(PsetInput::from_inner(inner)))
     }
 }

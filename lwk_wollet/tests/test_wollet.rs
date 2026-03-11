@@ -16,7 +16,8 @@ use lwk_test_util::{generate_mnemonic, generate_slip77};
 use lwk_wollet::clients::blocking::BlockchainBackend;
 use lwk_wollet::Tip;
 use lwk_wollet::{
-    AddressResult, Contract, ElectrumUrl, UnvalidatedRecipient, WalletTx, Wollet, WolletDescriptor,
+    AddressResult, Contract, ElectrumUrl, UnvalidatedRecipient, WalletTx, Wollet, WolletBuilder,
+    WolletDescriptor,
 };
 use lwk_wollet::{ElementsNetwork, Update};
 use tempfile::TempDir;
@@ -68,7 +69,11 @@ impl<C: BlockchainBackend> TestWollet<C> {
         };
 
         let desc: WolletDescriptor = descriptor.parse().unwrap();
-        let mut wollet = Wollet::with_fs_persist(network, desc, &db_root_dir).unwrap();
+        let mut wollet = WolletBuilder::new(network, desc)
+            .with_legacy_fs_store(&db_root_dir)
+            .unwrap()
+            .build()
+            .unwrap();
 
         sync(&mut wollet, &mut client);
 
@@ -652,9 +657,11 @@ impl<C: BlockchainBackend> TestWollet<C> {
         let network = ElementsNetwork::default_regtest();
 
         for _ in 0..2 {
-            let wollet =
-                Wollet::with_fs_persist(network, descriptor.parse().unwrap(), &db_root_dir)
-                    .unwrap();
+            let wollet = WolletBuilder::new(network, descriptor.parse().unwrap())
+                .with_legacy_fs_store(&db_root_dir)
+                .unwrap()
+                .build()
+                .unwrap();
 
             let balance = wollet.balance().unwrap();
             assert_eq!(expected, balance);
@@ -742,7 +749,9 @@ pub fn test_wollet_with_many_transactions() -> Wollet {
     let descriptor: WolletDescriptor = descriptor.parse().unwrap();
     let update = Update::deserialize(&update).unwrap();
     assert_eq!(update.version, 1);
-    let mut wollet = Wollet::without_persist(ElementsNetwork::LiquidTestnet, descriptor).unwrap();
+    let mut wollet = WolletBuilder::new(ElementsNetwork::LiquidTestnet, descriptor)
+        .build()
+        .unwrap();
     wollet.apply_update(update).unwrap();
     wollet
 }

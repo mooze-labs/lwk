@@ -173,6 +173,50 @@ impl Update {
             .map_err(|e| Error::Generic(e.to_string()))?;
         Self::deserialize_decrypted(&vec, desc)
     }
+
+    /// Merge another update into this one.
+    ///
+    /// This is used to squash multiple sequential updates into a single update.
+    ///
+    /// NOTE: it's caller responsibility to ensure that the following update is the next in sequence
+    /// and updates are not mixed up.
+    pub(crate) fn merge(&mut self, following: Update) {
+        // By construction there should not be duplicate txs,
+        // even if so when merged in the hashmap they will be overridden.
+        self.new_txs.txs.extend(following.new_txs.txs);
+
+        self.new_txs.unblinds.extend(following.new_txs.unblinds);
+
+        // When we apply an update we first delete then insert the new txs.
+        // Suppose to have Um = U1.merge(U2)
+        // The order would be:
+        // U1.delete, U1.insert, U2.delete, U2.insert
+
+        // Um.insert = (U1.insert \ U2.delete) ∪ U2.insert
+        self.txid_height_new
+            .retain(|(t, _)| !following.txid_height_delete.contains(t));
+        for (txid, height) in following.txid_height_new {
+            // In this case we can't extend, we want to keep the height of the newest update in case of duplicates
+            self.txid_height_new.retain(|(t, _)| *t != txid);
+            self.txid_height_new.push((txid, height));
+        }
+
+        // Um.delete = U1.delete ∪ U2.delete
+        self.txid_height_delete.extend(following.txid_height_delete);
+
+        // Merge timestamps and scripts
+        self.timestamps.extend(following.timestamps);
+        self.scripts_with_blinding_pubkey
+            .extend(following.scripts_with_blinding_pubkey);
+
+        // Update tip to other's tip
+        self.tip = following.tip;
+
+        // Update version to latest
+        self.version = following.version;
+
+        // We don't need to update the wollet status, it's right to keep the status of the first update
+    }
 }
 
 fn default_blockheader() -> BlockHeader {
@@ -737,7 +781,7 @@ mod test {
         Script,
     };
 
-    use crate::{update::DownloadTxResult, Chain, Update, Wollet, WolletDescriptor};
+    use crate::{update::DownloadTxResult, Chain, Update, WolletBuilder, WolletDescriptor};
 
     use super::EncodableTxOutSecrets;
 
@@ -882,7 +926,9 @@ mod test {
         let update_bytes = lwk_test_util::update_test_vector_2_bytes();
         let update = Update::deserialize(&update_bytes).unwrap();
         let desc: WolletDescriptor = lwk_test_util::wollet_descriptor_string().parse().unwrap();
-        let wollet = Wollet::without_persist(crate::ElementsNetwork::LiquidTestnet, desc).unwrap();
+        let wollet = WolletBuilder::new(crate::ElementsNetwork::LiquidTestnet, desc)
+            .build()
+            .unwrap();
         assert_eq!(update_bytes.len(), 18436);
         assert_eq!(update.serialize().unwrap().len(), 18436);
         let update_pruned = {

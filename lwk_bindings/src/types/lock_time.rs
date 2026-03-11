@@ -4,9 +4,8 @@ use std::fmt::Display;
 use std::sync::Arc;
 
 /// Transaction lock time.
-///
-/// See [`elements::LockTime`] for more details.
 #[derive(uniffi::Object, PartialEq, Eq, Debug, Clone, Copy)]
+#[uniffi::export(Display)]
 pub struct LockTime {
     inner: elements::LockTime,
 }
@@ -44,8 +43,6 @@ impl Display for LockTime {
 #[uniffi::export]
 impl LockTime {
     /// Create a LockTime from a consensus u32 value.
-    ///
-    /// See [`elements::LockTime::from_consensus`].
     #[uniffi::constructor]
     pub fn from_consensus(value: u32) -> Arc<Self> {
         Arc::new(LockTime {
@@ -54,8 +51,6 @@ impl LockTime {
     }
 
     /// Create a LockTime from a block height.
-    ///
-    /// See [`elements::LockTime::from_height`].
     #[uniffi::constructor]
     pub fn from_height(height: u32) -> Result<Arc<Self>, LwkError> {
         let inner = elements::LockTime::from_height(height)?;
@@ -63,8 +58,6 @@ impl LockTime {
     }
 
     /// Create a LockTime from a Unix timestamp.
-    ///
-    /// See [`elements::LockTime::from_time`].
     #[uniffi::constructor]
     pub fn from_time(time: u32) -> Result<Arc<Self>, LwkError> {
         let inner = elements::LockTime::from_time(time)?;
@@ -72,8 +65,6 @@ impl LockTime {
     }
 
     /// Create a LockTime with value zero (no lock time).
-    ///
-    /// See [`elements::LockTime::ZERO`].
     #[uniffi::constructor]
     pub fn zero() -> Arc<Self> {
         Arc::new(LockTime {
@@ -82,22 +73,16 @@ impl LockTime {
     }
 
     /// Return the consensus u32 value.
-    ///
-    /// See [`elements::LockTime::to_consensus_u32`].
     pub fn to_consensus_u32(&self) -> u32 {
         self.inner.to_consensus_u32()
     }
 
     /// Return true if this lock time represents a block height.
-    ///
-    /// See [`elements::LockTime::is_block_height`].
     pub fn is_block_height(&self) -> bool {
         self.inner.is_block_height()
     }
 
     /// Return true if this lock time represents a Unix timestamp.
-    ///
-    /// See [`elements::LockTime::is_block_time`].
     pub fn is_block_time(&self) -> bool {
         self.inner.is_block_time()
     }
@@ -108,44 +93,29 @@ mod tests {
     use super::LockTime;
 
     #[test]
-    fn test_lock_time_from_consensus() {
-        // Height value (< 500_000_000)
-        let lt = LockTime::from_consensus(100);
-        assert_eq!(lt.to_consensus_u32(), 100);
-        assert!(lt.is_block_height());
-        assert!(!lt.is_block_time());
+    fn test_lock_time_constructors_and_boundaries() {
+        let from_consensus_height = LockTime::from_consensus(100);
+        assert_eq!(from_consensus_height.to_consensus_u32(), 100);
+        assert!(from_consensus_height.is_block_height());
+        assert!(!from_consensus_height.is_block_time());
 
-        // Time value (>= 500_000_000)
-        let lt = LockTime::from_consensus(500_000_001);
-        assert_eq!(lt.to_consensus_u32(), 500_000_001);
-        assert!(!lt.is_block_height());
-        assert!(lt.is_block_time());
-    }
+        let from_consensus_time = LockTime::from_consensus(500_000_001);
+        assert_eq!(from_consensus_time.to_consensus_u32(), 500_000_001);
+        assert!(!from_consensus_time.is_block_height());
+        assert!(from_consensus_time.is_block_time());
 
-    #[test]
-    fn test_lock_time_from_height() {
-        let lt = LockTime::from_height(100).unwrap();
-        assert_eq!(lt.to_consensus_u32(), 100);
-        assert!(lt.is_block_height());
-
-        // Should fail for values >= 500_000_000
+        let from_height = LockTime::from_height(100).unwrap();
+        assert_eq!(from_height.to_consensus_u32(), 100);
+        assert!(from_height.is_block_height());
         assert!(LockTime::from_height(500_000_000).is_err());
-    }
 
-    #[test]
-    fn test_lock_time_from_time() {
-        let lt = LockTime::from_time(500_000_001).unwrap();
-        assert_eq!(lt.to_consensus_u32(), 500_000_001);
-        assert!(lt.is_block_time());
-
-        // Should fail for values < 500_000_000
+        let from_time = LockTime::from_time(500_000_001).unwrap();
+        assert_eq!(from_time.to_consensus_u32(), 500_000_001);
+        assert!(from_time.is_block_time());
         assert!(LockTime::from_time(100).is_err());
-    }
 
-    #[test]
-    fn test_lock_time_zero() {
-        let lt = LockTime::zero();
-        assert_eq!(lt.to_consensus_u32(), 0);
-        assert!(lt.is_block_height());
+        let lt_zero = LockTime::zero();
+        assert_eq!(lt_zero.to_consensus_u32(), 0);
+        assert!(lt_zero.is_block_height());
     }
 }

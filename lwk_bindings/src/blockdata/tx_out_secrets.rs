@@ -161,8 +161,6 @@ impl TxOutSecrets {
 #[cfg(test)]
 mod tests {
     #[cfg(feature = "simplicity")]
-    use crate::UniffiCustomTypeConverter;
-    #[cfg(feature = "simplicity")]
     use crate::{types, TxOutSecrets};
 
     use std::str::FromStr;
@@ -170,6 +168,9 @@ mod tests {
     use elements::confidential::{AssetBlindingFactor, ValueBlindingFactor};
     use elements::hex::FromHex;
     use elements::AssetId;
+
+    #[cfg(feature = "simplicity")]
+    use elements::hex::ToHex;
 
     #[cfg(feature = "simplicity")]
     fn reverse_hex(hex: &str) -> String {
@@ -183,9 +184,9 @@ mod tests {
     #[test]
     fn tx_out_secrets() {
         let zero_hex = "0000000000000000000000000000000000000000000000000000000000000000";
-        let asset_hex = "1111111111111111111111111111111111111111111111111111111111111111";
-        let abf_hex = "0102030405060708091011121314151617181920212223242526272829303132";
-        let vbf_hex = "aabbccdd00112233445566778899aabb01020304050607080910111213141516";
+        let asset_hex = "0000460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470";
+        let abf_hex = "0000460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a471";
+        let vbf_hex = "0000460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a472";
 
         let txoutsecrets_explicit: crate::TxOutSecrets = elements::TxOutSecrets::new(
             AssetId::from_str(asset_hex).unwrap(),
@@ -202,12 +203,12 @@ mod tests {
         assert_eq!(txoutsecrets_explicit.asset_bf().to_string(), zero_hex,);
         #[cfg(feature = "simplicity")]
         assert_eq!(
-            txoutsecrets_explicit.value_blinding_factor().to_hex(),
+            txoutsecrets_explicit.value_blinding_factor().to_string(),
             zero_hex,
         );
         #[cfg(feature = "simplicity")]
         assert_eq!(
-            txoutsecrets_explicit.asset_blinding_factor().to_hex(),
+            txoutsecrets_explicit.asset_blinding_factor().to_string(),
             zero_hex,
         );
         assert_eq!(txoutsecrets_explicit.asset_commitment().to_string(), "");
@@ -220,8 +221,8 @@ mod tests {
             ValueBlindingFactor::from_hex(vbf_hex).unwrap(),
         )
         .into();
-        let vc_hex = "08e092ca785f8d07681db07467e05f585e562bcf47171ddbe74d0c825f49c535fe";
-        let ac_hex = "0b73d08a80d4df97c7917eb231d2d9949422e49d5243e3b7342cfb7f409d05fae6";
+        let vc_hex = "099be562150e1db49df61c175dad7927c41152f19578ce09660b5346ea9e31e576";
+        let ac_hex = "0baffb010ebadaefcf81343637e2abf439fc2615ce30a8c4157ec36a11f926acb1";
 
         assert!(!txoutsecrets_blinded.is_explicit());
         assert_eq!(txoutsecrets_blinded.value(), 1000);
@@ -240,12 +241,18 @@ mod tests {
         );
         #[cfg(feature = "simplicity")]
         assert_eq!(
-            txoutsecrets_blinded.asset_blinding_factor().to_hex(),
+            txoutsecrets_blinded
+                .asset_blinding_factor()
+                .to_bytes()
+                .to_hex(),
             reverse_hex(abf_hex),
         );
         #[cfg(feature = "simplicity")]
         assert_eq!(
-            txoutsecrets_blinded.value_blinding_factor().to_hex(),
+            txoutsecrets_blinded
+                .value_blinding_factor()
+                .to_bytes()
+                .to_hex(),
             reverse_hex(vbf_hex),
         );
         assert_eq!(txoutsecrets_blinded.asset_commitment().to_string(), ac_hex);
@@ -255,22 +262,22 @@ mod tests {
     #[test]
     #[cfg(feature = "simplicity")]
     fn test_tx_out_secrets_new_with_blinding() {
-        let asset_hex = "1111111111111111111111111111111111111111111111111111111111111111";
-        let abf_hex = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-        let vbf_hex = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let asset_hex = "0000460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470";
+        let abf_hex = "0000460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a471";
+        let vbf_hex = "0000460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a472";
 
-        let asset_id = types::AssetId::into_custom(asset_hex.to_string()).unwrap();
-        let asset_bf = types::AssetBlindingFactor::from_hex(abf_hex).unwrap();
-        let value_bf = types::ValueBlindingFactor::from_hex(vbf_hex).unwrap();
+        let asset_id: types::AssetId = elements::AssetId::from_str(asset_hex).unwrap().into();
+        let asset_bf = types::AssetBlindingFactor::from_string(abf_hex).unwrap();
+        let value_bf = types::ValueBlindingFactor::from_string(vbf_hex).unwrap();
 
         let secrets = TxOutSecrets::new(asset_id, &asset_bf, 1000, &value_bf);
 
         assert!(!secrets.is_explicit());
         assert_eq!(secrets.asset().to_string(), asset_hex);
         assert_eq!(secrets.asset_bf().to_string(), abf_hex);
-        assert_eq!(secrets.asset_blinding_factor().to_hex(), abf_hex);
+        assert_eq!(secrets.asset_blinding_factor().to_string(), abf_hex);
         assert_eq!(secrets.value(), 1000);
         assert_eq!(secrets.value_bf().to_string(), vbf_hex);
-        assert_eq!(secrets.value_blinding_factor().to_hex(), vbf_hex);
+        assert_eq!(secrets.value_blinding_factor().to_string(), vbf_hex);
     }
 }
