@@ -16,8 +16,8 @@ boltz-client = { git = "https://github.com/SatoshiPortal/boltz-rust/", rev = "29
     "ws",
     "electrum",
 ] }
-lwk_common = { version = "0.15.0" }
-lwk_wollet = { version = "0.15.0", default-features = false, features = [
+lwk_common = { path = "../lwk_common/" }
+lwk_wollet = { version = "../lwk_wollet/", default-features = false, features = [
     "esplora",
 ] }
 serde = { version = "1.0", features = ["derive"] }
