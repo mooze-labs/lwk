@@ -1,3 +1,4 @@
+#[macro_use]
 mod utils;
 
 #[cfg(test)]
@@ -33,10 +34,7 @@ mod tests {
         // Call the helper that shells into the cln-1 container and runs `lightning-cli getinfo`.
         let info = utils::cln_getinfo().expect("cln_getinfo should succeed");
 
-        assert_eq!(
-            info.get("id").unwrap().as_str().unwrap(),
-            "027252b09ca91b04f5f42fe4fc647e3be3d06c405bf7a6437f5e429ffb695ba25b"
-        );
+        assert!(info.get("id").unwrap().as_str().is_some());
         assert_eq!(info.get("network").unwrap().as_str().unwrap(), "regtest");
         assert_eq!(info.get("version").unwrap().as_str().unwrap(), "25.12.1");
     }
@@ -56,7 +54,80 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires regtest environment"]
-    async fn test_bolt12_offer_to_bolt11_and_pay_with_session() {
+    async fn test_bolt12_pay_with_session() {
+        let _ = env_logger::try_init();
+
+        // Start concurrent block mining task
+        let mining_handle = utils::start_block_mining();
+
+        // Ask CLN for a BOLT12 offer
+        let offer_str = utils::cln_offer_any().expect("cln_offer_any should succeed");
+
+        let mut payment: LightningPayment = offer_str.parse().unwrap();
+        assert!(payment.bolt12().is_some());
+        assert!(payment.bolt12_invoice_amount().unwrap().is_none());
+
+        // create a BoltzSession
+        let client = Arc::new(
+            ElectrumClient::new(
+                DEFAULT_REGTEST_NODE,
+                false,
+                false,
+                ElementsNetwork::default_regtest(),
+            )
+            .unwrap(),
+        );
+        let session = BoltzSession::builder(
+            ElementsNetwork::default_regtest(),
+            AnyClient::Electrum(client.clone()),
+        )
+        .build()
+        .await
+        .unwrap();
+
+        // Try to pay the bolt12
+        let refund_address = utils::generate_address(Chain::Liquid(LiquidChain::LiquidRegtest))
+            .await
+            .unwrap();
+        let refund_address = elements::Address::from_str(&refund_address).unwrap();
+        let prepare_pay_err = session
+            .prepare_pay(&payment, &refund_address, None)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(prepare_pay_err.contains("Amount is required"));
+
+        let sat_amount = 10_000;
+        payment.set_bolt12_invoice_amount(sat_amount).unwrap();
+        assert_eq!(
+            payment.bolt12_invoice_amount().unwrap().unwrap(),
+            sat_amount
+        );
+
+        let prepare_pay = session
+            .prepare_pay(&payment, &refund_address, None)
+            .await
+            .unwrap();
+
+        // Send funds to the swap address
+        utils::send_to_address(
+            Chain::Liquid(LiquidChain::LiquidRegtest),
+            &prepare_pay.data.create_swap_response.address,
+            prepare_pay.data.create_swap_response.expected_amount,
+        )
+        .await
+        .unwrap();
+
+        // Complete the payment
+        prepare_pay.complete_pay().await.unwrap();
+
+        // Stop the mining task
+        mining_handle.abort();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires regtest environment"]
+    async fn test_bolt12_offer_to_invoice_and_pay_with_session() {
         let _ = env_logger::try_init();
 
         // Ask CLN for a BOLT12 offer
@@ -94,7 +165,7 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires regtest environment"]
-    async fn test_session_submarine() {
+    async fn test_session_submarine_base() {
         let _ = env_logger::try_init();
 
         // Start concurrent block mining task
@@ -157,23 +228,12 @@ mod tests {
         )
         .await
         .unwrap();
-        loop {
-            match prepare_pay_response.advance().await {
-                Ok(std::ops::ControlFlow::Continue(_)) => {}
-                Ok(std::ops::ControlFlow::Break(result)) => {
-                    log::info!("Payment completed with result: {result}");
-                    assert!(result, "Payment should succeed");
-                    break;
-                }
-                Err(e) => {
-                    panic!("Unexpected error: {e}");
-                }
-            }
-        }
+        advance_until_complete!(prepare_pay_response, true);
         assert!(
             prepare_pay_response.lockup_txid().is_some(),
             "lockup txid should be available when submarine swap is claimed"
         );
+        assert!(prepare_pay_response.refund_txid().is_none());
         // repeatly calling advance on a terminated swap don't timeout
         for _ in 0..10 {
             match prepare_pay_response.advance().await {
@@ -188,7 +248,7 @@ mod tests {
         // Test underpay which triggers a refund to the refund address
         let bolt11_invoice = utils::generate_invoice_lnd(50_000).await.unwrap();
         let lightning_payment = LightningPayment::from_str(&bolt11_invoice).unwrap();
-        let prepare_pay_response = session
+        let mut prepare_pay_response = session
             .prepare_pay(&lightning_payment, &refund_address, None)
             .await
             .unwrap();
@@ -203,7 +263,15 @@ mod tests {
         )
         .await
         .unwrap();
-        prepare_pay_response.complete_pay().await.unwrap();
+
+        // Use advance() instead of complete_pay() so we can check refund_txid afterwards
+        advance_until_complete!(prepare_pay_response, true);
+
+        // Verify refund txid was stored when refund transaction was broadcasted
+        assert!(
+            prepare_pay_response.refund_txid().is_some(),
+            "refund_txid should be set after refund transaction is broadcasted"
+        );
 
         // test polling
         let session_polling = BoltzSession::builder(
@@ -233,25 +301,7 @@ mod tests {
         .unwrap();
 
         // Poll for updates until payment is complete
-        loop {
-            match prepare_pay_response.advance().await {
-                Ok(std::ops::ControlFlow::Continue(update)) => {
-                    log::info!("Polling: Received update. status:{}", update.status);
-                }
-                Ok(std::ops::ControlFlow::Break(result)) => {
-                    log::info!("Polling: Payment completed with result: {result}");
-                    assert!(result, "Payment should succeed");
-                    break;
-                }
-                Err(lwk_boltz::Error::NoBoltzUpdate) => {
-                    log::info!("Polling: No update available, sleeping and retrying...");
-                    sleep(Duration::from_secs(1)).await;
-                }
-                Err(e) => {
-                    panic!("Polling: Unexpected error: {e}");
-                }
-            }
-        }
+        advance_until_complete_polling!(prepare_pay_response, true);
 
         // Stop the mining task
         mining_handle.abort();

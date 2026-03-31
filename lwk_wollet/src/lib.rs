@@ -93,6 +93,7 @@ pub mod amp0;
 #[cfg(feature = "amp2")]
 pub mod amp2;
 
+mod async_util;
 mod cache;
 pub mod clients;
 mod contract;
@@ -104,6 +105,7 @@ mod liquidex;
 mod model;
 mod network;
 pub mod pegin;
+mod tx_details;
 
 #[cfg(feature = "prices")]
 mod pos;
@@ -121,11 +123,11 @@ mod wollet;
 #[cfg(feature = "prices")]
 pub mod prices;
 
-pub use crate::clients::electrum_url::{ElectrumUrl, UrlError};
+pub use crate::clients::electrum_url::ElectrumUrl;
 pub use crate::clients::{Capability, History};
 pub use crate::contract::{asset_ids, issuance_ids, Contract, Entity};
 pub use crate::descriptor::{Chain, WolletDescriptor};
-pub use crate::error::Error;
+pub use crate::error::{Error, UrlError};
 pub use crate::liquidex::{AssetAmount, LiquidexProposal, Unvalidated, Validated};
 pub use crate::model::{
     AddressResult, ExternalUtxo, IssuanceDetails, Recipient, UnvalidatedRecipient, WalletTx,
@@ -135,6 +137,7 @@ pub use crate::network::ElementsNetwork;
 pub use crate::pegin::fed_peg_script;
 #[cfg(feature = "registry")]
 pub use crate::registry::RegistryAssetData;
+pub use crate::tx_details::{TxDetails, TxOpt, TxOutDetails, TxsOpt};
 pub use crate::wollet::DirectoryIdHash;
 
 // Re-export store types from lwk_common

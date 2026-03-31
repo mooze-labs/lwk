@@ -330,6 +330,11 @@ impl PreparePayResponse {
         self.inner.lockup_txid()
     }
 
+    /// See [`crate::PreparePayResponse::refund_txid()`]
+    pub fn refund_txid(&self) -> Option<&str> {
+        self.inner.refund_txid()
+    }
+
     /// See [`crate::PreparePayResponse::set_lockup_txid()`]
     pub fn set_lockup_txid(&mut self, txid: String) -> Result<(), Error> {
         self.inner.set_lockup_txid(txid)
@@ -374,6 +379,11 @@ impl InvoiceResponse {
         self.inner.claim_txid()
     }
 
+    /// See [`crate::InvoiceResponse::lockup_txid()`]
+    pub fn lockup_txid(&self) -> Option<&str> {
+        self.inner.lockup_txid()
+    }
+
     pub fn advance(&mut self) -> Result<ControlFlow<bool, SwapStatus>, Error> {
         let inner = self.runtime.block_on(self.inner.advance())?;
         Ok(inner)
@@ -391,6 +401,10 @@ impl LockupResponse {
 
     pub fn lockup_address(&self) -> &str {
         self.inner.lockup_address()
+    }
+
+    pub fn claim_address(&self) -> &str {
+        self.inner.claim_address()
     }
 
     pub fn expected_amount(&self) -> u64 {
@@ -428,6 +442,11 @@ impl LockupResponse {
     /// See [`crate::LockupResponse::lockup_txid()`]
     pub fn lockup_txid(&self) -> Option<&str> {
         self.inner.lockup_txid()
+    }
+
+    /// See [`crate::LockupResponse::refund_txid()`]
+    pub fn refund_txid(&self) -> Option<&str> {
+        self.inner.refund_txid()
     }
 
     /// See [`crate::LockupResponse::set_lockup_txid()`]

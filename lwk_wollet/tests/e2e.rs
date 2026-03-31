@@ -9,6 +9,7 @@ mod test_jade;
 mod test_ledger;
 mod test_wollet;
 mod tr;
+mod tx_details;
 
 use crate::test_jade::jade_setup;
 use clients::blocking::{self, BlockchainBackend};
@@ -25,7 +26,7 @@ use lwk_test_util::*;
 use lwk_wollet::pegin::fetch_last_full_header;
 use lwk_wollet::*;
 use std::{collections::HashSet, str::FromStr};
-use test_wollet::{generate_signer, test_client_electrum, wait_for_tx, TestWollet};
+use test_wollet::*;
 
 #[test]
 fn liquid_send_jade_signer() {
@@ -1260,6 +1261,80 @@ fn test_esplora_waterfalls_utxo_only() {
         .unwrap()
         .iter()
         .all(|tx| !tx.outputs.is_empty()));
+}
+
+#[test]
+fn test_waterfalls_utxo_only_with_dummy() {
+    let env = TestEnvBuilder::from_env().with_waterfalls().build();
+
+    let signer = generate_signer();
+    let view_key = generate_view_key();
+    let desc = format!("ct({},elwpkh({}/<0;1>/*))", view_key, signer.xpub());
+    let signers = [&AnySigner::Software(signer)];
+    let network = ElementsNetwork::default_regtest();
+    let lbtc = network.policy_asset();
+
+    let client = asyncr::EsploraClientBuilder::new(&env.waterfalls_url(), network)
+        .waterfalls(true)
+        .build_blocking()
+        .unwrap();
+    let mut w = TestWollet::new(client, &desc);
+
+    let wd = WolletDescriptor::from_str(&desc).unwrap();
+    let mut client_utxo_only = asyncr::EsploraClientBuilder::new(&env.waterfalls_url(), network)
+        .waterfalls(true)
+        .utxo_only(true)
+        .build_blocking()
+        .unwrap();
+    let mut wollet_utxo_only = WolletBuilder::new(network, wd).build().unwrap();
+
+    let node_address = env.elementsd_getnewaddress();
+    let txid0 = w.fund_btc(&env);
+    let txid1 = w.send_btc(&signers, None, Some((node_address.clone(), 1)));
+    env.elementsd_generate(1);
+
+    // Utxo only intermediate sync
+    let update = client_utxo_only
+        .full_scan(&wollet_utxo_only)
+        .unwrap()
+        .unwrap();
+    assert!(update
+        .new_txs
+        .txs
+        .iter()
+        .any(|(_, tx)| tx.output.is_empty()));
+    wollet_utxo_only.apply_update(update).unwrap();
+
+    let txid2 = w.send_btc(&signers, None, Some((node_address.clone(), 1)));
+    let txid3 = w.send_btc(&signers, None, Some((node_address.clone(), 1)));
+    env.elementsd_generate(1);
+    wait_for_tx_confirmation(&mut w.wollet, &mut w.client, &txid3);
+
+    let balance = w.wollet.balance().unwrap();
+    assert!(*balance.get(&lbtc).unwrap_or(&0) > 0);
+    let txs = w.wollet.transactions().unwrap();
+    assert_eq!(txs.len(), 4);
+    assert!(txs.iter().any(|tx| tx.txid == txid0));
+    assert!(txs.iter().any(|tx| tx.txid == txid1));
+    assert!(txs.iter().any(|tx| tx.txid == txid2));
+    assert!(txs.iter().any(|tx| tx.txid == txid3));
+
+    // Utxo only final sync
+    let update = client_utxo_only
+        .full_scan(&wollet_utxo_only)
+        .unwrap()
+        .unwrap();
+    assert!(update
+        .new_txs
+        .txs
+        .iter()
+        .any(|(_, tx)| tx.output.is_empty()));
+    wollet_utxo_only.apply_update(update).unwrap();
+
+    assert_eq!(wollet_utxo_only.balance().unwrap(), balance);
+    let txs = wollet_utxo_only.transactions().unwrap();
+    assert_eq!(txs.len(), 1);
+    assert!(txs.iter().any(|tx| tx.txid == txid3));
 }
 
 #[cfg(feature = "esplora")]
@@ -4258,136 +4333,215 @@ fn test_zmq_endpoint() {
     assert!(!msg[1].is_empty());
 }
 
+fn cp_dir_rec(src: &std::path::Path, dst: &std::path::Path) {
+    std::fs::create_dir_all(dst).unwrap();
+    for entry in std::fs::read_dir(src).unwrap() {
+        let entry = entry.unwrap();
+        let ty = entry.file_type().unwrap();
+        let dst_path = dst.join(entry.file_name());
+        if ty.is_dir() {
+            cp_dir_rec(&entry.path(), &dst_path);
+        } else {
+            std::fs::copy(entry.path(), dst_path).unwrap();
+        }
+    }
+}
+
 #[test]
 fn test_merge_updates_e2e() {
     let env = TestEnvBuilder::from_env().with_electrum().build();
-    let signer = SwSigner::new(TEST_MNEMONIC, false).unwrap();
-    let signers: [&AnySigner; 1] = [&AnySigner::Software(signer)];
-    let slip77_key = "9c8e4f05c7711a98c838be228bcb84924d4570ca53f35fa1c793e58841d47023";
-    let desc_str = format!(
-        "ct(slip77({}),elwpkh({}/*))",
-        slip77_key,
-        signers[0].xpub().unwrap()
-    );
+    let network = ElementsNetwork::default_regtest();
+
+    let signer = generate_signer();
+    let view_key = generate_view_key();
+    let desc = format!("ct({},elwpkh({}/*))", view_key, signer.xpub());
+
     let client = test_client_electrum(&env.electrum_url());
-    let mut wallet = TestWollet::new(client, &desc_str);
+    let mut wallet = TestWollet::new(client, &desc);
+
+    let desc = wallet.wollet.wollet_descriptor();
+    let path = wallet.path();
 
     wallet.fund_btc(&env);
-    wallet.send_btc(&signers, None, None);
+    wallet.send_btc(&[&AnySigner::Software(signer.clone())], None, None);
 
-    let expected_balance = wallet.wollet.balance().unwrap();
-    let expected_tx_count = wallet.wollet.transactions().unwrap().len();
-    let expected_utxo_count = wallet.wollet.utxos().unwrap().len();
-    let num_updates_before = wallet.wollet.updates().unwrap().len();
-    assert_eq!(num_updates_before, 4);
+    let balance = wallet.wollet.balance().unwrap();
+    let txs = wallet.wollet.transactions().unwrap().len();
+    let utxos = wallet.wollet.utxos().unwrap().len();
+    assert_eq!(wallet.wollet.updates().unwrap().len(), 4);
 
-    let descriptor = wallet.wollet.wollet_descriptor();
-    let network = ElementsNetwork::default_regtest();
-    let db_root_dir = wallet.db_root_dir();
+    {
+        // Simulate a restart from the state produced by wallet.wollet
+        let dir = tempfile::TempDir::new().unwrap();
+        cp_dir_rec(&path, dir.path());
+        {
+            // Restart with merge threshold
+            let wollet = WolletBuilder::new(network, desc.clone())
+                .with_legacy_fs_store(&dir)
+                .unwrap()
+                .with_merge_threshold(Some(2))
+                .build()
+                .unwrap();
 
-    // Reconstruct the encrypted file store
-    // this is needed to use the same path/encryption created by the TestWollet ( which use with_legacy_fs_store )
-    let mut path = db_root_dir.path().to_path_buf();
-    path.push(network.as_str());
-    path.push("enc_cache");
-    path.push(
-        <DirectoryIdHash as hashes::Hash>::hash(descriptor.to_string().as_bytes()).to_string(),
-    );
-    let file_store = FileStore::new(path.clone()).unwrap();
-    let encrypted_store = EncryptedStore::new(file_store, descriptor.encryption_key_bytes());
+            // Updates are merged
+            assert_eq!(wollet.updates().unwrap().len(), 1);
 
-    let wollet = WolletBuilder::new(network, descriptor.clone())
-        .with_store(std::sync::Arc::new(encrypted_store))
-        .with_merge_threshold(Some(2))
-        .build()
-        .unwrap();
+            // Internal state is identical to the original wallet
+            assert_eq!(balance, wollet.balance().unwrap());
+            assert_eq!(txs, wollet.transactions().unwrap().len());
+            assert_eq!(utxos, wollet.utxos().unwrap().len());
+        }
 
-    assert_eq!(expected_balance, wollet.balance().unwrap());
-    assert_eq!(expected_tx_count, wollet.transactions().unwrap().len());
-    assert_eq!(expected_utxo_count, wollet.utxos().unwrap().len());
+        {
+            // Restart from merged update
+            let wollet = WolletBuilder::new(network, desc.clone())
+                .with_legacy_fs_store(&dir)
+                .unwrap()
+                .build()
+                .unwrap();
 
-    let updates_after = wollet.updates().unwrap();
-    assert_eq!(updates_after.len(), 1);
+            // We get the same state
+            assert_eq!(wollet.updates().unwrap().len(), 1);
+            assert_eq!(balance, wollet.balance().unwrap());
+            assert_eq!(txs, wollet.transactions().unwrap().len());
+            assert_eq!(utxos, wollet.utxos().unwrap().len());
+        }
+    }
 
-    // Verify the merged wallet can be reopened and still has correct state
-    drop(wollet);
-    let mut wollet = WolletBuilder::new(network, descriptor.clone())
-        .with_legacy_fs_store(&db_root_dir)
-        .unwrap()
-        .build()
-        .unwrap();
-    assert_eq!(expected_balance, wollet.balance().unwrap());
-    assert_eq!(expected_tx_count, wollet.transactions().unwrap().len());
-    assert_eq!(expected_utxo_count, wollet.utxos().unwrap().len());
-    assert_eq!(wollet.updates().unwrap().len(), 1);
-
-    // Test merge with txid_height_delete:
-    // Build a tx, apply it without broadcasting, then sync so it gets deleted.
-    let address = wollet.address(None).unwrap().address().clone();
-    let mut pset = wollet
+    // Now we want to simulate the case where a transaction appears
+    // in the tx list and then it disappears. So we can test that we
+    // correctly handle merging updates where we "delete" a transaction.
+    let address = wallet.address();
+    let mut pset = wallet
         .tx_builder()
         .add_lbtc_recipient(&address, 10_000)
         .unwrap()
         .finish()
         .unwrap();
-    let signer = SwSigner::new(TEST_MNEMONIC, false).unwrap();
     signer.sign(&mut pset).unwrap();
-    let tx = wollet.finalize(&mut pset).unwrap();
+    let tx = wallet.wollet.finalize(&mut pset).unwrap();
     let phantom_txid = tx.txid();
-    wollet.apply_transaction(tx).unwrap();
-    assert!(wollet
+    wallet.wollet.apply_transaction(tx).unwrap();
+    assert!(wallet
+        .wollet
         .transactions()
         .unwrap()
         .iter()
         .any(|tx| tx.txid == phantom_txid));
 
     // Sync: electrum doesn't know about the phantom tx, so it will be deleted
-    let mut client = test_client_electrum(&env.electrum_url());
-    let update = client.full_scan(&wollet).unwrap().unwrap();
+    let update = wallet.client.full_scan(&wallet.wollet).unwrap().unwrap();
     assert!(update.txid_height_delete.contains(&phantom_txid));
-    wollet.apply_update(update).unwrap();
-    assert!(wollet
+    wallet.wollet.apply_update(update).unwrap();
+    assert!(wallet
+        .wollet
         .transactions()
         .unwrap()
         .iter()
         .all(|tx| tx.txid != phantom_txid));
 
     // State should be back to what it was before the phantom tx
-    assert_eq!(expected_balance, wollet.balance().unwrap());
-    assert_eq!(expected_tx_count, wollet.transactions().unwrap().len());
-    assert_eq!(expected_utxo_count, wollet.utxos().unwrap().len());
+    assert_eq!(balance, wallet.wollet.balance().unwrap());
+    assert_eq!(txs, wallet.wollet.transactions().unwrap().len());
+    assert_eq!(utxos, wallet.wollet.utxos().unwrap().len());
 
-    let num_updates = wollet.updates().unwrap().len();
-    assert_eq!(num_updates, 3);
+    // With 2 extra updates: one that adds the tx, one that removes it
+    assert_eq!(wallet.wollet.updates().unwrap().len(), 6);
 
-    // Reopen with merge threshold to trigger merge including txid_height_delete
-    drop(wollet);
+    {
+        let dir = tempfile::TempDir::new().unwrap();
+        cp_dir_rec(&path, dir.path());
+        {
+            // Restart with merge threshold
+            // Note: update includes txid_height_delete
+            let wollet = WolletBuilder::new(network, desc.clone())
+                .with_legacy_fs_store(&dir)
+                .unwrap()
+                .with_merge_threshold(Some(2))
+                .build()
+                .unwrap();
 
-    let file_store = FileStore::new(path).unwrap();
-    let encrypted_store = EncryptedStore::new(file_store, descriptor.encryption_key_bytes());
+            assert_eq!(wollet.updates().unwrap().len(), 1);
+            assert_eq!(balance, wollet.balance().unwrap());
+            assert_eq!(txs, wollet.transactions().unwrap().len());
+            assert_eq!(utxos, wollet.utxos().unwrap().len());
+        }
 
-    let wollet = WolletBuilder::new(network, descriptor.clone())
-        .with_store(std::sync::Arc::new(encrypted_store))
-        .with_merge_threshold(Some(2))
-        .build()
-        .unwrap();
+        {
+            // Restart from merged update
+            let wollet = WolletBuilder::new(network, desc.clone())
+                .with_legacy_fs_store(&dir)
+                .unwrap()
+                .build()
+                .unwrap();
 
-    assert_eq!(expected_balance, wollet.balance().unwrap());
-    assert_eq!(expected_tx_count, wollet.transactions().unwrap().len());
-    assert_eq!(expected_utxo_count, wollet.utxos().unwrap().len());
-    assert_eq!(wollet.updates().unwrap().len(), 1);
+            assert_eq!(wollet.updates().unwrap().len(), 1);
+            assert_eq!(balance, wollet.balance().unwrap());
+            assert_eq!(txs, wollet.transactions().unwrap().len());
+            assert_eq!(utxos, wollet.utxos().unwrap().len());
+        }
+    }
 
-    // Final reopen to verify persistence of the merged-with-deletes state
-    drop(wollet);
-    let wollet = WolletBuilder::new(network, descriptor)
-        .with_legacy_fs_store(&db_root_dir)
-        .unwrap()
-        .build()
-        .unwrap();
-    assert_eq!(expected_balance, wollet.balance().unwrap());
-    assert_eq!(expected_tx_count, wollet.transactions().unwrap().len());
-    assert_eq!(expected_utxo_count, wollet.utxos().unwrap().len());
-    assert_eq!(wollet.updates().unwrap().len(), 1);
+    // Test merging updates with a running instance
+    {
+        let dir = tempfile::TempDir::new().unwrap();
+        cp_dir_rec(&path, dir.path());
+        {
+            // Restart with merge threshold
+            let mut wollet = WolletBuilder::new(network, desc.clone())
+                .with_legacy_fs_store(&dir)
+                .unwrap()
+                .with_merge_threshold(Some(2))
+                .build()
+                .unwrap();
+
+            // All previous updates are merged
+            assert_eq!(wollet.updates().unwrap().len(), 1);
+            // Same state as before
+            assert_eq!(balance, wollet.balance().unwrap());
+            assert_eq!(txs, wollet.transactions().unwrap().len());
+            assert_eq!(utxos, wollet.utxos().unwrap().len());
+
+            fn wait_tx_update(wollet: &mut Wollet, client: &mut ElectrumClient) -> Update {
+                for _ in 0..10 {
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                    if let Some(update) = client.full_scan(wollet).unwrap() {
+                        if !update.new_txs.txs.is_empty() {
+                            return update;
+                        }
+                    }
+                }
+                panic!("update did not arrive");
+            }
+
+            // Apply one update (2): not merged
+            let address = wollet.address(Some(0)).unwrap().address().clone();
+            env.elementsd_sendtoaddress(&address, 10000, None);
+            let mut client = test_client_electrum(&env.electrum_url());
+            let update = wait_tx_update(&mut wollet, &mut client);
+            wollet.apply_update(update.clone()).unwrap();
+            assert_eq!(wollet.updates().unwrap().len(), 2);
+
+            // Apply another update (3): merged
+            env.elementsd_sendtoaddress(&address, 20000, None);
+            let update = wait_tx_update(&mut wollet, &mut wallet.client);
+            wollet.apply_update(update.clone()).unwrap();
+            assert_eq!(txs + 2, wollet.transactions().unwrap().len());
+            assert_eq!(wollet.updates().unwrap().len(), 1);
+        }
+
+        {
+            // Restart from merged update
+            let wollet = WolletBuilder::new(network, desc.clone())
+                .with_legacy_fs_store(&dir)
+                .unwrap()
+                .build()
+                .unwrap();
+
+            assert_eq!(wollet.updates().unwrap().len(), 1);
+            assert_eq!(txs + 2, wollet.transactions().unwrap().len());
+        }
+    }
 }
 
 #[test]
@@ -4402,7 +4556,7 @@ fn test_removed_tx() {
     let mut w = TestWollet::new(client, &desc);
 
     let lbtc = w.policy_asset();
-    w.fund_btc(&env);
+    let txid0 = w.fund_btc(&env);
 
     let node_address = env.elementsd_getnewaddress();
     let mut pset = w
@@ -4415,21 +4569,137 @@ fn test_removed_tx() {
     let sigs = signer.sign(&mut pset).unwrap();
     assert!(sigs > 0);
 
-    let tx = w.wollet.finalize(&mut pset).unwrap();
-    let txid = tx.txid();
-    w.wollet.apply_transaction(tx).unwrap();
+    let tx1 = w.wollet.finalize(&mut pset).unwrap();
+    let txid1 = tx1.txid();
+    w.wollet.apply_transaction(tx1).unwrap();
 
     // Tx is both in list and can be obtained with the txid
     let txs = w.wollet.transactions().unwrap();
-    assert!(txs.iter().any(|tx| tx.txid == txid));
-    assert!(w.wollet.transaction(&txid).unwrap().is_some());
+    assert!(txs.iter().any(|tx| tx.txid == txid1));
+    assert!(w.wollet.transaction(&txid1).unwrap().is_some());
 
     // Sync: tx was never broadcast so it disappears from the list
     w.sync();
     let txs = w.wollet.transactions().unwrap();
-    assert!(txs.iter().all(|tx| tx.txid != txid));
+    assert!(txs.iter().all(|tx| tx.txid != txid1));
 
     // Tx should be reachable if you know the txid
-    assert!(w.wollet.transaction(&txid).unwrap().is_some());
+    assert!(w.wollet.transaction(&txid1).unwrap().is_some());
     // Note: some fields (eg inputs and outputs) might not be accurate
+
+    // Create 2 tx remove both of them
+    let utxos = w.wollet.utxos().unwrap();
+    assert_eq!(utxos.len(), 1);
+    assert_eq!(utxos[0].outpoint.txid, txid0);
+
+    let mut pset = w
+        .tx_builder()
+        .add_recipient(&node_address, 1000, lbtc)
+        .unwrap()
+        .finish()
+        .unwrap();
+
+    let sigs = signer.sign(&mut pset).unwrap();
+    assert!(sigs > 0);
+
+    let tx2 = w.wollet.finalize(&mut pset).unwrap();
+    let txid2 = tx2.txid();
+    w.wollet.apply_transaction(tx2).unwrap();
+
+    let utxos = w.wollet.utxos().unwrap();
+    assert_eq!(utxos.len(), 1);
+    assert_eq!(utxos[0].outpoint.txid, txid2);
+
+    let mut pset = w
+        .tx_builder()
+        .add_recipient(&node_address, 1000, lbtc)
+        .unwrap()
+        .finish()
+        .unwrap();
+
+    let sigs = signer.sign(&mut pset).unwrap();
+    assert!(sigs > 0);
+
+    let tx3 = w.wollet.finalize(&mut pset).unwrap();
+    let txid3 = tx3.txid();
+    w.wollet.apply_transaction(tx3).unwrap();
+
+    let utxos = w.wollet.utxos().unwrap();
+    assert_eq!(utxos.len(), 1);
+    assert_eq!(utxos[0].outpoint.txid, txid3);
+
+    // Sync, txid2, txid3 disappear
+    w.sync();
+
+    let utxos = w.wollet.utxos().unwrap();
+    assert_eq!(utxos.len(), 1);
+    assert_eq!(utxos[0].outpoint.txid, txid0);
+}
+
+#[test]
+fn test_faucet() {
+    // Simulate a couple of errors that we see with the testnet faucet
+    let env = TestEnvBuilder::from_env().with_waterfalls().build();
+
+    let signer = generate_signer();
+    let view_key = generate_view_key();
+    let desc = format!("ct({view_key},elwpkh({}/*))", signer.xpub());
+    let client = clients::EsploraClientBuilder::new(&env.waterfalls_url(), ElementsNetwork::Liquid)
+        .utxo_only(true)
+        .waterfalls(true)
+        .build_blocking()
+        .unwrap();
+    let mut w = TestWollet::new(client, &desc);
+
+    let lbtc = w.policy_asset();
+    let txid0 = w.fund_btc(&env);
+
+    let utxos = w.wollet.utxos().unwrap();
+    assert_eq!(utxos.len(), 1);
+    assert_eq!(utxos[0].outpoint.txid, txid0);
+
+    let node_address = env.elementsd_getnewaddress();
+    let mut pset = w
+        .tx_builder()
+        .add_recipient(&node_address, 1000, lbtc)
+        .unwrap()
+        .finish()
+        .unwrap();
+    let sigs = signer.sign(&mut pset).unwrap();
+    assert!(sigs > 0);
+    let tx = w.wollet.finalize(&mut pset).unwrap();
+
+    let txid1 = tx.txid();
+    w.wollet.apply_transaction(tx.clone()).unwrap();
+
+    let utxos = w.wollet.utxos().unwrap();
+    assert_eq!(utxos.len(), 1);
+    assert_eq!(utxos[0].outpoint.txid, txid1);
+
+    // Simulate a situation where the tx is seen by the node *after* the next sync
+    w.sync();
+    w.client.broadcast(&tx).unwrap();
+
+    // We see the old state
+    let utxos = w.wollet.utxos().unwrap();
+    assert_eq!(utxos.len(), 1);
+    assert_eq!(utxos[0].outpoint.txid, txid0);
+
+    // Sending a new tx will trigger an error
+    let mut pset = w
+        .tx_builder()
+        .add_recipient(&node_address, 1000, lbtc)
+        .unwrap()
+        .finish()
+        .unwrap();
+    let sigs = signer.sign(&mut pset).unwrap();
+    assert!(sigs > 0);
+    let tx = w.wollet.finalize(&mut pset).unwrap();
+    let err = w.client.broadcast(&tx).unwrap_err();
+    assert!(err.to_string().contains("txn-mempool-conflict"));
+
+    // If the tx is included in a block, the error is different
+    env.elementsd_generate(1);
+    let err = w.client.broadcast(&tx).unwrap_err();
+    assert!(err.to_string().contains("bad-txns-inputs-missingorspent"));
 }

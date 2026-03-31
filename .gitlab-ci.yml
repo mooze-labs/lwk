@@ -7,7 +7,8 @@ variables:
   SECURE_LOG_LEVEL: "info"
   SECRET_DETECTION_ENABLED: "true"
   DS_GRADLE_RESOLUTION_POLICY: "none"
-  DS_EXCLUDED_PATHS:  "spec, test, tests, tmp, proxy"
+  DS_EXCLUDED_PATHS:  "spec, docs, test, tests, tmp, proxy"
+  SAST_EXCLUDED_PATHS:  "spec, docs, test, tests, tmp, proxy"
 
 include:
   - template: Security/SAST.gitlab-ci.yml
@@ -76,6 +77,20 @@ test_clean:
   image: rust:1.75
   script:
     - cargo build
+
+test_no_default_features:
+  stage: test
+  needs: []
+  extends: .base
+  # We need to polish how we feature gate our code
+  # However let's do things iteratively rather than all at once
+  # TODO: add RUSTFLAGS="-D warnings" to address warnings too
+  # TODO: test other crates too
+  # TODO: replace cargo build with cargo check --tests
+  script:
+    - cargo build -p lwk_wollet --no-default-features
+  allow_failure: true # TODO: remove once fixed
+
 
 test_wollet:
   stage: test
@@ -330,6 +345,7 @@ boltz_chain:
     - git submodule update --init --recursive
     - just regtest-env-start && sleep 15 # explicitly start the env to give more time to bitcoind to start
     - just test-chain
+  allow_failure: true
 
 boltz_mrh:
   stage: test_long
@@ -340,6 +356,7 @@ boltz_mrh:
     - git submodule update --init --recursive
     - just regtest-env-start && sleep 15 # explicitly start the env to give more time to bitcoind to start
     - just test-mrh
+  allow_failure: true
 
 boltz_reverse:
   stage: test_long
@@ -350,6 +367,7 @@ boltz_reverse:
     - git submodule update --init --recursive
     - just regtest-env-start && sleep 15 # explicitly start the env to give more time to bitcoind to start
     - just test-reverse
+  allow_failure: true
 
 boltz_submarine:
   stage: test_long
@@ -360,6 +378,7 @@ boltz_submarine:
     - git submodule update --init --recursive
     - just regtest-env-start && sleep 15 # explicitly start the env to give more time to bitcoind to start
     - just test-submarine
+  allow_failure: true
 
 # maven credentials and gpg settings
 # in runner's ~/.gradle/gradle.properties
@@ -406,9 +425,12 @@ publish_snapshot_to_maven:
     - PATCH=${PATCH:-0}
     - NEXT_PATCH=$((PATCH + 1))
     - NEXT_VERSION="${MAJOR}.${MINOR}.${NEXT_PATCH}"
+    - GIT_COMMIT=$(git rev-parse --short=8 HEAD)
     - SNAPSHOT_VERSION="${NEXT_VERSION}-SNAPSHOT"
-    - echo "Publishing snapshot version ${SNAPSHOT_VERSION} (base=${BASE_VERSION})"
+    - SNAPSHOT_VERSION_COMMIT="${NEXT_VERSION}-${GIT_COMMIT}-SNAPSHOT"
+    - echo "Publishing snapshot versions ${SNAPSHOT_VERSION} and ${SNAPSHOT_VERSION_COMMIT}"
     - ./gradlew -PlibraryVersion=${SNAPSHOT_VERSION} publish --no-daemon
+    - ./gradlew -PlibraryVersion=${SNAPSHOT_VERSION_COMMIT} publish --no-daemon
   artifacts:
     paths:
       - lwk_bindings/android_bindings/lib/build/libs

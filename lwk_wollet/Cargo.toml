@@ -1,9 +1,10 @@
 [package]
 name = "lwk_wollet"
-version = "0.15.0"
+version = "0.16.0"
 edition = "2021"
 autotests = false
 description = "Liquid Wallet Kit - Watch-only wallet based on CT Descriptors"
+exclude = ["tests/", "benches/"]
 license = "MIT OR BSD-2-Clause"
 documentation = "https://docs.rs/lwk_wollet"
 
@@ -123,6 +124,7 @@ test_wallet = ["lwk_signer"]
 amp2 = ["reqwest"]
 amp0 = [
     "tokio-tungstenite",
+    "reqwest",
     "scrypt",
     "pbkdf2",
     "sha2",

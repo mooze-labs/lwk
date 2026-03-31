@@ -11,7 +11,9 @@ use boltz_client::boltz::{
 };
 use boltz_client::fees::Fee;
 use boltz_client::network::Chain;
-use boltz_client::swaps::{ChainClient, SwapScript, SwapTransactionParams, TransactionOptions};
+use boltz_client::swaps::{
+    BtcLikeTransaction, ChainClient, SwapScript, SwapTransactionParams, TransactionOptions,
+};
 use boltz_client::util::sleep;
 use boltz_client::PublicKey;
 use lwk_wollet::bitcoin::PublicKey as BitcoinPublicKey;
@@ -220,6 +222,7 @@ impl BoltzSession {
                 random_preimage: self.random_preimages,
                 claim_txid: None,
                 lockup_txid: None,
+                refund_txid: None,
             },
             lockup_script,
             claim_script,
@@ -513,8 +516,9 @@ pub(crate) fn convert_swap_restore_response_to_chain_swap_data(
         from_chain,
         to_chain,
         random_preimage: false, // when trying to restore from boltz only deterministic preimage are supported
-        claim_txid: claim_details.transaction.as_ref().map(|t| t.id.clone()),
-        lockup_txid: None, // populated if available in restore_lockup
+        claim_txid: None, // claim_details.transaction is the lockup tx, boltz don't track claim tx
+        lockup_txid: refund_details.transaction.as_ref().map(|e| e.id.clone()),
+        refund_txid: None, // boltz don't track refund tx
     })
 }
 
@@ -526,6 +530,11 @@ impl LockupResponse {
     /// The txid of the user lockup transaction of the swap
     pub fn lockup_txid(&self) -> Option<&str> {
         self.data.lockup_txid.as_deref()
+    }
+
+    /// The txid of the refund transaction of the swap
+    pub fn refund_txid(&self) -> Option<&str> {
+        self.data.refund_txid.as_deref()
     }
 
     /// Optionally set the lockup transaction txid.
@@ -546,6 +555,10 @@ impl LockupResponse {
 
     pub fn lockup_address(&self) -> &str {
         &self.data.lockup_address
+    }
+
+    pub fn claim_address(&self) -> &str {
+        &self.data.claim_address
     }
 
     pub fn expected_amount(&self) -> u64 {
@@ -583,7 +596,7 @@ impl LockupResponse {
         self.data.boltz_fee
     }
 
-    async fn build_and_broadcast_refund(&self) -> Result<(), Error> {
+    async fn build_and_broadcast_refund(&mut self) -> Result<(), Error> {
         sleep(WAIT_TIME).await;
         let tx = self
             .lockup_script
@@ -598,6 +611,7 @@ impl LockupResponse {
             })
             .await?;
         let txid = broadcast_tx_with_retry(&self.chain_client, &tx).await?;
+        self.data.refund_txid = Some(txid.clone());
         log::info!("Refund transaction broadcasted: {txid}");
         Ok(())
     }
@@ -609,13 +623,17 @@ impl LockupResponse {
         let flow = match update_status {
             SwapState::SwapCreated => Ok(ControlFlow::Continue(update)),
             SwapState::TransactionMempool => {
-                self.data.lockup_txid = update.transaction.as_ref().map(|tx| tx.id.clone());
-                log::info!("User lockup in mempool");
+                let lockup_txid = update.transaction.as_ref().map(|tx| tx.id.clone());
+                log::info!("User lockup in mempool {lockup_txid:?}");
+                self.data.lockup_txid = lockup_txid;
                 Ok(ControlFlow::Continue(update))
             }
             SwapState::TransactionConfirmed => {
-                self.data.lockup_txid = update.transaction.as_ref().map(|tx| tx.id.clone());
-                log::info!("User lockup confirmed, waiting for server lockup");
+                let lockup_txid = update.transaction.as_ref().map(|tx| tx.id.clone());
+                log::info!("User lockup confirmed {lockup_txid:?}, waiting for server lockup");
+                if self.data.lockup_txid.is_none() {
+                    self.data.lockup_txid = lockup_txid;
+                }
                 Ok(ControlFlow::Continue(update))
             }
             SwapState::ServerTransactionMempool => {
@@ -623,11 +641,6 @@ impl LockupResponse {
                 Ok(ControlFlow::Continue(update))
             }
             SwapState::ServerTransactionConfirmed => {
-                log::info!(
-                    "Server lockup confirmed, claiming on {} chain",
-                    self.chain_to()
-                );
-
                 // Parse the server's lockup transaction from the status update if available.
                 // This avoids waiting for the transaction to propagate to the chain client's mempool,
                 // significantly improving claim speed.
@@ -654,59 +667,34 @@ impl LockupResponse {
                     sleep(WAIT_TIME).await;
                 }
 
-                // Build options with lockup_tx if available for faster claiming
-                let options = match lockup_tx {
-                    Some(tx) => TransactionOptions::default()
-                        .with_chain_claim(self.data.refund_keys, self.lockup_script.clone())
-                        .with_lockup_tx(tx),
-                    None => TransactionOptions::default()
-                        .with_chain_claim(self.data.refund_keys, self.lockup_script.clone()),
-                };
-
-                // Use the claim fee from Boltz API to match the quoted amount exactly.
-                // For Liquid claims (BTC→L-BTC), add LIQUID_UNCOOPERATIVE_EXTRA as buffer.
-                // Fall back to Fee::Relative if claim_fee is not available (e.g., restored swaps).
-                let fee = match self.data.claim_fee {
-                    Some(claim_fee) => {
-                        // Add extra for Liquid claims only (to_chain is Liquid)
-                        let extra = if matches!(self.data.to_chain, Chain::Liquid(_)) {
-                            LIQUID_UNCOOPERATIVE_EXTRA
-                        } else {
-                            0
-                        };
-                        Fee::Absolute(claim_fee + extra)
-                    }
-                    None => Fee::Relative(1.0),
-                };
-
-                let tx = self
-                    .claim_script
-                    .construct_claim(
-                        &self.data.preimage,
-                        SwapTransactionParams {
-                            keys: self.data.claim_keys,
-                            output_address: self.data.claim_address.clone(),
-                            fee,
-                            swap_id: self.swap_id().to_string(),
-                            chain_client: &self.chain_client,
-                            boltz_client: &self.api,
-                            options: Some(options),
-                        },
-                    )
-                    .await?;
-                let txid = broadcast_tx_with_retry(&self.chain_client, &tx).await?;
-                self.data.claim_txid = Some(txid);
-                log::info!("Claim transaction broadcasted successfully");
+                // Attempt cooperative (key path) claim
+                self.build_and_broadcast_claim(true, lockup_tx).await?;
                 Ok(ControlFlow::Continue(update))
             }
             SwapState::TransactionClaimed => {
+                // Boltz has claimed the user's lockup, but we still need to claim from Boltz's lockup
                 if self.data.lockup_txid.is_none() {
                     log::warn!("transaction.claimed but lockup_txid is not set, fetching it");
                     self.data.lockup_txid =
                         fetch_lockup_txid(self.api.as_ref(), self.swap_id()).await;
                 }
-                log::info!("Swap claimed successfully");
-                Ok(ControlFlow::Break(true))
+
+                // Check if we've already claimed our funds
+                if self.data.claim_txid.is_some() {
+                    log::info!("User already claimed their funds, swap completed successfully");
+                    Ok(ControlFlow::Break(true))
+                } else {
+                    // Boltz has already claimed, so we can't use cooperative claiming
+                    // We need to claim via script path instead
+                    log::warn!(
+                        "Boltz has already claimed (transaction.claimed), attempting non-cooperative claim via script path"
+                    );
+
+                    // Attempt non-cooperative (script path) claim
+                    self.build_and_broadcast_claim(false, None).await?;
+
+                    Ok(ControlFlow::Break(true))
+                }
             }
             SwapState::TransactionLockupFailed => {
                 log::warn!("User lockup failed, performing refund");
@@ -764,6 +752,86 @@ impl LockupResponse {
         }
 
         flow
+    }
+
+    /// Construct and broadcast claim transaction
+    ///
+    /// # Arguments
+    /// * `cooperative` - If true, attempts cooperative (key path) claim with Boltz's signature.
+    ///                   If false, uses script path claim (required when Boltz already claimed).
+    /// * `lockup_tx` - Optional pre-fetched lockup transaction. If None, will be fetched from chain.
+    async fn build_and_broadcast_claim(
+        &mut self,
+        cooperative: bool,
+        lockup_tx: Option<BtcLikeTransaction>,
+    ) -> Result<String, Error> {
+        log::info!(
+            "Claiming on {} chain (cooperative: {})",
+            self.chain_to(),
+            cooperative
+        );
+
+        // Build options with or without lockup_tx
+        let options = match lockup_tx {
+            Some(tx) => TransactionOptions::default()
+                .with_chain_claim(self.data.refund_keys, self.lockup_script.clone())
+                .with_cooperative(cooperative)
+                .with_lockup_tx(tx),
+            None => TransactionOptions::default()
+                .with_chain_claim(self.data.refund_keys, self.lockup_script.clone())
+                .with_cooperative(cooperative),
+        };
+
+        // Use the claim fee from Boltz API to match the quoted amount exactly.
+        // For Liquid claims (BTC→L-BTC), add LIQUID_UNCOOPERATIVE_EXTRA as buffer.
+        // Fall back to Fee::Relative if claim_fee is not available (e.g., restored swaps).
+        let fee = match self.data.claim_fee {
+            Some(claim_fee) => {
+                // Add extra for Liquid claims only (to_chain is Liquid)
+                let extra = if matches!(self.data.to_chain, Chain::Liquid(_)) {
+                    LIQUID_UNCOOPERATIVE_EXTRA
+                } else {
+                    0
+                };
+                Fee::Absolute(claim_fee + extra)
+            }
+            None => Fee::Relative(1.0),
+        };
+
+        let tx = self
+            .claim_script
+            .construct_claim(
+                &self.data.preimage,
+                SwapTransactionParams {
+                    keys: self.data.claim_keys,
+                    output_address: self.data.claim_address.clone(),
+                    fee,
+                    swap_id: self.swap_id().to_string(),
+                    chain_client: &self.chain_client,
+                    boltz_client: &self.api,
+                    options: Some(options),
+                },
+            )
+            .await?;
+
+        #[cfg(debug_assertions)]
+        {
+            // Simulate app crash AFTER construct_claim (preimage revealed to Boltz)
+            // but BEFORE broadcast_tx (user never gets funds)
+            // Only compiled in debug builds, excluded from release builds
+            if std::env::var("LWKBOLTZ_TEST_CRASH_AFTER_CONSTRUCT").is_ok() {
+                log::warn!("TEST: Simulating crash AFTER construct_claim, BEFORE broadcast");
+
+                return Err(Error::Generic(
+                    "Simulated crash after construct_claim for testing".to_string(),
+                ));
+            }
+        }
+
+        let txid = broadcast_tx_with_retry(&self.chain_client, &tx).await?;
+        self.data.claim_txid = Some(txid.clone());
+        log::info!("Claim transaction broadcasted successfully: {}", txid);
+        Ok(txid)
     }
 
     pub async fn complete(mut self) -> Result<bool, Error> {

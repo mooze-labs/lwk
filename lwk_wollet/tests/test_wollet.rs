@@ -57,6 +57,23 @@ pub fn wait_for_tx<S: BlockchainBackend>(wollet: &mut Wollet, client: &mut S, tx
     panic!("Wallet does not have {txid} in its list");
 }
 
+pub fn wait_for_tx_confirmation<S: BlockchainBackend>(
+    wollet: &mut Wollet,
+    client: &mut S,
+    txid: &Txid,
+) {
+    for _ in 0..10 {
+        sync(wollet, client);
+        if let Some(tx) = wollet.transaction(txid).unwrap() {
+            if tx.height.is_some() {
+                return;
+            }
+        }
+        thread::sleep(Duration::from_millis(500));
+    }
+    panic!("Tx is not confirmed");
+}
+
 impl<C: BlockchainBackend> TestWollet<C> {
     pub fn new(mut client: C, desc: &str) -> Self {
         let db_root_dir = TempDir::new().unwrap();
@@ -103,8 +120,8 @@ impl<C: BlockchainBackend> TestWollet<C> {
         self.wollet.tx_builder()
     }
 
-    pub fn db_root_dir(self) -> TempDir {
-        self.db_root_dir
+    pub fn path(&self) -> std::path::PathBuf {
+        self.db_root_dir.path().to_owned()
     }
 
     pub fn policy_asset(&self) -> AssetId {
@@ -174,7 +191,7 @@ impl<C: BlockchainBackend> TestWollet<C> {
         satoshi: u64,
         address: Option<Address>,
         asset: Option<AssetId>,
-    ) {
+    ) -> Txid {
         let utxos_before = self.wollet.utxos().unwrap().len();
         let balance_before = self.balance(&asset.unwrap_or(self.policy_asset()));
 
@@ -194,10 +211,11 @@ impl<C: BlockchainBackend> TestWollet<C> {
         let balance_after = self.balance(&asset.unwrap_or(self.policy_asset()));
         assert_eq!(utxos_after, utxos_before + 1);
         assert_eq!(balance_before + satoshi, balance_after);
+        txid
     }
 
-    pub fn fund_btc(&mut self, env: &TestEnv) {
-        self.fund(env, 1_000_000, Some(self.address()), None);
+    pub fn fund_btc(&mut self, env: &TestEnv) -> Txid {
+        self.fund(env, 1_000_000, Some(self.address()), None)
     }
 
     pub fn fund_asset(&mut self, env: &TestEnv) -> AssetId {
@@ -236,7 +254,7 @@ impl<C: BlockchainBackend> TestWollet<C> {
         signers: &[&AnySigner],
         fee_rate: Option<f32>,
         external: Option<(Address, u64)>,
-    ) {
+    ) -> Txid {
         let balance_before = self.balance_btc();
 
         let recipient = external.clone().unwrap_or((self.address(), 10_000));
@@ -292,6 +310,7 @@ impl<C: BlockchainBackend> TestWollet<C> {
                 }
                 true
             });
+        txid
     }
 
     /// Send all L-BTC
@@ -653,7 +672,7 @@ impl<C: BlockchainBackend> TestWollet<C> {
         let descriptor = wollet.wollet.descriptor().unwrap().to_string();
         let expected_updates = wollet.wollet.updates().unwrap();
         let expected = wollet.wollet.balance().unwrap();
-        let db_root_dir = wollet.db_root_dir();
+        let db_root_dir = wollet.path();
         let network = ElementsNetwork::default_regtest();
 
         for _ in 0..2 {

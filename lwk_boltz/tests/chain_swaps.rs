@@ -1,3 +1,4 @@
+#[macro_use]
 mod utils;
 
 #[cfg(test)]
@@ -20,15 +21,16 @@ mod tests {
     use boltz_client::PublicKey;
     use boltz_client::Secp256k1;
     use boltz_client::{Amount, Keypair};
-    use lwk_boltz::SwapPersistence;
     use lwk_boltz::{
         clients::{AnyClient, ElectrumClient},
         BoltzSession, SwapAsset, LIQUID_UNCOOPERATIVE_EXTRA,
     };
+    use lwk_boltz::{SwapPersistence, SwapState};
     use lwk_wollet::bitcoin;
     use lwk_wollet::elements;
     use lwk_wollet::secp256k1::rand::thread_rng;
     use lwk_wollet::ElementsNetwork;
+    use std::ops::ControlFlow;
     use std::str::FromStr;
     use std::sync::Arc;
     use std::time::Duration;
@@ -261,7 +263,7 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires regtest environment"]
-    async fn test_session_restore_chain_swaps() {
+    async fn test_session_restore_chain_swaps_base() {
         let _ = env_logger::try_init();
 
         // Start concurrent block mining task
@@ -304,6 +306,7 @@ mod tests {
         let serialized_data = response.serialize().unwrap();
         let lockup_address = response.lockup_address().to_string();
         let expected_amount = response.expected_amount();
+        assert_eq!(response.claim_address(), claim_address_str);
         drop(response);
         drop(session);
 
@@ -609,6 +612,7 @@ mod tests {
         let serialized_data = response.serialize().unwrap();
         let lockup_address = response.lockup_address().to_string();
         let expected_amount = response.expected_amount();
+        assert_eq!(response.claim_address(), claim_address_str);
         drop(response);
         drop(session);
 
@@ -867,6 +871,8 @@ mod tests {
             .await
             .unwrap();
 
+        assert_eq!(response.claim_address(), claim_address_str);
+
         // Verify quote matches swap response
         // For chain swaps: user sends lockup_amount, receives claim_details.amount - claim_fee
         let claim_fee = response.data.claim_fee.expect("claim_fee should be set");
@@ -1074,19 +1080,7 @@ mod tests {
         )
         .await
         .unwrap();
-        loop {
-            match response.advance().await {
-                Ok(std::ops::ControlFlow::Continue(_)) => {}
-                Ok(std::ops::ControlFlow::Break(result)) => {
-                    log::info!("Payment completed with result: {result}");
-                    assert!(result, "Payment should succeed");
-                    break;
-                }
-                Err(e) => {
-                    panic!("Unexpected error: {e}");
-                }
-            }
-        }
+        advance_until_complete!(response, true);
         // repeatly calling advance on a terminated swap don't timeout
         for _ in 0..10 {
             match response.advance().await {
@@ -1135,25 +1129,108 @@ mod tests {
         .unwrap();
 
         // Poll for updates until swap is complete
-        loop {
-            match response.advance().await {
-                Ok(std::ops::ControlFlow::Continue(update)) => {
-                    log::info!("Polling: Received update. status:{}", update.status);
-                }
-                Ok(std::ops::ControlFlow::Break(result)) => {
-                    log::info!("Polling: Swap completed with result: {result}");
-                    assert!(result, "Polling swap should succeed");
-                    break;
-                }
-                Err(lwk_boltz::Error::NoBoltzUpdate) => {
-                    log::info!("Polling: No update available, sleeping and retrying...");
-                    sleep(Duration::from_secs(1)).await;
-                }
-                Err(e) => {
-                    panic!("Polling: Unexpected error: {e}");
-                }
-            }
-        }
+        advance_until_complete_polling!(response, true);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires regtest environment"]
+    async fn test_session_restore_chain_swaps_from_boltz() {
+        let _ = env_logger::try_init();
+
+        // Start concurrent block mining task
+        let mining_handle = crate::utils::start_block_mining();
+
+        let network = ElementsNetwork::default_regtest();
+        let client =
+            Arc::new(ElectrumClient::new(DEFAULT_REGTEST_NODE, false, false, network).unwrap());
+
+        let mnemonic = Mnemonic::from_str(
+            "damp cart merit asset obvious idea chef traffic absent armed road link",
+        )
+        .unwrap();
+
+        let session = BoltzSession::builder(network, AnyClient::Electrum(client.clone()))
+            .create_swap_timeout(TIMEOUT)
+            .mnemonic(mnemonic.clone())
+            .build()
+            .await
+            .unwrap();
+
+        // test restore swap after losing data
+        let refund_address_str = crate::utils::generate_address(BTC_CHAIN.into())
+            .await
+            .unwrap();
+        let claim_address_str = crate::utils::generate_address(LBTC_CHAIN.into())
+            .await
+            .unwrap();
+        let refund_address = bitcoin::Address::from_str(&refund_address_str)
+            .unwrap()
+            .assume_checked();
+        let claim_address = elements::Address::from_str(&claim_address_str).unwrap();
+
+        let mut response = session
+            .btc_to_lbtc(50_000, &refund_address, &claim_address, None)
+            .await
+            .unwrap();
+
+        let swap_id = response.swap_id().to_string();
+        let lockup_address = response.lockup_address().to_string();
+        let expected_amount = response.expected_amount();
+
+        crate::utils::send_to_address(BTC_CHAIN.into(), &lockup_address, expected_amount)
+            .await
+            .unwrap();
+
+        let _ = response.advance().await.unwrap();
+        let _ = response.advance().await.unwrap();
+
+        assert!(response.claim_txid().is_none());
+        assert!(response.lockup_txid().is_some());
+
+        let _ = response.advance().await.unwrap();
+        let _ = response.advance().await.unwrap();
+
+        assert!(response.claim_txid().is_some());
+        assert!(response.lockup_txid().is_some());
+        assert!(response.refund_txid().is_none()); // no refund in successful swap
+
+        // Save the lockup_txid before dropping to compare with restored version
+        let original_lockup_txid = response.lockup_txid().map(|s| s.to_string());
+
+        drop(session);
+
+        let session = BoltzSession::builder(network, AnyClient::Electrum(client.clone()))
+            .create_swap_timeout(TIMEOUT)
+            .mnemonic(mnemonic)
+            .build()
+            .await
+            .unwrap();
+
+        let swap_list = session.swap_restore().await.unwrap();
+
+        let mut restorable = session
+            .restorable_btc_to_lbtc_swaps(&swap_list, &claim_address, &refund_address)
+            .await
+            .unwrap();
+
+        let data = restorable.pop().unwrap();
+        let data: lwk_boltz::ChainSwapDataSerializable = data.into();
+        assert!(data.preimage.is_none());
+        let response_restored = session.restore_lockup(data).await.unwrap();
+        assert_eq!(swap_id, response_restored.swap_id());
+        assert!(response_restored.claim_txid().is_none()); // boltz doesn't store claim informations, thus we don't have this on restore
+        assert!(response_restored.lockup_txid().is_some());
+        assert!(response_restored.refund_txid().is_none()); // boltz doesn't store refund informations, thus we don't have this on restore
+
+        // Verify lockup_txid is preserved correctly after restore from Boltz
+        let restored_lockup_txid = response_restored.lockup_txid().map(|s| s.to_string());
+        assert_eq!(
+            original_lockup_txid, restored_lockup_txid,
+            "lockup_txid should match before and after restore from Boltz"
+        );
+
+        // Stop the mining task
+        mining_handle.abort();
     }
 
     #[tokio::test]
@@ -1234,8 +1311,16 @@ mod tests {
             .await
             .unwrap();
         let data = lwk_boltz::ChainSwapDataSerializable::deserialize(&serialized_data).unwrap();
-        response = session.restore_lockup(data).await.unwrap();
-        assert!(response.complete().await.unwrap());
+        let mut response = session.restore_lockup(data).await.unwrap();
+
+        // Use advance() instead of complete() so we can check refund_txid afterwards
+        advance_until_complete!(response, true);
+
+        // Verify refund txid was stored when refund transaction was broadcasted
+        assert!(
+            response.refund_txid().is_some(),
+            "refund_txid should be set after refund transaction is broadcasted"
+        );
 
         let refund_balance =
             crate::utils::get_address_balance(LBTC_CHAIN.into(), &refund_address_str)
@@ -1245,5 +1330,146 @@ mod tests {
             refund_balance > 0,
             "Expected refund address to receive funds, got {refund_balance} sats"
         );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires regtest environment"]
+    async fn test_lbtc_btc_skipped_server_confirmed() {
+        let _ = env_logger::try_init();
+
+        let mnemonic = Mnemonic::from_str(
+            "damp cart merit asset obvious idea chef traffic absent armed road link",
+        )
+        .unwrap();
+
+        let network = ElementsNetwork::default_regtest();
+        let client =
+            Arc::new(ElectrumClient::new(DEFAULT_REGTEST_NODE, false, false, network).unwrap());
+
+        let session = BoltzSession::builder(network, AnyClient::Electrum(client.clone()))
+            .create_swap_timeout(TIMEOUT)
+            .mnemonic(mnemonic.clone())
+            .build()
+            .await
+            .unwrap();
+
+        let refund_address_str = crate::utils::generate_address(LBTC_CHAIN.into())
+            .await
+            .unwrap();
+        let claim_address_str = crate::utils::generate_address(BTC_CHAIN.into())
+            .await
+            .unwrap();
+        let refund_address = elements::Address::from_str(&refund_address_str).unwrap();
+        let claim_address = bitcoin::Address::from_str(&claim_address_str)
+            .unwrap()
+            .assume_checked();
+
+        let mut response = session
+            .lbtc_to_btc(50_000, &refund_address, &claim_address, None)
+            .await
+            .unwrap();
+
+        log::info!(
+            "LBTC->BTC skipped server confirmed test - Lockup address: {}",
+            response.lockup_address()
+        );
+
+        // Send to lockup address
+        crate::utils::send_to_address(
+            LBTC_CHAIN.into(),
+            response.lockup_address(),
+            response.expected_amount(),
+        )
+        .await
+        .unwrap();
+
+        // Advance through states until we reach transaction.server.mempool
+        crate::utils::assert_next_continue_status(&mut response, "transaction.mempool").await;
+        crate::utils::mine_blocks(1).await.unwrap();
+        crate::utils::assert_next_continue_status(&mut response, "transaction.confirmed").await;
+        crate::utils::assert_next_continue_status(&mut response, "transaction.server.mempool")
+            .await;
+
+        // Mine one more block to confirm server lockup
+        crate::utils::mine_blocks(1).await.unwrap();
+
+        // Set env var to simulate crash AFTER construct_claim but BEFORE broadcast
+        // This simulates the case where Boltz receives the preimage but user never broadcasts
+        std::env::set_var("LWKBOLTZ_TEST_CRASH_AFTER_CONSTRUCT", "1");
+        log::info!("Set crash injection flag, next advance() should crash after construct_claim");
+
+        // Try to advance - this should hit ServerTransactionConfirmed, construct claim (revealing preimage), and "crash"
+        let crash_result = response.advance().await;
+        assert!(crash_result
+            .unwrap_err()
+            .to_string()
+            .contains("Simulated crash after construct_claim"));
+
+        // Verify we don't have a claim txid after the crash (never broadcast)
+        assert!(response.claim_txid().is_none());
+
+        // Serialize swap data and drop session (simulating app restart after crash)
+        let serialized_data = response.serialize().unwrap();
+        let swap_id = response.swap_id().to_string();
+
+        log::info!("Dropping session after simulated crash in swap {swap_id}");
+        log::info!(
+            "At this point: preimage was revealed to Boltz but user never broadcast claim tx"
+        );
+        drop(response);
+        drop(session);
+
+        // Unset the crash injection flag so restore can proceed normally
+        std::env::remove_var("LWKBOLTZ_TEST_CRASH_AFTER_CONSTRUCT");
+        log::info!("Removed crash injection flag");
+
+        // Mine a few more blocks to ensure we're past the server confirmation window
+        crate::utils::mine_blocks(5).await.unwrap();
+        sleep(Duration::from_secs(2)).await;
+
+        // Recreate session and restore the swap
+        log::info!("Recreating session and restoring swap");
+        let session = BoltzSession::builder(network, AnyClient::Electrum(client.clone()))
+            .create_swap_timeout(TIMEOUT)
+            .mnemonic(mnemonic.clone())
+            .build()
+            .await
+            .unwrap();
+
+        let data = lwk_boltz::ChainSwapDataSerializable::deserialize(&serialized_data).unwrap();
+        let mut response = session.restore_lockup(data).await.unwrap();
+
+        // State should still be ServerTransactionMempool (crash prevented state update)
+        // because we crashed before the state was persisted
+        assert_eq!(
+            response.data.last_state,
+            SwapState::ServerTransactionMempool
+        );
+        assert!(response.claim_txid().is_none());
+
+        log::info!("Restored swap state: {:?}", response.data.last_state);
+        log::info!("Waiting for Boltz to claim using the revealed preimage...");
+
+        // Give Boltz time to claim the user's lockup using the revealed preimage
+        sleep(Duration::from_secs(3)).await;
+
+        // We expect transaction.claimed status because Boltz claimed the user's lockup
+        let status = response.advance().await.unwrap();
+
+        assert_eq!(response.data.last_state, SwapState::TransactionClaimed);
+
+        // Swap result completed
+        assert!(matches!(status, ControlFlow::Break(true)));
+
+        // Check balance of claim address (BTC)
+        let claim_balance = crate::utils::get_address_balance(BTC_CHAIN.into(), &claim_address_str)
+            .await
+            .unwrap_or(0);
+
+        log::info!("Claim address balance: {} sats", claim_balance);
+
+        assert!(claim_balance > 0);
+
+        assert!(response.claim_txid().is_some(),);
     }
 }

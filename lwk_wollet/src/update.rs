@@ -337,9 +337,10 @@ impl Wollet {
         }
 
         cache.unblinded.extend(new_txs.unblinds);
-        cache.all_txs.extend(new_txs.txs);
-        cache.heights.retain(|k, _| !txid_height_delete.contains(k));
-        cache.heights.extend(txid_height_new.clone());
+        cache.extend_all_txs(new_txs.txs);
+        cache.update_heights(&txid_height_new, &txid_height_delete);
+        cache.rebuild_sorted_txids();
+        cache.update_unspent(&txid_height_new, &txid_height_delete);
         cache.timestamps.extend(timestamps);
         cache.scripts.extend(
             scripts_with_blinding_pubkey
@@ -355,8 +356,17 @@ impl Wollet {
         );
         let mut last_used_internal = None;
         let mut last_used_external = None;
-        for (txid, _) in txid_height_new {
-            if let Some(tx) = cache.all_txs.get(&txid) {
+        // Also include deleted txids: a tx that was seen and then deleted (e.g. a phantom tx
+        // applied locally but not confirmed on-chain) should still count as having used its
+        // addresses so those addresses are not reused. This matters for merged updates where
+        // phantom txids are removed from txid_height_new but still appear in txid_height_delete.
+        let txids_for_last_used: Vec<Txid> = txid_height_new
+            .into_iter()
+            .map(|(t, _)| t)
+            .chain(txid_height_delete.iter().copied())
+            .collect();
+        for txid in txids_for_last_used {
+            if let Some(tx) = cache.tx(&txid) {
                 for (vout, output) in tx.output.iter().enumerate() {
                     if !cache
                         .unblinded
@@ -439,7 +449,51 @@ impl Wollet {
             .map_err(|e| Error::Generic(format!("store error: {e}")))?;
         *next_index += 1;
 
+        *next_index = self.merge_updates(*next_index)?;
+
         Ok(())
+    }
+
+    pub(crate) fn merge_updates(&self, next_index: usize) -> Result<usize, Error> {
+        match self.merge_threshold {
+            Some(threshold) if threshold < next_index => (),
+            _ => return Ok(next_index), // Not merging
+        };
+
+        // Read and merge all persisted updates
+        let first_bytes = self
+            .store
+            .get(&update_key(0))
+            .map_err(|e| Error::Generic(format!("store error: {e}")))?
+            .ok_or_else(|| Error::Generic("expected update 0 to exist".into()))?;
+        let mut merged = Update::deserialize(&first_bytes)?;
+
+        for i in 1..next_index {
+            let bytes = self
+                .store
+                .get(&update_key(i))
+                .map_err(|e| Error::Generic(format!("store error: {e}")))?
+                .ok_or_else(|| Error::Generic(format!("expected update {i} to exist")))?;
+            merged.merge(Update::deserialize(&bytes)?);
+        }
+
+        // Delete all old updates from last to first to avoid holes on crash
+        for j in (0..next_index).rev() {
+            self.store
+                .remove(&update_key(j))
+                .map_err(|e| Error::Generic(format!("failed to remove update {j}: {e}")))?;
+        }
+        // A crash here or during the removal loop will leave the cache empty or at an old state,
+        // which is not the end of the world, the following scan will bring it back.
+
+        // Store the merged update as update 0
+        let merged_bytes = merged.serialize()?;
+        self.store
+            .put(&update_key(0), &merged_bytes)
+            .map_err(|e| Error::Generic(format!("failed to store merged update: {e}")))?;
+
+        let next_index = 1;
+        Ok(next_index)
     }
 
     /// Apply a transaction to the wallet state

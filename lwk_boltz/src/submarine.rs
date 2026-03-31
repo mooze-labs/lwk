@@ -11,6 +11,7 @@ use boltz_client::boltz::{
     SubSwapStates, SwapRestoreResponse, SwapRestoreType, SwapStatus, Webhook,
 };
 use boltz_client::fees::Fee;
+use boltz_client::network::Chain;
 use boltz_client::swaps::magic_routing::check_for_mrh;
 use boltz_client::swaps::{ChainClient, SwapScript, SwapTransactionParams};
 use boltz_client::util::sleep;
@@ -21,11 +22,10 @@ use lwk_wollet::elements;
 use crate::error::Error;
 use crate::prepare_pay_data::{to_prepare_pay_data, PreparePayData, PreparePayDataSerializable};
 use crate::swap_state::SwapStateTrait;
-use crate::DynStore;
 use crate::SwapPersistence;
 use crate::{
-    broadcast_tx_with_retry, mnemonic_identifier, next_status, BoltzSession, LightningPayment,
-    SwapState, SwapType,
+    broadcast_tx_with_retry, mnemonic_identifier, next_status, BoltzSession, DynStore, Invoice,
+    LightningPayment, SwapState, SwapType,
 };
 
 pub struct PreparePayResponse {
@@ -75,15 +75,29 @@ impl BoltzSession {
     ) -> Result<PreparePayResponse, Error> {
         let chain = self.chain();
 
-        let (bolt11_invoice_str, bolt11_invoice) = match lightning_payment {
-            LightningPayment::Bolt11(invoice) => (invoice.to_string(), invoice),
-            LightningPayment::Bolt12(_) => {
-                return Err(Error::Bolt12Unsupported);
+        let invoice = match lightning_payment {
+            LightningPayment::Bolt11(invoice) => {
+                Invoice::Bolt11(Box::new(invoice.as_ref().clone()))
+            }
+            LightningPayment::Bolt12 {
+                offer,
+                invoice_amount,
+            } => {
+                match invoice_amount {
+                    Some(invoice_amount_msats) => {
+                        let amount_sats = invoice_amount_msats / 1000;
+                        log::info!("Preparing to pay {} sats", amount_sats);
+                        let bolt12_invoice = self.fetch_bolt12_invoice(offer, amount_sats).await?;
+                        Invoice::Bolt12(Box::new(bolt12_invoice))
+                    }
+                    None => return Err(Error::Generic("Amount is required".to_string())), // TODO use appropriate variant
+                }
             }
             LightningPayment::LnUrl(_) => {
                 return Err(Error::LnUrlUnsupported);
             }
         };
+        let invoice_str = invoice.to_string();
         let webhook_str = format!("{webhook:?}");
 
         let (key_index, our_keys) = self.derive_next_keypair()?;
@@ -92,26 +106,28 @@ impl BoltzSession {
             compressed: true,
         };
 
-        if let Some((address, amount)) =
-            check_for_mrh(&self.api, &bolt11_invoice_str, chain).await?
-        {
-            let asset_id = self.network().policy_asset().to_string();
-            let mrh_uri = format!(
-                "liquidnetwork:{address}?amount={}&assetid={}",
-                amount.to_string_in(Denomination::Bitcoin),
-                asset_id
-            );
-            return Err(Error::MagicRoutingHint {
-                address: address.to_string(),
-                amount: amount.to_sat(),
-                uri: mrh_uri,
-            });
+        if invoice.is_bolt11() {
+            // mrh works only with bolt11
+
+            if let Some((address, amount)) = check_for_mrh(&self.api, &invoice_str, chain).await? {
+                let asset_id = self.network().policy_asset().to_string();
+                let mrh_uri = format!(
+                    "liquidnetwork:{address}?amount={}&assetid={}",
+                    amount.to_string_in(Denomination::Bitcoin),
+                    asset_id
+                );
+                return Err(Error::MagicRoutingHint {
+                    address: address.to_string(),
+                    amount: amount.to_sat(),
+                    uri: mrh_uri,
+                });
+            }
         }
 
         let create_swap_req = CreateSubmarineRequest {
             from: chain.to_string(),
             to: "BTC".to_string(),
-            invoice: bolt11_invoice_str.clone(),
+            invoice: invoice_str.clone(),
             refund_public_key,
             pair_hash: None,
             referral_id: self.referral_id.clone(),
@@ -123,16 +139,13 @@ impl BoltzSession {
             "accept zero conf: {}",
             create_swap_response.accept_zero_conf
         );
-        let bolt11_amount = bolt11_invoice
-            .amount_milli_satoshis()
-            .ok_or(Error::InvoiceWithoutAmount(bolt11_invoice_str.clone()))?
-            / 1000;
+        let bolt11_amount = invoice.amount_sats()?;
         let fee = create_swap_response
             .expected_amount
             .checked_sub(bolt11_amount)
             .ok_or(Error::ExpectedAmountLowerThanInvoice(
                 create_swap_response.expected_amount,
-                bolt11_invoice_str.clone(),
+                invoice_str.clone(),
             ))?;
 
         let boltz_fee = self
@@ -145,7 +158,8 @@ impl BoltzSession {
 
         log::info!("Got Swap Response from Boltz server {create_swap_response:?}");
 
-        create_swap_response.validate(&bolt11_invoice_str, &refund_public_key, chain)?;
+        // Validate for both BOLT11 and BOLT12 (BOLT12 only supported for Liquid)
+        validate_submarine_swap(&invoice, &create_swap_response, &refund_public_key, chain)?;
         log::info!("VALIDATED RESPONSE!");
 
         let swap_script =
@@ -181,9 +195,11 @@ impl BoltzSession {
                 last_state: SwapState::InvoiceSet,
                 swap_type: SwapType::Submarine,
                 lockup_txid: None,
+                refund_txid: None,
                 fee: Some(fee),
                 boltz_fee,
-                bolt11_invoice: Some((**bolt11_invoice).clone()),
+                bolt11_invoice: invoice.bolt11().cloned(),
+                bolt12_invoice: invoice.bolt12().cloned(),
                 our_keys,
                 refund_address: refund_address.to_string(),
                 create_swap_response: create_swap_response.clone(),
@@ -292,6 +308,61 @@ async fn fetch_lockup_txid(api: &BoltzApiClientV2, swap_id: &str) -> Option<Stri
     }
 }
 
+/// Validate submarine swap for both BOLT11 and BOLT12 invoices
+///
+/// This is similar to the external crate's validate() but with BOLT12 support for Liquid chain.
+fn validate_submarine_swap(
+    invoice: &Invoice,
+    create_swap_response: &CreateSubmarineResponse,
+    refund_public_key: &PublicKey,
+    chain: Chain,
+) -> Result<(), Error> {
+    match (invoice, chain) {
+        (Invoice::Bolt11(bolt11), _) => {
+            // Use the external crate's validation for BOLT11
+            create_swap_response.validate(&bolt11.to_string(), refund_public_key, chain)?;
+            Ok(())
+        }
+        (Invoice::Bolt12(_), Chain::Bitcoin(_)) => {
+            // BOLT12 validation not supported for Bitcoin chain yet
+            Err(Error::Generic(
+                "BOLT12 validation not supported for Bitcoin chain".to_string(),
+            ))
+        }
+        (Invoice::Bolt12(bolt12), Chain::Liquid(liquid_chain)) => {
+            // BOLT12 validation for Liquid chain
+            use boltz_client::swaps::liquid::LBtcSwapScript;
+            use lwk_wollet::hashes::{ripemd160, Hash};
+
+            let payment_hash = bolt12.payment_hash();
+
+            // Compute hashlock from payment hash
+            // The relationship is: hash160(preimage) = RIPEMD160(SHA256(preimage))
+            // Since payment_hash = SHA256(preimage), we have:
+            // hashlock = RIPEMD160(payment_hash)
+            let hashlock_computed = ripemd160::Hash::hash(&payment_hash.0);
+
+            // Create swap script to get the hashlock
+            let swap_script =
+                LBtcSwapScript::submarine_from_swap_resp(create_swap_response, *refund_public_key)?;
+
+            // This ensures Boltz can only claim the funds if they successfully pay the invoice
+            if swap_script.hashlock.to_string() != hashlock_computed.to_string() {
+                return Err(Error::Generic(format!(
+                    "Hash160 mismatch for BOLT12: expected {}, got {}",
+                    swap_script.hashlock, hashlock_computed
+                )));
+            }
+
+            // Validate address
+            swap_script.validate_address(liquid_chain, create_swap_response.address.clone())?;
+
+            log::info!("BOLT12 invoice validated successfully for Liquid chain");
+            Ok(())
+        }
+    }
+}
+
 pub(crate) fn convert_swap_restore_response_to_prepare_pay_data(
     e: &boltz_client::boltz::SwapRestoreResponse,
     mnemonic: &Mnemonic,
@@ -353,8 +424,10 @@ pub(crate) fn convert_swap_restore_response_to_prepare_pay_data(
         last_state,
         swap_type: SwapType::Submarine,
         lockup_txid: None,
+        refund_txid: None,
         fee: None,            // Fee information not available in restore response
         bolt11_invoice: None, // Invoice information not available in restore response
+        bolt12_invoice: None, // Invoice information not available in restore response
         our_keys,
         refund_address: refund_address.to_string(),
         create_swap_response,
@@ -375,16 +448,21 @@ impl PreparePayResponse {
         update: SwapStatus,
     ) -> Result<ControlFlow<bool, SwapStatus>, Error> {
         log::info!("submarine_cooperative_claim");
-        if let Some(bolt_11_invoice) = &self.data.bolt11_invoice {
+
+        let invoice_str = if let Some(bolt11) = &self.data.bolt11_invoice {
+            Some(bolt11.to_string())
+        } else {
+            self.data
+                .bolt12_invoice
+                .as_ref()
+                .map(crate::display_bolt12_invoice)
+        };
+
+        if let Some(invoice_str) = invoice_str {
             let swap_id = self.swap_id().to_string();
             let response = self
                 .swap_script
-                .submarine_cooperative_claim(
-                    &swap_id,
-                    &self.data.our_keys,
-                    &bolt_11_invoice.to_string(),
-                    &self.api,
-                )
+                .submarine_cooperative_claim(&swap_id, &self.data.our_keys, &invoice_str, &self.api)
                 .await;
 
             match response {
@@ -417,15 +495,43 @@ impl PreparePayResponse {
         let flow = match update_status {
             SwapState::InvoiceSet => Ok(ControlFlow::Continue(update)),
             SwapState::TransactionMempool => {
-                self.data.lockup_txid = update.transaction.as_ref().map(|tx| tx.id.clone());
-                log::info!("transaction.mempool Boltz broadcasted funding tx");
+                let lockup_txid = update.transaction.as_ref().map(|tx| tx.id.clone());
+                log::info!("transaction.mempool Boltz broadcasted funding tx {lockup_txid:?}");
+                self.data.lockup_txid = lockup_txid;
                 Ok(ControlFlow::Continue(update))
             }
-            SwapState::TransactionLockupFailed | SwapState::InvoiceFailedToPay => {
+            SwapState::InvoiceFailedToPay => {
+                log::warn!("invoice.failedToPay Boltz failed to pay the invoice");
+                let addr = self.uri_address()?;
+                let utxo = self
+                    .chain_client
+                    .liquid_client()
+                    .ok_or(Error::MissingLiquidClient)?
+                    .get_address_utxo(&addr)
+                    .await?;
+
+                match utxo {
+                    Some(_) => {
+                        // UTXO exists, make refund transaction
+                        let tx = self.make_refund_tx_with_retry().await?;
+                        let txid = broadcast_tx_with_retry(&self.chain_client, &tx).await?;
+                        self.data.refund_txid = Some(txid.clone());
+                        log::info!("Cooperative Refund Successfully broadcasted: {txid}");
+                        Ok(ControlFlow::Break(true))
+                    }
+                    None => {
+                        // No UTXO found, funds were not sent, consider the swap failed but completed
+                        log::warn!("No UTXO found at address, invoice payment failed without funds being sent");
+                        Ok(ControlFlow::Break(false))
+                    }
+                }
+            }
+            SwapState::TransactionLockupFailed => {
                 log::warn!("transaction.lockupFailed Boltz failed to lockup funding tx");
                 let tx = self.make_refund_tx_with_retry().await?;
 
                 let txid = broadcast_tx_with_retry(&self.chain_client, &tx).await?;
+                self.data.refund_txid = Some(txid.clone());
                 log::info!("Cooperative Refund Successfully broadcasted: {txid}");
 
                 Ok(ControlFlow::Break(true))
@@ -558,6 +664,11 @@ impl PreparePayResponse {
     /// The txid of the lockup transaction
     pub fn lockup_txid(&self) -> Option<&str> {
         self.data.lockup_txid.as_deref()
+    }
+
+    /// The txid of the refund transaction
+    pub fn refund_txid(&self) -> Option<&str> {
+        self.data.refund_txid.as_deref()
     }
 
     /// Optionally set the lockup transaction txid.

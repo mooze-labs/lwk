@@ -328,14 +328,14 @@ impl BoltzSession {
         let client = match builder.client.as_ref() {
             AnyClient::Electrum(client) => {
                 let boltz_client = lwk_boltz::clients::ElectrumClient::from_client(
-                    client.clone_client().expect("TODO"),
+                    client.clone_client()?,
                     network_value,
                 );
                 lwk_boltz::clients::AnyClient::Electrum(Arc::new(boltz_client))
             }
             AnyClient::Esplora(client) => {
                 let boltz_client = lwk_boltz::clients::EsploraClient::from_client(
-                    Arc::new(client.clone_async_client().expect("TODO")),
+                    Arc::new(client.clone_async_client()?),
                     network_value,
                 );
                 lwk_boltz::clients::AnyClient::Esplora(Arc::new(boltz_client))
@@ -403,9 +403,11 @@ impl BoltzSession {
                 hash_swap_id: None,
                 status,
             });
-        let response =
-            self.inner
-                .prepare_pay(lightning_payment.as_ref(), refund_address.as_ref(), webhook)?;
+        let response = self.inner.prepare_pay(
+            &lightning_payment.clone()?,
+            refund_address.as_ref(),
+            webhook,
+        )?;
 
         Ok(PreparePayResponse {
             inner: Mutex::new(Some(response)),
@@ -842,6 +844,17 @@ impl PreparePayResponse {
             .map(|txid| txid.to_string()))
     }
 
+    /// The txid of the refund transaction of the swap
+    pub fn refund_txid(&self) -> Result<Option<String>, LwkError> {
+        Ok(self
+            .inner
+            .lock()?
+            .as_ref()
+            .ok_or(LwkError::ObjectConsumed)?
+            .refund_txid()
+            .map(|txid| txid.to_string()))
+    }
+
     /// Optionally set the lockup transaction txid.
     ///
     /// This can be useful when the app creates and broadcasts the lockup transaction and wants to
@@ -939,6 +952,17 @@ impl InvoiceResponse {
             .map(|txid| txid.to_string()))
     }
 
+    /// The txid of the lockup transaction of the swap (made by Boltz)
+    pub fn lockup_txid(&self) -> Result<Option<String>, LwkError> {
+        Ok(self
+            .inner
+            .lock()?
+            .as_ref()
+            .ok_or(LwkError::ObjectConsumed)?
+            .lockup_txid()
+            .map(|txid| txid.to_string()))
+    }
+
     /// Serialize the prepare pay response data to a json string
     ///
     /// This can be used to restore the prepare pay response after a crash
@@ -1001,6 +1025,16 @@ impl LockupResponse {
             .as_ref()
             .ok_or(LwkError::ObjectConsumed)?
             .lockup_address()
+            .to_string())
+    }
+
+    pub fn claim_address(&self) -> Result<String, LwkError> {
+        Ok(self
+            .inner
+            .lock()?
+            .as_ref()
+            .ok_or(LwkError::ObjectConsumed)?
+            .claim_address()
             .to_string())
     }
 
@@ -1087,6 +1121,17 @@ impl LockupResponse {
             .as_ref()
             .ok_or(LwkError::ObjectConsumed)?
             .lockup_txid()
+            .map(|txid| txid.to_string()))
+    }
+
+    /// The txid of the refund transaction of the swap
+    pub fn refund_txid(&self) -> Result<Option<String>, LwkError> {
+        Ok(self
+            .inner
+            .lock()?
+            .as_ref()
+            .ok_or(LwkError::ObjectConsumed)?
+            .refund_txid()
             .map(|txid| txid.to_string()))
     }
 

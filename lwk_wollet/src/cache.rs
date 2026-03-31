@@ -14,7 +14,10 @@ pub type Timestamp = u32;
 /// It is fully reconstructable from the CT Descriptor and the blockchain.
 pub struct Cache {
     /// contains all my tx and all prevouts
-    pub all_txs: HashMap<Txid, Transaction>,
+    all_txs: HashMap<Txid, Transaction>,
+
+    /// Dummy txs for utxo only mode
+    dummy_txids: HashSet<Txid>,
 
     /// contains all my script up to an empty batch of BATCHSIZE
     pub paths: HashMap<Script, (Chain, ChildNumber)>,
@@ -23,7 +26,13 @@ pub struct Cache {
     pub scripts: HashMap<(Chain, ChildNumber), (Script, Option<BlindingPublicKey>)>,
 
     /// contains only my wallet txs with the relative heights (None if unconfirmed)
-    pub heights: HashMap<Txid, Option<Height>>,
+    heights: HashMap<Txid, Option<Height>>,
+
+    /// txids sorted by height descending, then txid descending (unconfirmed first)
+    sorted_txids: Vec<Txid>,
+
+    /// Wallet unspent outpoints
+    unspent: HashSet<OutPoint>,
 
     /// unblinded values
     pub unblinded: HashMap<OutPoint, TxOutSecrets>,
@@ -45,9 +54,12 @@ impl Default for Cache {
     fn default() -> Self {
         Self {
             all_txs: HashMap::default(),
+            dummy_txids: HashSet::default(),
             paths: HashMap::default(),
             scripts: HashMap::default(),
             heights: HashMap::default(),
+            sorted_txids: vec![],
+            unspent: HashSet::new(),
             unblinded: HashMap::default(),
             tip: (0, BlockHash::all_zeros()),
             last_unused_internal: 0.into(),
@@ -147,7 +159,7 @@ impl Cache {
         Ok(result)
     }
 
-    pub(crate) fn get_or_derive(
+    pub fn get_or_derive(
         &self,
         ext_int: Chain,
         child: ChildNumber,
@@ -165,24 +177,112 @@ impl Cache {
         Ok((script, blinding_pubkey, cached))
     }
 
-    pub fn spent(&self) -> Result<HashSet<OutPoint>, Error> {
-        // Dummy spent outputs are outputs that are not in height map, but we have to consider them
-        // for the utxo mode.
-        let dummy_spent: Vec<OutPoint> = self
-            .all_txs
-            .iter()
-            .filter(|(_, tx)| tx.output.is_empty()) // Only dummy tx have no outputs
-            .flat_map(|(_, tx)| tx.input.iter().map(|i| i.previous_output))
+    pub fn sorted_txids(&self) -> impl Iterator<Item = (&Txid, &Option<Height>)> {
+        self.sorted_txids.iter().map(|txid| {
+            let height = self.heights.get(txid).unwrap_or(&None);
+            (txid, height)
+        })
+    }
+
+    pub fn rebuild_sorted_txids(&mut self) {
+        let mut sorted: Vec<Txid> = self.heights.keys().cloned().collect();
+        sorted.sort_by(|a, b| {
+            // cannot panic here, sorted is heights keys
+            let ha = self.heights[a].unwrap_or(u32::MAX);
+            let hb = self.heights[b].unwrap_or(u32::MAX);
+            hb.cmp(&ha).then(b.cmp(a))
+        });
+        self.sorted_txids = sorted;
+    }
+
+    pub fn update_unspent(
+        &mut self,
+        txid_height_new: &[(Txid, Option<u32>)],
+        deleted_txids: &[Txid],
+    ) {
+        let txids_new: HashSet<&Txid> = txid_height_new.iter().map(|(txid, _)| txid).collect();
+
+        let outputs_new: Vec<OutPoint> = self
+            // we're assuming: in unblinded => belongs to wollet
+            .unblinded
+            .keys()
+            .filter(|op| txids_new.contains(&op.txid))
+            .cloned()
             .collect();
 
-        Ok(self
-            .heights
-            .keys()
-            .filter_map(|txid| self.all_txs.get(txid))
-            .flat_map(|tx| tx.input.iter())
-            .map(|i| i.previous_output)
-            .chain(dummy_spent)
-            .collect())
+        let mut inputs_new: HashSet<OutPoint> = txids_new
+            .iter()
+            .filter_map(|txid| self.tx(txid))
+            .flat_map(|tx| tx.input.iter().map(|i| i.previous_output))
+            .collect();
+
+        // In utxo_only mode the client creates a dummy tx whose inputs are outputs known to be
+        // spent by transactions that were not fetched. Remove those from unspent.
+        let inputs_from_dummmy_txs: HashSet<OutPoint> = self
+            .dummy_txids
+            .iter()
+            .filter_map(|txid| self.tx(txid))
+            .flat_map(|tx| tx.input.iter().map(|i| i.previous_output))
+            .collect();
+        inputs_new.extend(inputs_from_dummmy_txs);
+
+        let inputs_to_restore: Vec<OutPoint> = deleted_txids
+            .iter()
+            .filter_map(|txid| self.tx(txid))
+            .flat_map(|tx| tx.input.iter().map(|i| i.previous_output))
+            // we're assuming: in unblinded => belongs to wollet
+            .filter(|op| self.unblinded.contains_key(op))
+            .collect();
+
+        // Add outputs of new txs
+        self.unspent.extend(outputs_new);
+        // Add inputs of deleted txs (they are utxos now)
+        self.unspent.extend(inputs_to_restore);
+        // Remove inputs of new txs (they are spent now)
+        self.unspent.retain(|o| !inputs_new.contains(o));
+        // Remove outputs of deleted txs (after adding inputs, so that an output spent
+        // by another deleted tx does not remain in unspent)
+        self.unspent
+            .retain(|o| deleted_txids.iter().all(|txid| txid != &o.txid));
+    }
+
+    pub fn unspent(&self) -> &HashSet<OutPoint> {
+        &self.unspent
+    }
+
+    pub fn tx_height(&self, txid: &Txid) -> Option<&Option<Height>> {
+        self.heights.get(txid)
+    }
+
+    pub fn heights(&self) -> &HashMap<Txid, Option<Height>> {
+        &self.heights
+    }
+
+    pub fn update_heights(&mut self, new: &[(Txid, Option<u32>)], to_delete: &[Txid]) {
+        self.heights.retain(|k, _| !to_delete.contains(k));
+        // TODO: consider avoid the allocation here
+        self.heights.extend(new.to_vec());
+    }
+
+    pub fn all_txs(&self) -> impl Iterator<Item = (&Txid, &Transaction)> {
+        self.all_txs.iter()
+    }
+
+    pub fn tx(&self, txid: &Txid) -> Option<&Transaction> {
+        self.all_txs.get(txid)
+    }
+
+    pub fn all_txids(&self) -> HashSet<Txid> {
+        self.all_txs.keys().cloned().collect()
+    }
+
+    pub fn extend_all_txs(&mut self, txs: Vec<(Txid, Transaction)>) {
+        for (txid, tx) in &txs {
+            if tx.output.is_empty() {
+                self.dummy_txids.insert(*txid);
+            }
+        }
+        self.all_txs.extend(txs);
     }
 }
 

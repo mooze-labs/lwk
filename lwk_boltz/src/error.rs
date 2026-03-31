@@ -97,6 +97,9 @@ pub enum Error {
     #[error("Bolt12 (offers) are not yet supported")]
     Bolt12Unsupported,
 
+    #[error("Bolt12 invoice verification failed: invoice does not match offer")]
+    Bolt12InvoiceVerificationFailed,
+
     #[error("LnUrl are not supperted")]
     LnUrlUnsupported,
 
@@ -126,6 +129,15 @@ pub enum Error {
 
     #[error("Encryption error: {0}")]
     Encryption(String),
+
+    #[error("Missing liquid client")]
+    MissingLiquidClient,
+
+    #[error("Expected Bolt12 variant for this operation")]
+    ExpectedBolt12Variant,
+
+    #[error("{0}")]
+    Generic(String),
 }
 
 impl From<BoltzError> for Error {

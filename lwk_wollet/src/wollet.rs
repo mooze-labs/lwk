@@ -27,8 +27,7 @@ use lwk_common::{
     burn_script, pset_balance, pset_issuances, pset_signatures, Balance, DynStore, EncryptedStore,
     FakeStore, FileStore, PsetDetails,
 };
-use std::cmp;
-use std::collections::{hash_map::Entry, BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::Hasher;
 use std::path::Path;
 use std::sync::{atomic, Arc, Mutex};
@@ -57,6 +56,7 @@ pub struct Wollet {
     pub(crate) descriptor: WolletDescriptor,
     /// Counter for the next update key
     pub(crate) next_update_index: Mutex<usize>,
+    pub(crate) merge_threshold: Option<usize>,
     /// cached value
     max_weight_to_satisfy: usize,
 }
@@ -81,8 +81,9 @@ impl WolletBuilder {
         }
     }
 
-    /// Set the threshold for merging updates during build.
-    /// When the number of updates exceeds this threshold, they will be merged into one.
+    /// Set a threshold to merge updates
+    ///
+    /// When the number of updates exceeds the threshold, they are merged into one.
     /// Set to None to disable merging (default).
     pub fn with_merge_threshold(mut self, threshold: Option<usize>) -> Self {
         self.merge_threshold = threshold;
@@ -125,24 +126,7 @@ impl WolletBuilder {
             store: self.store,
             next_update_index: Mutex::new(0),
             max_weight_to_satisfy,
-        };
-
-        // Check if merging is enabled and needed
-        let mut merging = if let Some(threshold) = self.merge_threshold {
-            let merge_key = update_key(threshold);
-            match wollet.store.get(&merge_key) {
-                Ok(Some(_)) => {
-                    // There are at least threshold+1 updates, need to merge
-                    let first_key = update_key(0);
-                    match wollet.store.get(&first_key) {
-                        Ok(Some(bytes)) => Some(Update::deserialize(&bytes)?),
-                        _ => None,
-                    }
-                }
-                _ => None,
-            }
-        } else {
-            None
+            merge_threshold: self.merge_threshold,
         };
 
         // Restore updates from the store using indexed keys
@@ -151,49 +135,14 @@ impl WolletBuilder {
             match wollet.store.get(&key) {
                 Ok(Some(bytes)) => {
                     let update = Update::deserialize(&bytes)?;
-                    wollet.apply_update_no_persist(update.clone())?;
-                    if let Some(ref mut m) = merging {
-                        if i > 0 {
-                            m.merge(update);
-                        }
-                    }
+                    wollet.apply_update_no_persist(update)?;
                 }
                 Ok(None) => {
-                    // Update the next index
                     let mut next_update_index = wollet
                         .next_update_index
                         .lock()
                         .map_err(|_| Error::Generic("next_update_index lock poisoned".into()))?;
-                    *next_update_index = i;
-
-                    // If we were merging, persist the merged update and clean up
-                    if let Some(merged) = merging {
-                        // Delete all old updates
-                        // we are starting from the last to avoid having holes in the beginning
-                        for j in (0..i).rev() {
-                            let old_key = update_key(j);
-                            wollet.store.remove(&old_key).map_err(|e| {
-                                Error::Generic(format!("failed to remove update {}: {}", j, e))
-                            })?;
-                        }
-
-                        // A crash here or during the removal loop will leave the cache empty or at
-                        // an old state which is not the end of the world, the following scan will
-                        // bring the cache back to the correct state.
-
-                        // Store the merged update as update 0
-                        let merged_bytes = merged.serialize()?;
-                        wollet
-                            .store
-                            .put(&update_key(0), &merged_bytes)
-                            .map_err(|e| {
-                                Error::Generic(format!("failed to store merged update: {}", e))
-                            })?;
-
-                        // Update next_update_index to 1
-                        *next_update_index = 1;
-                    }
-
+                    *next_update_index = wollet.merge_updates(i)?;
                     break;
                 }
                 Err(e) => return Err(Error::Generic(format!("store error: {e}"))),
@@ -342,7 +291,7 @@ impl WolletState for Wollet {
     }
 
     fn heights(&self) -> &HashMap<Txid, Option<Height>> {
-        &self.cache.heights
+        self.cache.heights()
     }
 
     fn paths(&self) -> &HashMap<Script, (Chain, ChildNumber)> {
@@ -350,7 +299,7 @@ impl WolletState for Wollet {
     }
 
     fn txs(&self) -> HashSet<Txid> {
-        self.cache.all_txs.keys().cloned().collect()
+        self.cache.all_txids()
     }
 
     fn tip(&self) -> (Height, BlockHash) {
@@ -417,10 +366,10 @@ impl Wollet {
         WolletConciseState {
             wollet_status: self.status(),
             descriptor: self.wollet_descriptor(),
-            txs: cache.all_txs.keys().cloned().collect(),
+            txs: cache.all_txids(),
             paths: cache.paths.clone(),
             scripts: cache.scripts.clone(),
-            heights: cache.heights.clone(),
+            heights: cache.heights().clone(),
             tip: cache.tip,
             last_unused: LastUnused {
                 internal: cache.last_unused_internal.load(atomic::Ordering::Relaxed),
@@ -579,12 +528,11 @@ impl Wollet {
 
     fn txos_inner(&self) -> Result<Vec<WalletTxOut>, Error> {
         let mut txos = vec![];
-        let spent = self.cache.spent()?;
-        for (tx_id, height) in self.cache.heights.iter() {
+        let unspent = self.cache.unspent();
+        for (tx_id, height) in self.cache.sorted_txids() {
             let tx = self
                 .cache
-                .all_txs
-                .get(tx_id)
+                .tx(tx_id)
                 .ok_or_else(|| Error::Generic(format!("txos no tx {tx_id}")))?;
             let tx_txos = tx
                 .output
@@ -595,7 +543,7 @@ impl Wollet {
                         txid: *tx_id,
                         vout: vout as u32,
                     };
-                    (out_point, output, spent.contains(&out_point))
+                    (out_point, output, !unspent.contains(&out_point))
                 })
                 .filter_map(|(outpoint, output, is_spent)| {
                     let unblinded = *self.cache.unblinded.get(&outpoint)?;
@@ -661,16 +609,16 @@ impl Wollet {
     ///
     /// They can be spent as external utxos using [`crate::TxBuilder::add_external_utxos()`].
     pub fn explicit_utxos(&self) -> Result<Vec<ExternalUtxo>, Error> {
-        let spent = self.cache.spent()?;
+        let unspent = self.cache.unspent();
         let mut utxos = vec![];
-        for (txid, tx) in self.cache.all_txs.iter() {
+        for (txid, tx) in self.cache.all_txs() {
             for (vout, o) in tx.output.iter().enumerate() {
                 let outpoint = OutPoint::new(*txid, vout as u32);
                 if !o.script_pubkey.is_empty()
                     && o.asset.is_explicit()
                     && o.value.is_explicit()
                     && self.cache.paths.contains_key(&o.script_pubkey)
-                    && !spent.contains(&outpoint)
+                    && unspent.contains(&outpoint)
                 {
                     let unblinded = TxOutSecrets::new(
                         o.asset.explicit().expect("explicit"),
@@ -736,7 +684,7 @@ impl Wollet {
     /// In some particular situation they can be unblinded with [`crate::Wollet::reunblind()`].
     pub fn txos_cannot_unblind(&self) -> Result<Vec<OutPoint>, Error> {
         let mut txos = vec![];
-        for (txid, tx) in self.cache.all_txs.iter() {
+        for (txid, tx) in self.cache.all_txs() {
             for (vout, o) in tx.output.iter().enumerate() {
                 let outpoint = OutPoint::new(*txid, vout as u32);
                 if !o.script_pubkey.is_empty()
@@ -756,18 +704,19 @@ impl Wollet {
     ///
     /// Note: if the blinding key is the one derived from the wallet descriptor,
     /// this function will NOT return that UTXO. That UTXO is available with the normal flow.
+    ///
+    /// Note: this function might return spent transaction outputs too
     pub fn unblind_utxos_with(
         &self,
         blinding_key: bitcoin::secp256k1::SecretKey,
     ) -> Result<Vec<ExternalUtxo>, Error> {
         let mut utxos = vec![];
-        let spent = self.cache.spent()?;
         let cache_unblinded = &self.cache.unblinded;
-        for (txid, tx) in self.cache.all_txs.iter() {
+        for (txid, tx) in self.cache.all_txs() {
             for (i, txout) in tx.output.iter().enumerate() {
                 if self.cache.paths.contains_key(&txout.script_pubkey) {
                     let outpoint = OutPoint::new(*txid, i as u32);
-                    if !spent.contains(&outpoint) && !cache_unblinded.contains_key(&outpoint) {
+                    if !cache_unblinded.contains_key(&outpoint) {
                         if let Ok(unblinded) = txout.unblind(&EC, blinding_key) {
                             let tx_ = if self.is_segwit() {
                                 None
@@ -795,20 +744,22 @@ impl Wollet {
     /// In some quite particular situations, the wollet might have not unblinded some of
     /// its transaction outputs. This function allows to attempt to unblind them again.
     pub fn reunblind(&mut self) -> Result<Vec<OutPoint>, Error> {
+        let mut new = HashMap::new();
         let mut txos = vec![];
-        for (txid, tx) in self.cache.all_txs.iter() {
+        for (txid, tx) in self.cache.all_txs() {
             for (vout, txout) in tx.output.iter().enumerate() {
                 if self.cache.paths.contains_key(&txout.script_pubkey) {
                     let outpoint = OutPoint::new(*txid, vout as u32);
-                    if let Entry::Vacant(e) = self.cache.unblinded.entry(outpoint) {
+                    if !self.cache.unblinded.contains_key(&outpoint) {
                         if let Ok(unblinded) = try_unblind(txout, &self.descriptor) {
-                            e.insert(unblinded);
+                            new.insert(outpoint, unblinded);
                             txos.push(outpoint);
                         }
                     }
                 }
             }
         }
+        self.cache.unblinded.extend(new);
         Ok(txos)
     }
 
@@ -840,26 +791,17 @@ impl Wollet {
         limit: usize,
     ) -> Result<Vec<WalletTx>, Error> {
         let mut txs = vec![];
-        let mut my_txids: Vec<(&Txid, &Option<u32>)> = self.cache.heights.iter().collect();
-        my_txids.sort_by(|a, b| {
-            let height_cmp = b.1.unwrap_or(u32::MAX).cmp(&a.1.unwrap_or(u32::MAX));
-            match height_cmp {
-                cmp::Ordering::Equal => b.0.cmp(a.0),
-                h => h,
-            }
-        });
 
         let txos = self.txos_map()?;
-        for (txid, height) in my_txids.iter().skip(offset).take(limit) {
+        for (txid, height) in self.cache.sorted_txids().skip(offset).take(limit) {
             let tx = self
                 .cache
-                .all_txs
-                .get(*txid)
+                .tx(txid)
                 .ok_or_else(|| Error::Generic(format!("list_tx no tx {txid}")))?;
 
-            let balance = tx_balance(**txid, tx, &txos);
+            let balance = tx_balance(*txid, tx, &txos);
             let inputs = tx_inputs(tx, &txos);
-            let outputs = tx_outputs(**txid, tx, &txos);
+            let outputs = tx_outputs(*txid, tx, &txos);
             if balance.is_empty()
                 && inputs.iter().all(|i| i.is_none())
                 && outputs.iter().all(|o| o.is_none())
@@ -874,8 +816,8 @@ impl Wollet {
             let timestamp = height.and_then(|h| self.cache.timestamps.get(&h).cloned());
             txs.push(WalletTx {
                 tx: tx.clone(),
-                txid: **txid,
-                height: **height,
+                txid: *txid,
+                height: *height,
                 balance: balance.into(),
                 fee,
                 type_,
@@ -898,9 +840,8 @@ impl Wollet {
     /// Note: this returns any transaction that the wallet has in its storage,
     /// which in some circumstances might include non-wallet txs.
     pub fn transaction(&self, txid: &Txid) -> Result<Option<WalletTx>, Error> {
-        let height = self.cache.heights.get(txid).unwrap_or(&None);
-        let tx = self.cache.all_txs.get(txid);
-        if let Some(tx) = tx {
+        let height = self.cache.tx_height(txid).unwrap_or(&None);
+        if let Some(tx) = self.cache.tx(txid) {
             let txos = self.txos_map()?;
 
             let balance = tx_balance(*txid, tx, &txos);

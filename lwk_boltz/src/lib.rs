@@ -7,6 +7,7 @@ mod chain_swaps;
 pub mod clients;
 mod error;
 mod invoice_data;
+mod invoice_enum;
 mod lightning_payment;
 mod prepare_pay_data;
 mod quote;
@@ -75,6 +76,7 @@ pub use crate::error::Error;
 pub use crate::invoice_data::to_invoice_data;
 pub use crate::invoice_data::InvoiceData;
 pub use crate::invoice_data::InvoiceDataSerializable;
+pub use crate::invoice_enum::Invoice;
 pub use crate::lightning_payment::LightningPayment;
 pub use crate::prepare_pay_data::PreparePayData;
 pub use crate::prepare_pay_data::PreparePayDataSerializable;
@@ -316,6 +318,51 @@ impl BoltzSession {
     pub async fn swap_restore(&self) -> Result<Vec<SwapRestoreResponse>, Error> {
         let result = self.api.post_swap_restore(&self.xpub.to_string()).await?;
         Ok(result)
+    }
+
+    /// Fetch a BOLT12 invoice from an offer using the Boltz API
+    ///
+    /// This method takes a BOLT12 offer and an amount, fetches the corresponding
+    /// BOLT12 invoice from the Boltz service, and verifies that it matches the offer.
+    ///
+    /// # Arguments
+    ///
+    /// * `offer` - The BOLT12 offer to fetch an invoice for
+    /// * `amount` - The amount in satoshis for the invoice
+    ///
+    /// # Returns
+    ///
+    /// Returns the parsed and verified `Bolt12Invoice`
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The API request fails
+    /// - The returned invoice cannot be parsed
+    /// - The invoice doesn't match the offer (signature verification fails)
+    #[allow(dead_code)]
+    async fn fetch_bolt12_invoice(
+        &self,
+        offer: &Offer,
+        amount: u64,
+    ) -> Result<Bolt12Invoice, Error> {
+        use boltz_client::boltz::GetBolt12FetchRequest;
+
+        let request = GetBolt12FetchRequest {
+            offer: offer.to_string(),
+            amount,
+            note: None,
+        };
+
+        let response = self.api.get_bolt12_invoice(request).await?;
+        let invoice = parse_bolt12_invoice(&response.invoice)?;
+
+        // Verify that the invoice matches the offer
+        if !verify_invoice_from_offer(&invoice, offer) {
+            return Err(Error::Bolt12InvoiceVerificationFailed);
+        }
+
+        Ok(invoice)
     }
 
     /// Get the list of pending swap IDs from the store
@@ -835,6 +882,24 @@ pub fn parse_bolt12_invoice(bolt12_invoice: &str) -> Result<Bolt12Invoice, Error
     Ok(lightning::offers::invoice::Bolt12Invoice::try_from(data)?)
 }
 
+pub fn display_bolt12_invoice(bolt12_invoice: &Bolt12Invoice) -> String {
+    use bech32::ToBase32;
+    use lightning::util::ser::Writeable;
+
+    // Serialize the invoice to bytes using the Writeable trait
+    let mut bytes = Vec::new();
+    bolt12_invoice
+        .write(&mut bytes)
+        .expect("writing to vec should not fail");
+
+    // Convert bytes to base32
+    let data = bytes.to_base32();
+
+    // Encode with bech32 using the invoice HRP without checksum (matching decode_without_checksum)
+    bech32::encode_without_checksum(BECH32_BOLT12_INVOICE_HRP, data)
+        .expect("encoding valid invoice should succeed")
+}
+
 #[cfg(test)]
 mod tests {
     use std::str::FromStr;
@@ -901,5 +966,20 @@ mod tests {
         let data = include_str!("../tests/data/swap_restore_response.json");
         let data: Vec<SwapRestoreResponse> = serde_json::from_str(data).unwrap();
         assert_eq!(data.len(), 32);
+    }
+
+    #[test]
+    fn test_bolt12_invoice_roundtrip() {
+        // Test data - a real BOLT12 invoice string from submarine.rs tests
+        let invoice_str = "lni1qqgwwn892vxqk9fsgul2fgzxyj5wk93pqtqft5rf2w8ed0c5chus7mqg2x7lx49qajrq8x3yhuu2w0msttwzc5srqxr2q4qqtqss80rn9yedw8hsef9w2lwa83zsfxglnhaen4kl272wrv4uccukswxm5zvq9sy46p548rukhu2vt7g0dsy9r00n2jswepsrngjt7w988ac94hpvqws6qvd2q863an980srs7dpnt6qpqzlxrdkds6l8zz33enxmr42ujqgzfyq6zkdznkzf5m4u7ran24078mtlcdnaltufm4znls5gkq9lyhvqqvhwq0uy4rzc77s7d8gfx4hxemjql7gfcd7l97c3m76vtqnqmkg3eafm2msn4jj864haz42dc6r8r47gt64zrsqqqqqqqqqqqqqqzgqqqqqqqqqqqqqayjedltzjqqqqqq9yq35mrksp4qst37he8z5zvgq948434andxfzlfru53mfvvaycmed6ynt67qyg3xa2qvqcdg9wqvpqqq9syypvp9wsd9fcl94lznzljrmvppgmmu655rkgvqu6yjln3felwpddct8sgrt30e0uynvhy5ydaktehuwctyzkd05wgw4zqn0ayx4d9yndcfhd4ygpjceygz9629n4qm0zn7xa5k8e8xaphu280n4v2y3dzc2etywv";
+
+        // Parse the invoice string
+        let parsed = crate::parse_bolt12_invoice(invoice_str).unwrap();
+
+        // Convert back to string
+        let displayed = crate::display_bolt12_invoice(&parsed);
+
+        // Verify roundtrip - should get back the same string
+        assert_eq!(invoice_str, displayed);
     }
 }

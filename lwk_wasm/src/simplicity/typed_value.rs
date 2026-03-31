@@ -92,6 +92,10 @@ impl SimplicityTypedValue {
     }
 
     /// Create a tuple value from elements.
+    ///
+    /// NOTE: The elements object is destroyed during the execution of the function, so the argument that was
+    /// passed in the JS code cannot be reused.
+    // TODO: address the limitation
     #[wasm_bindgen(js_name = fromElements)]
     pub fn from_elements(elements: Vec<SimplicityTypedValue>) -> SimplicityTypedValue {
         let inner = Value::tuple(elements.iter().map(|e| e.inner.clone()));
@@ -121,8 +125,8 @@ impl SimplicityTypedValue {
     }
 
     /// Parse a value from a string with a given type.
-    #[wasm_bindgen(constructor)]
-    pub fn new(value_str: &str, ty: &SimplicityType) -> Result<SimplicityTypedValue, Error> {
+    #[wasm_bindgen(js_name = parse)]
+    pub fn parse(value_str: &str, ty: &SimplicityType) -> Result<SimplicityTypedValue, Error> {
         let inner = Value::parse_from_str(value_str, ty.inner())?;
         Ok(Self { inner })
     }
@@ -137,8 +141,6 @@ impl SimplicityTypedValue {
 #[cfg(all(test, target_arch = "wasm32"))]
 mod tests {
     use super::*;
-
-    use crate::{SimplicityArguments, SimplicityProgram};
 
     use wasm_bindgen_test::*;
 
@@ -176,6 +178,6 @@ mod tests {
         let _ = SimplicityTypedValue::from_byte_array_hex("deadbeef").unwrap();
 
         let ty = SimplicityType::u32();
-        let _ = SimplicityTypedValue::new("42", &ty).unwrap();
+        let _ = SimplicityTypedValue::parse("42", &ty).unwrap();
     }
 }
