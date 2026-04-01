@@ -3,6 +3,7 @@
 members = [
     "lwk_app",
     "lwk_bindings",
+    "lwk_boltz",
     "lwk_cli",
     "lwk_hwi",
     "lwk_jade",
